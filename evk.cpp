@@ -194,18 +194,18 @@ namespace evk {
     void* Buffer::GetPtr() {
         Internal_Buffer* buffer = dynamic_cast<Internal_Buffer*>(res);
         EVK_ASSERT(buffer, "Invalid Buffer");
-        EVK_ASSERT(buffer->desc.memoryType == MemoryType::CPU || buffer->desc.memoryType == MemoryType::CPU_TO_GPU, "Trying to write to buffer '%s', but its memory type is not CPU or CPU_TO_GPU!", buffer->desc.name.c_str());
+        EVK_ASSERT(buffer->desc.memoryType != MemoryType::GPU, "Trying to write to buffer '%s', but its memory type is GPU!", buffer->desc.name.c_str());
         return buffer->mappedData;
     }
     void WriteBuffer(Buffer& buffer, void* src, uint64_t size, uint64_t offset) {
         Internal_Buffer* res = (Internal_Buffer*)buffer.res;
-        EVK_ASSERT(GetDesc(buffer).memoryType == MemoryType::CPU || GetDesc(buffer).memoryType == MemoryType::CPU_TO_GPU, "Trying to write to buffer '%s', but its memory type is not CPU or CPU_TO_GPU!", GetDesc(buffer).name.c_str());
+        EVK_ASSERT(GetDesc(buffer).memoryType != MemoryType::GPU, "Trying to write to buffer '%s', but its memory type is GPU!", GetDesc(buffer).name.c_str());
         EVK_ASSERT(offset + size <= res->desc.size, "Trying to write Buffer '%s' out of range!", res->desc.name.c_str());
         std::memcpy((void*)((size_t)res->mappedData + offset), src, size);
     }
     void ReadBuffer(Buffer& buffer, void* dst, uint64_t size, uint64_t offset) {
         Internal_Buffer* res = (Internal_Buffer*)buffer.res;
-        EVK_ASSERT(GetDesc(buffer).memoryType == MemoryType::CPU || GetDesc(buffer).memoryType == MemoryType::GPU_TO_CPU, "Trying to read from buffer '%s', but its memory type is not CPU or GPU_TO_CPU!", GetDesc(buffer).name.c_str());
+        EVK_ASSERT(GetDesc(buffer).memoryType != MemoryType::GPU, "Trying to read from buffer '%s', but its memory type is GPU!", GetDesc(buffer).name.c_str());
         EVK_ASSERT(offset + size <= res->desc.size, "Trying to read Buffer '%s' out of range!", res->desc.name.c_str());
         std::memcpy(dst, (void*)((size_t)res->mappedData + offset), size);
     }
@@ -253,9 +253,9 @@ namespace evk {
             VkSamplerCreateInfo samplerci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
             samplerci.minFilter = FILTER_VK[(int)state->desc.filter];
             samplerci.magFilter = FILTER_VK[(int)state->desc.filter];
-            samplerci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-            samplerci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-            samplerci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+            samplerci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
             samplerci.anisotropyEnable = false;
             samplerci.maxAnisotropy = 0.0f;
             samplerci.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
@@ -839,10 +839,22 @@ namespace evk {
             features.shaderStorageImageReadWithoutFormat = true;
             features.shaderStorageImageWriteWithoutFormat = true;
             features.independentBlend = true;
-
-            VkPhysicalDeviceShaderAtomicInt64Features feature_atomicint64 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES, .shaderBufferInt64Atomics = true};
-            VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT feature_imageatomicint64 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT, .pNext = &feature_atomicint64, .shaderImageInt64Atomics = true};
-
+            
+            VkPhysicalDeviceShaderAtomicFloatFeaturesEXT feature_atomicFloat = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+                .shaderBufferFloat32Atomics = true,
+                .shaderBufferFloat32AtomicAdd = true,
+            };
+            VkPhysicalDeviceShaderAtomicInt64Features feature_atomicint64 = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES,
+                .pNext = &feature_atomicFloat,
+                .shaderBufferInt64Atomics = true,
+            };
+            VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT feature_imageatomicint64 = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT,
+                .pNext = &feature_atomicint64,
+                .shaderImageInt64Atomics = true,
+            };
             // Feature Descriptor Indexing Feature
             VkPhysicalDeviceDescriptorIndexingFeatures feature_indexing = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
@@ -857,46 +869,39 @@ namespace evk {
                 .descriptorBindingPartiallyBound = true,
                 .runtimeDescriptorArray = true,
             };
-
             VkPhysicalDeviceDynamicRenderingFeatures feature_dynamicRendering = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
                 .pNext = &feature_indexing,
                 .dynamicRendering = true,
             };
-
             VkPhysicalDeviceBufferDeviceAddressFeatures feature_bufferDeviceAddress = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
                 .pNext = &feature_dynamicRendering,
                 .bufferDeviceAddress = true,
             };
-
             VkPhysicalDeviceSynchronization2Features feature_sync2 = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
                 .pNext = &feature_bufferDeviceAddress,
                 .synchronization2 = true,
             };
 #if EVK_RT
-
             VkPhysicalDevice8BitStorageFeatures feature_8bitStorage = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES,
                 .pNext = &feature_sync2,
                 .storageBuffer8BitAccess = true,
                 .uniformAndStorageBuffer8BitAccess = true,
             };
-
             VkPhysicalDevice16BitStorageFeatures feature_16bitStorage = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
                 .pNext = &feature_8bitStorage,
                 .storageBuffer16BitAccess = true,
                 .uniformAndStorageBuffer16BitAccess = true,
             };
-
             VkPhysicalDeviceRayTracingPipelineFeaturesKHR feature_rayTracingPipeline = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
                 .pNext = &feature_16bitStorage,
                 .rayTracingPipeline = VK_TRUE,
             };
-
             VkPhysicalDeviceAccelerationStructureFeaturesKHR feature_accelerationStructure = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
                 .pNext = &feature_rayTracingPipeline,
@@ -904,7 +909,6 @@ namespace evk {
                 .accelerationStructureCaptureReplay = VK_TRUE,
                 .descriptorBindingAccelerationStructureUpdateAfterBind = VK_TRUE,
             };
-
             VkPhysicalDeviceRayQueryFeaturesKHR feature_rayQuery = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
                 .pNext = &feature_accelerationStructure,
@@ -918,6 +922,7 @@ namespace evk {
                 VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
                 VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME,
                 VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
+                VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
                 VK_KHR_MAINTENANCE3_EXTENSION_NAME,
 
 #if EVK_RT
