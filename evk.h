@@ -93,8 +93,12 @@ namespace evk {
         const char* name;
     };
 
-    BufferUsage operator|(BufferUsage a, BufferUsage b);
-    ImageUsage operator|(ImageUsage a, ImageUsage b);
+    inline BufferUsage operator|(BufferUsage a, BufferUsage b) {
+        return (BufferUsage)((uint32_t)a | (uint32_t)b);
+    }
+    inline ImageUsage operator|(ImageUsage a, ImageUsage b) {
+        return (ImageUsage)((uint32_t)a | (uint32_t)b);
+    }
 
     template <std::size_t _index, typename T>
     struct _Constant_Impl {
@@ -220,7 +224,9 @@ namespace evk {
         void* GetPtr();
     };
     Buffer CreateBuffer(const BufferDesc& desc);
+    // TODO: remove WriteBuffer, will be only Buffer::GetPtr()
     void WriteBuffer(Buffer& buffer, void* src, uint64_t size, uint64_t offset = 0u);
+    // TODO: remove ReadBuffer, will be only Buffer::GetPtr()
     void ReadBuffer(Buffer& buffer, void* dst, uint64_t size, uint64_t offset = 0u);
 
     struct ImageDesc {
@@ -249,7 +255,7 @@ namespace evk {
         uint32_t frameBufferingCount = 2;
     };
 
-    RID GetRID(const ResourceRef& ref);
+    RID GetRID(const ResourceRef& ref); // TODO: make it a method
     const BufferDesc& GetDesc(const Buffer& res);
     const ImageDesc& GetDesc(const Image& res);
 

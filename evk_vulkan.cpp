@@ -86,13 +86,6 @@ namespace evk {
     const VkPrimitiveTopology PRIMITIVE_TOPOLOGY_VK[] = {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST};
     const VkCullModeFlags TO_VK_CULL_MODE[] = {VK_CULL_MODE_NONE, VK_CULL_MODE_FRONT_BIT, VK_CULL_MODE_BACK_BIT};
 
-    BufferUsage operator|(BufferUsage a, BufferUsage b) {
-        return (BufferUsage)((uint32_t)a | (uint32_t)b);
-    }
-    ImageUsage operator|(ImageUsage a, ImageUsage b) {
-        return (ImageUsage)((uint32_t)a | (uint32_t)b);
-    }
-
     bool DoesFormatHaveDepth(Format format) {
         switch (format) {
             case Format::D24UnormS8Uint:
