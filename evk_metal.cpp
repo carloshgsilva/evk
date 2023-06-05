@@ -7,8 +7,25 @@
 // spirv-cross PathTrace.comp.spv --msl --msl-version 20300 --msl-argument-buffer-tier 1
 
 namespace evk {
+    static State* GState = {};
+
+    State& GetState() {
+        EVK_ASSERT(GState, "EVK not intialized! did you call evk::Initialize()?");
+        return *GState;
+    }
+
     Pipeline CreatePipeline(const PipelineDesc& desc){
-        return {};
+        PipelineMetal* p = new PipelineMetal();
+        //TODO: 
+        auto& S = GetState();
+
+        auto* pipeline_desc = MTL::RenderPipelineDescriptor::alloc()->autorelease();
+        pipeline_desc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormat::PixelFormatBGRA8Unorm_sRGB);
+        pipeline_desc->setVertexFunction(fn_vertex);
+        pipeline_desc->setFragmentFunction(fn_fragment);
+        S.device->newRenderPipelineState();
+
+        return {p};
     }
     Buffer CreateBuffer(const BufferDesc& desc){
         return {};
@@ -31,31 +48,75 @@ namespace evk {
     const BufferDesc& GetDesc(const Buffer& res){}
     const ImageDesc& GetDesc(const Image& res){}
 
-    static struct Internal {
-        MTL::Device* device;
-        MTL::CommandQueue* queue;
-        CA::MetalLayer* swapchain;
-        MTK::View* view;
-    } global;
     bool InitializeEVK(const EvkDesc& info) {
-        global.device = MTL::CreateSystemDefaultDevice();
-        global.queue = global.device->newCommandQueue();
-        global.swapchain = CA::MetalLayer::layer();
-        global.swapchain->setDevice(global.device);
+        GState = new State();
+        auto& S = GetState();
+
+        S.device = MTL::CreateSystemDefaultDevice();
+        S.queue = S.device->newCommandQueue();
+        S.swapchain = CA::MetalLayer::layer();
+        S.swapchain->setDevice(S.device);
         
         CGRect frame = (CGRect){{100.0, 100.0}, {512.0, 512.0}};
-        global.view = MTK::View::alloc()->init(frame, global.device);
-        global.view->setColorPixelFormat(MTL::PixelFormat::PixelFormatBGRA8Unorm_sRGB);
-        global.view->setClearColor(MTL::ClearColor::Make( 1.0, 0.0, 0.0, 1.0 ));
+        S.view = MTK::View::alloc()->init(frame, GetState().device);
+        S.view->setColorPixelFormat(MTL::PixelFormat::PixelFormatBGRA8Unorm_sRGB);
+        S.view->setClearColor(MTL::ClearColor::Make( 1.0, 0.0, 0.0, 1.0 ));
+
+        auto* comp_options = MTL::CompileOptions::alloc()->autorelease();
+
+        const char* src = R"(
+            using namespace metal;
+            struct ColoredVertex {
+                float4 position [[position]];
+                float4 color;
+            };
+            vertex ColoredVertex vertex_main(constant float4 *position [[buffer(0)]],
+                                            constant float4 *color    [[buffer(1)]],
+                                            uint vid                  [[vertex_id]]) {
+                ColoredVertex vert;
+                vert.position = position[vid];
+                vert.color    = color[vid];
+                return vert;
+            }
+            fragment float4 fragment_main(ColoredVertex vert [[stage_in]]) {
+                return vert.color;
+            })";
+        auto* src_str = NS::String::string(src, NS::StringEncoding::UTF8StringEncoding)->autorelease();
+        NS::Error* err = {};
+        MTL::Library* lib = S.device->newLibrary(src_str, &err);
+        EVK_ASSERT(err == nullptr, "Failed to create metal library");
+        MTL::Function* fn_vertex = lib->newFunction(NS::String::string("vertex_main", NS::StringEncoding::UTF8StringEncoding)->autorelease());
+        MTL::Function* fn_fragment = lib->newFunction(NS::String::string("fragment_main", NS::StringEncoding::UTF8StringEncoding)->autorelease());
+        
+        auto* pipeline_desc = MTL::RenderPipelineDescriptor::alloc();
+        pipeline_desc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormat::PixelFormatBGRA8Unorm_sRGB);
+        pipeline_desc->setVertexFunction(fn_vertex);
+        pipeline_desc->setFragmentFunction(fn_fragment);
+
+        err = {};
+        S.pipeline = S.device->newRenderPipelineState(pipeline_desc, &err);
+        EVK_ASSERT(err == nullptr, "Failed to create metal render pipeline");
+
+        float positions[3][4] =  {
+            { 0.0,  0.5, 0, 1},
+            {-0.5, -0.5, 0, 1},
+            { 0.5, -0.5, 0, 1},
+        };
+        float colors[3][4] = {
+            {1, 0, 0, 1},
+            {0, 1, 0, 1},
+            {0, 0, 1, 1},
+        };
+
+        S.buffer_pos = S.device->newBuffer(positions, sizeof(positions), {});
+        S.buffer_color = S.device->newBuffer(colors, sizeof(colors), {});
 
         return true;
     }
     void Shutdown(){}
     bool InitializeSwapchain(void* nsWindow){
         NS::Window* window = (NS::Window*)nsWindow;
-        // NS::Private::Selector::s_ksetContentView_
-        window->contentView()->setLayer(global.swapchain);
-        // NS::Private::Selector::s_ksetContentView_
+        window->contentView()->setLayer(GetState().swapchain);
 
         return true;
     }
@@ -64,7 +125,7 @@ namespace evk {
     uint32_t GetFrameIndex(){}
     void Submit(){
         MTL::ClearColor color = MTL::ClearColor::Make(0, 0, 255, 1);
-        CA::MetalDrawable* surface = global.swapchain->nextDrawable();
+        CA::MetalDrawable* surface = GetState().swapchain->nextDrawable();
         
         MTL::RenderPassDescriptor* pass = MTL::RenderPassDescriptor::renderPassDescriptor()->autorelease();
         pass->colorAttachments()->object(0)->setClearColor(color);
@@ -72,9 +133,17 @@ namespace evk {
         pass->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
         pass->colorAttachments()->object(0)->setTexture(surface->texture());
 
-        MTL::CommandBuffer* cmd = global.queue->commandBuffer()->autorelease();
-        MTL::RenderCommandEncoder* encoder = cmd->renderCommandEncoder(pass)->autorelease();
-        encoder->endEncoding();
+        MTL::CommandBuffer* cmd = GetState().queue->commandBuffer()->autorelease();
+        
+        MTL::RenderCommandEncoder* render = cmd->renderCommandEncoder(pass)->autorelease();
+
+        auto& S = GetState();
+        render->setRenderPipelineState(S.pipeline);
+        render->setVertexBuffer(S.buffer_pos, 0, 0);
+        render->setVertexBuffer(S.buffer_color, 0, 1);
+        render->drawPrimitives(MTL::PrimitiveTypeTriangle, 0, 3, 1);
+
+        render->endEncoding();
         cmd->presentDrawable(surface);
         cmd->commit();
     }
