@@ -132,9 +132,9 @@ namespace evk {
         PFN_vkDestroyAccelerationStructureKHR vkDestroyAccelerationStructureKHR;
 
         // Pfns
-        PFN_vkDebugMarkerSetObjectNameEXT vkDebugMarkerSetObjectNameEXT;
-        PFN_vkCmdDebugMarkerBeginEXT vkCmdDebugMarkerBeginEXT;
-        PFN_vkCmdDebugMarkerEndEXT vkCmdDebugMarkerEndEXT;
+        PFN_vkCmdBeginDebugUtilsLabelEXT vkCmdBeginDebugUtilsLabelEXT;
+        PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT;
+        PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT;
     };
     State& GetState();
     FrameData& GetFrame();

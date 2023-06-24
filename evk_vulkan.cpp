@@ -155,11 +155,13 @@ namespace evk {
         }
 
 #if EVK_DEBUG
-        VkDebugMarkerObjectNameInfoEXT dbgName = {VK_STRUCTURE_TYPE_DEBUG_MARKER_OBJECT_NAME_INFO_EXT};
-        dbgName.objectType = VK_DEBUG_REPORT_OBJECT_TYPE_BUFFER_EXT;
-        dbgName.object = (uint64_t)(VkBuffer)res->buffer;
-        dbgName.pObjectName = desc.name.c_str();
-        GetState().vkDebugMarkerSetObjectNameEXT(GetState().device, &dbgName);
+        VkDebugUtilsObjectNameInfoEXT name = {
+            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
+            .objectType = VkObjectType::VK_OBJECT_TYPE_BUFFER,
+            .objectHandle = (uint64_t)(VkBuffer)res->buffer,
+            .pObjectName = desc.name.c_str(),
+        };
+        GetState().vkSetDebugUtilsObjectNameEXT(GetState().device, &name);
 #endif
 
         // Alloc descriptor index
@@ -301,11 +303,13 @@ namespace evk {
         }
 
 #if EVK_DEBUG
-        VkDebugMarkerObjectNameInfoEXT dbgName{VK_STRUCTURE_TYPE_DEBUG_MARKER_OBJECT_NAME_INFO_EXT};
-        dbgName.objectType = VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT;
-        dbgName.object = (uint64_t)(VkImage)res->image;
-        dbgName.pObjectName = desc.name.c_str();
-        GetState().vkDebugMarkerSetObjectNameEXT(GetState().device, &dbgName);
+        VkDebugUtilsObjectNameInfoEXT name = {
+            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
+            .objectType = VkObjectType::VK_OBJECT_TYPE_IMAGE,
+            .objectHandle = (uint64_t)(VkImage)res->image,
+            .pObjectName = desc.name.c_str(),
+        };
+        GetState().vkSetDebugUtilsObjectNameEXT(GetState().device, &name);
 #endif
 
         InitializeImageView(res);
@@ -579,11 +583,13 @@ namespace evk {
         EVK_ASSERT(state->pipeline != VK_NULL_HANDLE, "Failed to create pipeline '%s'", desc.name.c_str());
 
 #if EVK_DEBUG
-        VkDebugMarkerObjectNameInfoEXT dbgName = {VK_STRUCTURE_TYPE_DEBUG_MARKER_OBJECT_NAME_INFO_EXT};
-        dbgName.objectType = VK_DEBUG_REPORT_OBJECT_TYPE_PIPELINE_EXT;
-        dbgName.object = (uint64_t)state->pipeline;
-        dbgName.pObjectName = desc.name.c_str();
-        GetState().vkDebugMarkerSetObjectNameEXT(GetState().device, &dbgName);
+        VkDebugUtilsObjectNameInfoEXT name = {
+            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
+            .objectType = VkObjectType::VK_OBJECT_TYPE_PIPELINE,
+            .objectHandle = (uint64_t)state->pipeline,
+            .pObjectName = desc.name.c_str(),
+        };
+        GetState().vkSetDebugUtilsObjectNameEXT(GetState().device, &name);
 #endif
 
         return Pipeline{state};
@@ -710,7 +716,6 @@ namespace evk {
             appInfo.engineVersion = desc.engineVersion;
 
             // Instance Info
-            // TODO: filter vkEnumerateInstanceExtensionProperties
             std::vector<const char*> extensions;
             for (auto& name : desc.instanceExtensions) {
                 extensions.push_back(name.c_str());
@@ -722,11 +727,11 @@ namespace evk {
 
 #if EVK_DEBUG
             printf("[evk] validation layers enabled!\n");
-            extensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
+            extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
             layers.push_back("VK_LAYER_KHRONOS_validation");
 #endif
 
-            // Validate instance layers and extensions
+            // Validate instance layers
             {
                 uint32_t count = 0;
                 std::vector<VkLayerProperties> avaible_layers;
@@ -744,8 +749,10 @@ namespace evk {
                     }
                     EVK_ASSERT(found, "Failed to find instance layer '%s'!", layer);
                 }
-
-                count = 0;
+            }
+            // Validate instance extensions
+            {
+                uint32_t count = 0;
                 std::vector<VkExtensionProperties> avaible_extensions;
                 CHECK_VK(vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr));
                 avaible_extensions.resize(count);
@@ -912,24 +919,14 @@ namespace evk {
             // Create device and get queue
             std::vector<const char*> deviceExtensions = {
                 VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-                VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
-                VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME,
                 VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
                 VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
-                VK_KHR_MAINTENANCE3_EXTENSION_NAME,
 
 #if EVK_RT
-                VK_KHR_SPIRV_1_4_EXTENSION_NAME,
-                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
                 VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
                 VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
                 VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
                 VK_KHR_RAY_QUERY_EXTENSION_NAME,
-#endif
-
-#if EVK_DEBUG
-                VK_EXT_DEBUG_MARKER_EXTENSION_NAME,
-                "VK_KHR_shader_non_semantic_info"
 #endif
             };
 
@@ -941,14 +938,14 @@ namespace evk {
             supportedExtensions.resize(supportedExtensionsCount);
             CHECK_VK(vkEnumerateDeviceExtensionProperties(S.physicalDevice, NULL, &supportedExtensionsCount, supportedExtensions.data()));
             for (auto& ext1 : deviceExtensions) {
-                bool found = std::strstr(ext1, "debug");
+                bool found = false;
                 for (auto& ext2 : supportedExtensions) {
                     if (!std::strcmp(ext1, ext2.extensionName)) {
                         found = true;
                         break;
                     }
                 }
-                EVK_ASSERT(found, "Device extension '%s' not supported!", ext1);
+                EVK_ASSERT(found, "Device extension '%s' not found!", ext1);
             }
 #endif
 
@@ -970,9 +967,10 @@ namespace evk {
 
         // Get PFNs
         { 
-            S.vkDebugMarkerSetObjectNameEXT = (PFN_vkDebugMarkerSetObjectNameEXT)vkGetDeviceProcAddr(S.device, "vkDebugMarkerSetObjectNameEXT");
-            S.vkCmdDebugMarkerBeginEXT = (PFN_vkCmdDebugMarkerBeginEXT)vkGetDeviceProcAddr(S.device, "vkCmdDebugMarkerBeginEXT");
-            S.vkCmdDebugMarkerEndEXT = (PFN_vkCmdDebugMarkerEndEXT)vkGetDeviceProcAddr(S.device, "vkCmdDebugMarkerEndEXT");
+            #define EVK_PFN(name) S.name = (PFN_##name)vkGetDeviceProcAddr(S.device, #name)
+            EVK_PFN(vkCmdBeginDebugUtilsLabelEXT);
+            EVK_PFN(vkCmdEndDebugUtilsLabelEXT);
+            EVK_PFN(vkSetDebugUtilsObjectNameEXT);
         }
 
         // Vma Allocator
@@ -1734,22 +1732,25 @@ namespace evk {
         vkCmdDrawIndexedIndirectCount(GetFrame().cmd, ToInternal(buffer).buffer, offset, ToInternal(countBuffer).buffer, countBufferOffset, drawCount, stride);
     }
     void CmdBeginTimestamp(const char* name) {
-        VkDebugMarkerMarkerInfoEXT marker = {
-            .sType = VK_STRUCTURE_TYPE_DEBUG_MARKER_MARKER_INFO_EXT,
-            .pMarkerName = name,
-            .color = {0.0f, 1.0f, 0.0f, 1.0f},
+        VkDebugUtilsLabelEXT label = {
+            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
+            .pLabelName = name,
         };
-        GetState().vkCmdDebugMarkerBeginEXT(GetFrame().cmd, &marker);
-        vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, GetFrame().timestampId(name) * 2);
+        GetState().vkCmdBeginDebugUtilsLabelEXT(GetFrame().cmd, &label);
+        vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, GetFrame().queryPool, GetFrame().timestampId(name) * 2);
     }
     void CmdEndTimestamp(const char* name) {
-        VkDebugMarkerMarkerInfoEXT marker = {
-            .sType = VK_STRUCTURE_TYPE_DEBUG_MARKER_MARKER_INFO_EXT,
-            .pMarkerName = name,
-            .color = {0.0f, 1.0f, 0.0f, 1.0f},
-        };
-        GetState().vkCmdDebugMarkerEndEXT(GetFrame().cmd);
+        vkCmdPipelineBarrier(
+            GetFrame().cmd,
+            VkPipelineStageFlagBits::VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VkPipelineStageFlagBits::VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VkDependencyFlagBits::VK_DEPENDENCY_DEVICE_GROUP_BIT,
+            0, nullptr,
+            0, nullptr,
+            0, nullptr
+        );
         vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, GetFrame().timestampId(name) * 2 + 1);
+        GetState().vkCmdEndDebugUtilsLabelEXT(GetFrame().cmd);
     }
 
 #if EVK_RT
