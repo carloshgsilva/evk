@@ -252,7 +252,7 @@ namespace evk {
         std::uint32_t engineVersion = 0;
         std::vector<std::string> instanceLayers = {};
         std::vector<std::string> instanceExtensions = {};
-        uint32_t frameBufferingCount = 2;
+        uint32_t frameBufferingCount = 3;
     };
 
     RID GetRID(const ResourceRef& ref); // TODO: make it a method
@@ -362,33 +362,6 @@ namespace evk {
         callback();
         CmdEndTimestamp(name);
     }
-    template <typename T>
-    class PerFrame {
-        T data[3];
-
-       public:
-        operator T&() {
-            return data[GetFrameIndex()];
-        }
-        T& operator[](int i) {
-            // assert(i < 3 && "Only triple buffering supported at max!");
-            return data[i];
-        }
-        T* operator->() {
-            return &data[GetFrameIndex()];
-        }
-        template <typename Cb>
-        void Build(Cb cb) {
-            for (uint32_t i = 0; i < GetFrameBufferingCount(); i++) {
-                data[i] = cb(i);
-            }
-        }
-        void release() {
-            for (uint32_t i = 0; i < GetFrameBufferingCount(); i++) {
-                data[i].release();
-            }
-        }
-    };
 
 #if EVK_RT
     namespace rt {
