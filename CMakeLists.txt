@@ -7,10 +7,28 @@ if(EVK_DEBUG)
   add_compile_definitions(EVK_DEBUG)
 endif()
 
-add_library(evk ${CMAKE_CURRENT_SOURCE_DIR}/evk_vulkan.cpp)
+# SPIRV-Cross
+file(GLOB_RECURSE SPIRV_CROSS_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/SPIRV-Cross/*.cpp)
+add_library(spirv_cross ${SPIRV_CROSS_SOURCE})
+
+# evk
+add_library(evk $<IF:$<PLATFORM_ID:Darwin>,
+  "${CMAKE_CURRENT_SOURCE_DIR}/evk_metal.cpp",
+  "${CMAKE_CURRENT_SOURCE_DIR}/evk_vulkan.cpp"
+>)
 target_include_directories(evk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(evk PRIVATE cxx_std_20)
+target_link_libraries(evk PUBLIC spirv_cross)
 
-# vulkan
-find_package(Vulkan REQUIRED)
-target_link_libraries(evk PUBLIC Vulkan::Vulkan)
+if(APPLE)
+  # metal
+  target_link_libraries(evk "-framework AppKit" "-framework QuartzCore" "-framework Metal")
+  target_compile_definitions(evk PUBLIC "EVK_METAL=1")
+  target_include_directories(evk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/metal-cpp)
+  # brew install shaderc spirv-cross
+elseif(WIN32 OR UNIX)
+  # vulkan
+  find_package(Vulkan REQUIRED)
+  target_link_libraries(evk PUBLIC Vulkan::Vulkan)
+  target_compile_definitions(evk PUBLIC "EVK_VULKAN=1")
+endif()
