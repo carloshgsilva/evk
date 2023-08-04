@@ -1737,7 +1737,7 @@ namespace evk {
             .pLabelName = name,
         };
         GetState().vkCmdBeginDebugUtilsLabelEXT(GetFrame().cmd, &label);
-        vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, GetFrame().queryPool, GetFrame().timestampId(name) * 2);
+        vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, GetFrame().timestampId(name) * 2);
     }
     void CmdEndTimestamp(const char* name) {
         vkCmdPipelineBarrier(
