@@ -1740,15 +1740,6 @@ namespace evk {
         vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, GetFrame().timestampId(name) * 2);
     }
     void CmdEndTimestamp(const char* name) {
-        vkCmdPipelineBarrier(
-            GetFrame().cmd,
-            VkPipelineStageFlagBits::VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VkPipelineStageFlagBits::VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VkDependencyFlagBits::VK_DEPENDENCY_DEVICE_GROUP_BIT,
-            0, nullptr,
-            0, nullptr,
-            0, nullptr
-        );
         vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, GetFrame().timestampId(name) * 2 + 1);
         GetState().vkCmdEndDebugUtilsLabelEXT(GetFrame().cmd);
     }

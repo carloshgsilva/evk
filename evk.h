@@ -396,7 +396,7 @@ namespace evk {
 
         struct BLASInstance {
             BLAS blas;
-            uint32_t customId;
+            uint32_t customId = 0u;
             float transform[12] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
         };
         struct TLAS : ResourceRef {
