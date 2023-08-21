@@ -485,8 +485,8 @@ namespace evk {
                     blendAttach.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
                     blendAttach.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
                     blendAttach.colorBlendOp = VK_BLEND_OP_ADD;
-                    blendAttach.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-                    blendAttach.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+                    blendAttach.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+                    blendAttach.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
                     blendAttach.alphaBlendOp = VK_BLEND_OP_ADD;
                     break;
                 case Blend::Additive:

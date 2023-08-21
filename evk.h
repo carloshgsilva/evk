@@ -66,7 +66,7 @@ namespace evk {
     };
     enum class Filter { Nearest, Linear };
     enum class MemoryType {
-        CPU,         // lives in the mains CPU's memory
+        CPU,         // TODO: completely remove the CPU memory type
         GPU,         // lives in the GPU's memory
         CPU_TO_GPU,  // data that change every frame
         GPU_TO_CPU,  // useful for read back
