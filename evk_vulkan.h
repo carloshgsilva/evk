@@ -31,6 +31,8 @@ namespace evk {
     const uint32_t IMAGE_COUNT = 8192;
     const uint32_t SAMPLER_COUNT = IMAGE_COUNT;
     const uint32_t TLAS_COUNT = 8192;
+    
+    const uint32_t PERF_QUERY_COUNT = 64;
 
     struct FrameData {
         Image image;
@@ -200,6 +202,7 @@ namespace evk {
 
         VkAccelerationStructureKHR accel = {};
         Buffer buffer;
+        Buffer aabbsBuffer;
 
         ~Internal_BLAS() {
             GetState().vkDestroyAccelerationStructureKHR(GetState().device, accel, nullptr);

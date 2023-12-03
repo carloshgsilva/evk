@@ -631,7 +631,7 @@ namespace evk {
         cmdbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         CHECK_VK(vkBeginCommandBuffer(F.cmd, &cmdbi));
 
-        vkCmdResetQueryPool(F.cmd, F.queryPool, 0, 64);
+        vkCmdResetQueryPool(F.cmd, F.queryPool, 0, PERF_QUERY_COUNT);
         vkCmdBindDescriptorSets(F.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, S.pipelineLayout, 0, 1, &S.descriptorSet, 0, nullptr);
         vkCmdBindDescriptorSets(F.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pipelineLayout, 0, 1, &S.descriptorSet, 0, nullptr);
     }
@@ -675,9 +675,9 @@ namespace evk {
 
         CHECK_VK(vkWaitForFences(GetState().device, 1, &F.fence, true, std::numeric_limits<uint64_t>().max()));
         CHECK_VK(vkResetFences(GetState().device, 1, &F.fence));
-        F.queries.resize(64);
+        F.queries.resize(PERF_QUERY_COUNT);
 
-        vkGetQueryPoolResults(GetState().device, F.queryPool, 0, 64, 64 * sizeof(uint64_t), F.queries.data(), 8, VK_QUERY_RESULT_64_BIT);
+        vkGetQueryPoolResults(GetState().device, F.queryPool, 0, PERF_QUERY_COUNT, PERF_QUERY_COUNT * sizeof(uint64_t), F.queries.data(), 8, VK_QUERY_RESULT_64_BIT);
         F.timestampEntries.clear();
         uint64_t start = F.queries[0];
         for (int i = 0; i < F.timestampNames.size(); i++) {
@@ -1079,7 +1079,7 @@ namespace evk {
                 CHECK_VK(vkCreateFence(S.device, &fenceci, nullptr, &fd.fence));
 
                 VkQueryPoolCreateInfo queryPoolci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-                queryPoolci.queryCount = 64;
+                queryPoolci.queryCount = PERF_QUERY_COUNT;
                 queryPoolci.queryType = VK_QUERY_TYPE_TIMESTAMP;
                 CHECK_VK(vkCreateQueryPool(S.device, &queryPoolci, nullptr, &fd.queryPool));
 
@@ -1750,7 +1750,7 @@ namespace evk {
         BLAS CreateBLAS(const BLASDesc& desc) {
             auto& S = GetState();
             Internal_BLAS* res = new Internal_BLAS();
-
+            res->aabbsBuffer = desc.aabbs;
             if (desc.geometry == GeometryType::Triangles) {
                 VkAccelerationStructureGeometryTrianglesDataKHR triangles = {
                     .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
@@ -1920,6 +1920,10 @@ namespace evk {
             for (auto& blasRes : blases) {
                 scratchSize = std::max(scratchSize, ToInternal(blasRes).sizeInfo.buildScratchSize);
             }
+
+            if(scratchSize == 0u)
+                return;
+
             Buffer scratchBuffer = CreateBuffer({
                 .name = "BLAS Build Scratch Buffer",
                 .size = scratchSize,
@@ -1964,15 +1968,19 @@ namespace evk {
                 //    batchSize = 0;
                 //}
                 i++;
+                //TODO: if (desc.allowUpdate == false) {
+                    blas.aabbsBuffer = {};
+                //}
             }
         }
         void CmdBuildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update) {
             auto& S = GetState();
             Internal_TLAS& res = ToInternal(tlas);
 
+            EVK_ASSERT(tlas, "Invalid TLAS.");
             EVK_ASSERT(res.instances.size() == blasInstances.size(), "TLAS has been created with %llu BLAS count but now is being built with %llu BLAS count, the BLAS count must be the same! If the count changed purposely you must create another TLAS.",
                        res.instances.size(), blasInstances.size());
-            EVK_ASSERT(update == true || res.buildInfo.dstAccelerationStructure == VK_NULL_HANDLE, "TLAS is already built, did you meant to build with update == true?");
+            //EVK_ASSERT(update == true || res.buildInfo.dstAccelerationStructure == VK_NULL_HANDLE, "TLAS is already built, did you meant to build with update == true?");
 
             for (int i = 0; i < blasInstances.size(); i++) {
                 const BLASInstance& blasInstance = blasInstances[i];
