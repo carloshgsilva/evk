@@ -321,8 +321,8 @@ namespace evk {
     void CmdDrawIndexedIndirect(Buffer& buffer, uint64_t offset, uint32_t drawCount, uint32_t stride);
     void CmdDrawIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countBufferOffset, uint32_t drawCount, uint32_t stride);
     void CmdDrawIndexedIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countBufferOffset, uint32_t drawCount, uint32_t stride);
-    void CmdBeginTimestamp(const char* name);
-    void CmdEndTimestamp(const char* name);
+    int CmdBeginTimestamp(const char* name);
+    void CmdEndTimestamp(int id);
 
     template <typename... Args>
     void CmdPush(const Constant<Args...>& data) {
@@ -358,9 +358,9 @@ namespace evk {
     }
     template <typename T>
     void CmdTimestamp(const char* name, T callback) {
-        CmdBeginTimestamp(name);
+        int id = CmdBeginTimestamp(name);
         callback();
-        CmdEndTimestamp(name);
+        CmdEndTimestamp(id);
     }
 
 #if EVK_RT
@@ -405,7 +405,7 @@ namespace evk {
         };
 
         BLAS CreateBLAS(const BLASDesc& desc);
-        TLAS CreateTLAS(uint64_t blasCount, bool allowUpdate);
+        TLAS CreateTLAS(uint32_t maxBlasCount, bool allowUpdate);
 
         void CmdBuildBLAS(const std::vector<BLAS>& blases, bool update = false);
         void CmdBuildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update = false);

@@ -1731,16 +1731,18 @@ namespace evk {
     void CmdDrawIndexedIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countBufferOffset, uint32_t drawCount, uint32_t stride) {
         vkCmdDrawIndexedIndirectCount(GetFrame().cmd, ToInternal(buffer).buffer, offset, ToInternal(countBuffer).buffer, countBufferOffset, drawCount, stride);
     }
-    void CmdBeginTimestamp(const char* name) {
+    int CmdBeginTimestamp(const char* name) {
         VkDebugUtilsLabelEXT label = {
             .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
             .pLabelName = name,
         };
         GetState().vkCmdBeginDebugUtilsLabelEXT(GetFrame().cmd, &label);
-        vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, GetFrame().timestampId(name) * 2);
+        int id = GetFrame().AllocTimestap(name);
+        vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, id * 2);
+        return id;
     }
-    void CmdEndTimestamp(const char* name) {
-        vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, GetFrame().timestampId(name) * 2 + 1);
+    void CmdEndTimestamp(int id) {
+        vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, id * 2 + 1);
         GetState().vkCmdEndDebugUtilsLabelEXT(GetFrame().cmd);
     }
 
@@ -1827,11 +1829,11 @@ namespace evk {
 
             return BLAS{res};
         }
-        TLAS CreateTLAS(uint64_t blasCount, bool allowUpdate) {
+        TLAS CreateTLAS(uint32_t maxBlasCount, bool allowUpdate) {
             auto& S = GetState();
             Internal_TLAS* res = new Internal_TLAS();
 
-            res->instances.resize(blasCount);
+            res->instances.resize(maxBlasCount);
 
             VkBuildAccelerationStructureFlagsKHR flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
             if (allowUpdate) flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
@@ -1870,9 +1872,8 @@ namespace evk {
                 .pGeometries = &res->geometry,
             };
 
-            uint32_t countInstance = uint32_t(res->instances.size());
             res->sizeInfo = VkAccelerationStructureBuildSizesInfoKHR{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
-            S.vkGetAccelerationStructureBuildSizesKHR(S.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &res->buildInfo, &countInstance, &res->sizeInfo);
+            S.vkGetAccelerationStructureBuildSizesKHR(S.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &res->buildInfo, &maxBlasCount, &res->sizeInfo);
 
             res->buffer = CreateBuffer({
                 .name = "TLAS Buffer",
@@ -1968,7 +1969,7 @@ namespace evk {
                 //    batchSize = 0;
                 //}
                 i++;
-                //TODO: if (desc.allowUpdate == false) {
+                // TODO: if (desc.allowUpdate == false) {
                     blas.aabbsBuffer = {};
                 //}
             }
@@ -1978,9 +1979,8 @@ namespace evk {
             Internal_TLAS& res = ToInternal(tlas);
 
             EVK_ASSERT(tlas, "Invalid TLAS.");
-            EVK_ASSERT(res.instances.size() == blasInstances.size(), "TLAS has been created with %llu BLAS count but now is being built with %llu BLAS count, the BLAS count must be the same! If the count changed purposely you must create another TLAS.",
+            EVK_ASSERT(blasInstances.size() < res.instances.size(), "TLAS has been created with max of %llu BLAS count but now is being built with %llu BLAS count!",
                        res.instances.size(), blasInstances.size());
-            //EVK_ASSERT(update == true || res.buildInfo.dstAccelerationStructure == VK_NULL_HANDLE, "TLAS is already built, did you meant to build with update == true?");
 
             for (int i = 0; i < blasInstances.size(); i++) {
                 const BLASInstance& blasInstance = blasInstances[i];
@@ -2014,7 +2014,7 @@ namespace evk {
                     .accelerationStructureReference = S.vkGetAccelerationStructureDeviceAddressKHR(S.device, &addressInfo),
                 };
             }
-            WriteBuffer(res.instancesBuffer, res.instances.data(), res.instances.size() * sizeof(VkAccelerationStructureInstanceKHR));
+            WriteBuffer(res.instancesBuffer, res.instances.data(), blasInstances.size() * sizeof(VkAccelerationStructureInstanceKHR));
 
             Buffer scratchBuffer = CreateBuffer({
                 .name = "TLAS Scratch",
@@ -2030,7 +2030,7 @@ namespace evk {
             res.buildInfo.scratchData.deviceAddress = ToInternal(scratchBuffer).deviceAddress;
 
             // Build Offsets info: n instances
-            VkAccelerationStructureBuildRangeInfoKHR buildOffsetInfo{static_cast<uint32_t>(res.instances.size()), 0, 0, 0};
+            VkAccelerationStructureBuildRangeInfoKHR buildOffsetInfo{static_cast<uint32_t>(blasInstances.size()), 0, 0, 0};
             const VkAccelerationStructureBuildRangeInfoKHR* pBuildOffsetInfo = &buildOffsetInfo;
 
             VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};

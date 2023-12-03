@@ -52,14 +52,10 @@ namespace evk {
         std::vector<uint64_t> queries;
         std::vector<TimestampEntry> timestampEntries;
 
-        inline int timestampId(const char* name) {
-            for (int i = 0; i < timestampNames.size(); i++) {
-                if (std::strcmp(timestampNames[i], name) == 0) {
-                    return i;
-                }
-            }
+        inline int AllocTimestap(const char* name) {
+            int id = timestampNames.size();
             timestampNames.push_back(name);
-            return (int)timestampNames.size() - 1;
+            return id;
         }
 
         Buffer stagingBuffer = {};
