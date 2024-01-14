@@ -383,7 +383,7 @@ namespace evk {
             Buffer vertices;
             uint32_t vertexCount;
             Buffer indices;
-            uint32_t indexCount;
+            uint32_t triangleCount;
 
             // AABBs
             Buffer aabbs;

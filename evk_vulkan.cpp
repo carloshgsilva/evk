@@ -677,15 +677,17 @@ namespace evk {
         CHECK_VK(vkResetFences(GetState().device, 1, &F.fence));
         F.queries.resize(PERF_QUERY_COUNT);
 
-        vkGetQueryPoolResults(GetState().device, F.queryPool, 0, PERF_QUERY_COUNT, PERF_QUERY_COUNT * sizeof(uint64_t), F.queries.data(), 8, VK_QUERY_RESULT_64_BIT);
-        F.timestampEntries.clear();
-        uint64_t start = F.queries[0];
-        for (int i = 0; i < F.timestampNames.size(); i++) {
-            TimestampEntry e = {};
-            e.start = (F.queries[i * 2] - start) * 1e-6 / GetState().timestampPeriod;
-            e.end = (F.queries[i * 2 + 1] - start) * 1e-6 / GetState().timestampPeriod;
-            e.name = F.timestampNames[i];
-            F.timestampEntries.push_back(e);
+        if(F.timestampEntries.empty() == false) { 
+            vkGetQueryPoolResults(GetState().device, F.queryPool, 0, PERF_QUERY_COUNT, PERF_QUERY_COUNT * sizeof(uint64_t), F.queries.data(), 8, VK_QUERY_RESULT_64_BIT);
+            F.timestampEntries.clear();
+            uint64_t start = F.queries[0];
+            for (int i = 0; i < F.timestampNames.size(); i++) {
+                TimestampEntry e = {};
+                e.start = (F.queries[i * 2] - start) * 1e-6 / GetState().timestampPeriod;
+                e.end = (F.queries[i * 2 + 1] - start) * 1e-6 / GetState().timestampPeriod;
+                e.name = F.timestampNames[i];
+                F.timestampEntries.push_back(e);
+            }
         }
     }
     void _ReleaseResources() {
@@ -1753,7 +1755,10 @@ namespace evk {
             auto& S = GetState();
             Internal_BLAS* res = new Internal_BLAS();
             res->aabbsBuffer = desc.aabbs;
+            res->vertexBuffer = desc.vertices;
+            res->indexBuffer = desc.indices;
             if (desc.geometry == GeometryType::Triangles) {
+                EVK_ASSERT(desc.stride != 0, "BLASDesc::stride must be different than 0 for triangles");
                 VkAccelerationStructureGeometryTrianglesDataKHR triangles = {
                     .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
                     .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
@@ -1771,7 +1776,7 @@ namespace evk {
                     .flags = VK_GEOMETRY_OPAQUE_BIT_KHR | VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR,
                 });
                 VkAccelerationStructureBuildRangeInfoKHR range = {
-                    .primitiveCount = desc.indexCount / 3,
+                    .primitiveCount = desc.triangleCount,
                     .primitiveOffset = 0,
                     .firstVertex = 0,
                     .transformOffset = 0,
@@ -1969,8 +1974,11 @@ namespace evk {
                 //    batchSize = 0;
                 //}
                 i++;
+                // Cleanup not used resources
                 // TODO: if (desc.allowUpdate == false) {
                     blas.aabbsBuffer = {};
+                    blas.indexBuffer = {};
+                    blas.vertexBuffer = {};
                 //}
             }
         }

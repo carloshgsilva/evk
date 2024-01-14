@@ -27,10 +27,10 @@ namespace evk {
     const uint32_t BINDING_IMAGE = 2;
     const uint32_t BINDING_TLAS = 3;
 
-    const uint32_t STORAGE_COUNT = 8192;
-    const uint32_t IMAGE_COUNT = 8192;
+    const uint32_t STORAGE_COUNT = 16384;
+    const uint32_t IMAGE_COUNT = 16384;
     const uint32_t SAMPLER_COUNT = IMAGE_COUNT;
-    const uint32_t TLAS_COUNT = 8192;
+    const uint32_t TLAS_COUNT = 16384;
     
     const uint32_t PERF_QUERY_COUNT = 64;
 
@@ -199,6 +199,8 @@ namespace evk {
         VkAccelerationStructureKHR accel = {};
         Buffer buffer;
         Buffer aabbsBuffer;
+        Buffer vertexBuffer;
+        Buffer indexBuffer;
 
         ~Internal_BLAS() {
             GetState().vkDestroyAccelerationStructureKHR(GetState().device, accel, nullptr);
