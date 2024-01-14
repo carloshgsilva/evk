@@ -677,7 +677,7 @@ namespace evk {
         CHECK_VK(vkResetFences(GetState().device, 1, &F.fence));
         F.queries.resize(PERF_QUERY_COUNT);
 
-        if(F.timestampEntries.empty() == false) { 
+        if(F.timestampNames.empty() == false) { 
             vkGetQueryPoolResults(GetState().device, F.queryPool, 0, PERF_QUERY_COUNT, PERF_QUERY_COUNT * sizeof(uint64_t), F.queries.data(), 8, VK_QUERY_RESULT_64_BIT);
             F.timestampEntries.clear();
             uint64_t start = F.queries[0];
