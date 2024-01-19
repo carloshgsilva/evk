@@ -1206,24 +1206,22 @@ namespace evk {
 
         EVK_ASSERT(surfaceCaps.minImageCount <= S.frames.size() && S.frames.size() <= surfaceCaps.maxImageCount, "Frame buffering count out of range!");
 
-        VkSwapchainCreateInfoKHR swapchainci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
-        swapchainci.oldSwapchain = oldSwapchain;
-        swapchainci.surface = surface;
-        swapchainci.presentMode = VK_PRESENT_MODE_FIFO_KHR;  // VK_PRESENT_MODE_MAILBOX_KHR = v-sync off
-        swapchainci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        swapchainci.clipped = false;
-
-        swapchainci.imageFormat = format;
-        swapchainci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        swapchainci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        swapchainci.imageArrayLayers = 1;
-        swapchainci.imageExtent = extent;
-        swapchainci.imageColorSpace = colorSpace;
-        swapchainci.minImageCount = (uint32_t)frameCount;
-        swapchainci.preTransform = transform;
-
-        swapchainci.queueFamilyIndexCount = 1;
-        swapchainci.pQueueFamilyIndices = &S.queueFamily;
+        VkSwapchainCreateInfoKHR swapchainci = {
+            .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+            .surface = surface,
+            .minImageCount = (uint32_t)frameCount,
+            .imageFormat = format,
+            .imageColorSpace = colorSpace,
+            .imageExtent = extent,
+            .imageArrayLayers = 1,
+            .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .preTransform = transform,
+            .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+            .presentMode = VK_PRESENT_MODE_FIFO_KHR,  // VK_PRESENT_MODE_MAILBOX_KHR = v-sync off,
+            .clipped = false,
+            .oldSwapchain = oldSwapchain,
+        };
 
         CHECK_VK(vkCreateSwapchainKHR(S.device, &swapchainci, nullptr, &S.swapchain));
         S.swapchainIndex = (uint32_t)(frameCount - 1);
