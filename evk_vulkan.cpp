@@ -1401,7 +1401,6 @@ namespace evk {
             .pMemoryBarriers = &barrier,
         };
         vkCmdPipelineBarrier2(GetFrame().cmd, &dependency);
-        // vkCmdPipelineBarrier(GetFrame().cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 0, nullptr);
     }
     void CmdFill(Buffer dst, uint32_t data, uint64_t size, uint64_t offset) {
         EVK_ASSERT(size % 4 == 0, "Trying to fill buffer '%s', but size is %lld which is not a multiple of 4", GetDesc(dst).name.c_str(), size);
