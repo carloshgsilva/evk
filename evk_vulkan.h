@@ -223,10 +223,8 @@ namespace evk {
         }
     };
 
-    namespace rt {
-        DEFINE_TO_INTERNAL(BLAS)
-        DEFINE_TO_INTERNAL(TLAS)
-    }  // namespace rt
+    DEFINE_TO_INTERNAL(BLAS)
+    DEFINE_TO_INTERNAL(TLAS)
 #endif
 
     DEFINE_TO_INTERNAL(Image)

@@ -364,51 +364,49 @@ namespace evk {
     }
 
 #if EVK_RT
-    namespace rt {
-        enum class GeometryType {
-            Triangles,
-            AABBs,
-        };
+    enum class GeometryType {
+        Triangles,
+        AABBs,
+    };
 
-        struct AABB {
-            float minX, minY, minZ;
-            float maxX, maxY, maxZ;
-        };
+    struct AABB {
+        float minX, minY, minZ;
+        float maxX, maxY, maxZ;
+    };
 
-        struct BLASDesc {
-            GeometryType geometry;
-            uint32_t stride;  // if no extra data: 6*sizeof(float) for AABBs or 3*sizeof(float) for triangles
+    struct BLASDesc {
+        GeometryType geometry;
+        uint32_t stride;  // if no extra data: 6*sizeof(float) for AABBs or 3*sizeof(float) for triangles
 
-            // Triangles
-            Buffer vertices;
-            uint32_t vertexCount;
-            Buffer indices;
-            uint32_t triangleCount;
+        // Triangles
+        Buffer vertices;
+        uint32_t vertexCount;
+        Buffer indices;
+        uint32_t triangleCount;
 
-            // AABBs
-            Buffer aabbs;
-            uint32_t aabbsCount;
-        };
-        struct BLAS : ResourceRef {
-            BLAS(Resource* res = nullptr) : ResourceRef(res) {
-            }
-        };
+        // AABBs
+        Buffer aabbs;
+        uint32_t aabbsCount;
+    };
+    struct BLAS : ResourceRef {
+        BLAS(Resource* res = nullptr) : ResourceRef(res) {
+        }
+    };
 
-        struct BLASInstance {
-            BLAS blas;
-            uint32_t customId = 0u;
-            float transform[12] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
-        };
-        struct TLAS : ResourceRef {
-            TLAS(Resource* res = nullptr) : ResourceRef(res) {
-            }
-        };
+    struct BLASInstance {
+        BLAS blas;
+        uint32_t customId = 0u;
+        float transform[12] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+    };
+    struct TLAS : ResourceRef {
+        TLAS(Resource* res = nullptr) : ResourceRef(res) {
+        }
+    };
 
-        BLAS CreateBLAS(const BLASDesc& desc);
-        TLAS CreateTLAS(uint32_t maxBlasCount, bool allowUpdate);
+    BLAS CreateBLAS(const BLASDesc& desc);
+    TLAS CreateTLAS(uint32_t maxBlasCount, bool allowUpdate);
 
-        void CmdBuildBLAS(const std::vector<BLAS>& blases, bool update = false);
-        void CmdBuildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update = false);
-    }  // namespace rt
+    void CmdBuildBLAS(const std::vector<BLAS>& blases, bool update = false);
+    void CmdBuildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update = false);
 #endif
 }  // namespace evk
