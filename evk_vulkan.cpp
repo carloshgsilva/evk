@@ -23,7 +23,7 @@ namespace evk {
     };
 #define FMT_C(name, vkFormat, size)           \
     {                                         \
-#name, Format::##name, vkFormat, size \
+#name, Format::name, vkFormat, size \
     }
     const FormatConversion FORMAT_VK[] = {
         FMT_C(Undefined, VK_FORMAT_UNDEFINED, 1),
