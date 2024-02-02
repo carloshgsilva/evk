@@ -51,7 +51,7 @@ namespace evk {
         std::vector<TimestampEntry> timestampEntries;
 
         inline int AllocTimestap(const char* name) {
-            int id = timestampNames.size();
+            int id = int(timestampNames.size());
             timestampNames.push_back(name);
             return id;
         }
