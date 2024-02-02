@@ -1,8 +1,5 @@
 #include "evk_vulkan.h"
 
-#include <filesystem>
-#include <fstream>
-
 #define VMA_IMPLEMENTATION
 #include "vk_mem_alloc.h"
 

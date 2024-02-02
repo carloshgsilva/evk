@@ -4,8 +4,6 @@
 
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
-#include <unordered_map>
-#include <filesystem>
 
 #if defined(_DEBUG) || defined(EVK_DEBUG)
 #define EVK_ASSERT(cond, message, ...)                                                        \
