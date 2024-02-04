@@ -92,6 +92,17 @@ namespace evk {
         double start, end;
         const char* name;
     };
+    struct MemoryBudget {
+        static constexpr uint32_t MAX_HEAPS = 16u;
+        struct Heap {
+            uint32_t blockCount;
+            uint32_t allocationCount;
+            uint64_t blockBytes;
+            uint64_t allocationBytes;
+            uint64_t usage;
+            uint64_t budget;
+        } heaps[MAX_HEAPS];
+    };
 
     inline BufferUsage operator|(BufferUsage a, BufferUsage b) {
         return (BufferUsage)((uint32_t)a | (uint32_t)b);
@@ -273,6 +284,7 @@ namespace evk {
     void Sync();
     // Returns the timestamps of the last frame
     const std::vector<TimestampEntry>& GetTimestamps();
+    MemoryBudget GetMemoryBudget();
     // Binds a graphics shader or a compute kernel
     // Eg. Path/To/Shader
     // Graphics and Compute shader will not affect each other

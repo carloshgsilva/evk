@@ -2,6 +2,7 @@
 
 #define VMA_IMPLEMENTATION
 #include "vk_mem_alloc.h"
+#include "evk.h"
 
 namespace evk {
     static State* GState;
@@ -1271,7 +1272,13 @@ namespace evk {
         return GetFrame().timestampEntries;
     }
 
-    //////////
+    MemoryBudget GetMemoryBudget() {
+        static_assert(sizeof(MemoryBudget::Heap) == sizeof(VmaBudget));
+        static_assert(MemoryBudget::MAX_HEAPS == VK_MAX_MEMORY_HEAPS);
+        MemoryBudget budget = {};
+        vmaGetHeapBudgets(GetState().allocator, (VmaBudget*)&budget);
+        return budget;
+    }
     // Cmds //
     //////////
     void CmdBind(Pipeline pipeline) {
