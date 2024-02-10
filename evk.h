@@ -19,7 +19,7 @@ namespace evk {
         TransferSrc = 1,
         TransferDst = 2,
         Vertex = 4,     // used in cmd.vertex()
-        Index = 8,      // used in cmd.drawIndex;ed() and cmd.drawIndexedIndirect()
+        Index = 8,      // used in cmd.drawIndexed() and cmd.drawIndexedIndirect()
         Indirect = 16,  // used in cmd.drawIndirect() and cmd.drawIndexedIndirect()
         Storage = 32,
         AccelerationStructure = 64,        // used internally for ray tracing acceleration structure

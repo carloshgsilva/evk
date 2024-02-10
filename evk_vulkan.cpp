@@ -1739,14 +1739,18 @@ namespace evk {
             .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
             .pLabelName = name,
         };
-        GetState().vkCmdBeginDebugUtilsLabelEXT(GetFrame().cmd, &label);
+        if(GetState().vkCmdBeginDebugUtilsLabelEXT) {
+            GetState().vkCmdBeginDebugUtilsLabelEXT(GetFrame().cmd, &label);
+        }
         int id = GetFrame().AllocTimestap(name);
         vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, id * 2);
         return id;
     }
     void CmdEndTimestamp(int id) {
         vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, id * 2 + 1);
-        GetState().vkCmdEndDebugUtilsLabelEXT(GetFrame().cmd);
+        if(GetState().vkCmdEndDebugUtilsLabelEXT) {
+            GetState().vkCmdEndDebugUtilsLabelEXT(GetFrame().cmd);
+        }
     }
 
 #if EVK_RT
