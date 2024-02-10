@@ -184,7 +184,7 @@ namespace evk {
             vkDestroyPipeline(GetState().device, pipeline, nullptr);
         }
     };
-#if EVK_RT
+    
     struct Internal_BLAS : Resource {
         std::vector<VkAccelerationStructureGeometryKHR> geometries;
         std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
@@ -223,8 +223,6 @@ namespace evk {
 
     DEFINE_TO_INTERNAL(BLAS)
     DEFINE_TO_INTERNAL(TLAS)
-#endif
-
     DEFINE_TO_INTERNAL(Image)
     DEFINE_TO_INTERNAL(Buffer)
     DEFINE_TO_INTERNAL(Pipeline)

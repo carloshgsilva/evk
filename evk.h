@@ -3,8 +3,6 @@
 #include <vector>
 #include <string>
 
-#define EVK_RT 1
-
 namespace evk {
     constexpr int MAX_VERTEX_BINDING_COUNT = 4;
     constexpr int MAX_VERTEX_ATTRIBUTE_COUNT = 4;
@@ -111,32 +109,6 @@ namespace evk {
         return (ImageUsage)((uint32_t)a | (uint32_t)b);
     }
 
-    template <std::size_t _index, typename T>
-    struct _Constant_Impl {
-        _Constant_Impl(T const& v) {
-            val = v;
-        }
-
-       private:
-        T val;
-    };
-    template <std::size_t Index, typename... Types>
-    struct _Constant_RecurrBase {};
-    template <std::size_t Index, typename T, typename... Types>
-    struct _Constant_RecurrBase<Index, T, Types...> : public _Constant_Impl<Index, typename std::remove_reference_t<T>>, public _Constant_RecurrBase<Index + 1, Types...> {
-        template <typename CL, typename... CArgs>
-        _Constant_RecurrBase(CL&& arg, CArgs&&... args) : _Constant_Impl<Index, typename std::remove_reference_t<T>>(std::forward<CL>(arg)), _Constant_RecurrBase<Index + 1, Types...>(std::forward<CArgs>(args)...) {
-        }
-    };
-    template <typename T, typename... Types>
-    struct Constant : public _Constant_RecurrBase<0, T, Types...> {
-        template <typename... CArgs>
-        Constant(CArgs&&... args) : _Constant_RecurrBase<0, T, Types...>(std::forward<CArgs>(args)...) {
-        }
-    };
-    template <typename... CArgs>
-    Constant(CArgs... args) -> Constant<CArgs...>;
-
     struct Resource {
         RID resourceid = -1;
         uint32_t refCount = 0;
@@ -195,6 +167,7 @@ namespace evk {
             other.res = res;
             res = temp;
         }
+        RID GetRID() const;
     };
 
     struct PipelineDesc {
@@ -256,6 +229,89 @@ namespace evk {
     };
     Image CreateImage(const ImageDesc& desc);
 
+    const BufferDesc& GetDesc(const Buffer& res);
+    const ImageDesc& GetDesc(const Image& res);
+
+    enum class GeometryType {
+        Triangles,
+        AABBs,
+    };
+
+    struct AABB {
+        float minX, minY, minZ;
+        float maxX, maxY, maxZ;
+    };
+
+    struct BLASDesc {
+        GeometryType geometry;
+        uint32_t stride;  // if no extra data: 6*sizeof(float) for AABBs or 3*sizeof(float) for triangles
+
+        // Triangles
+        Buffer vertices;
+        uint32_t vertexCount;
+        Buffer indices;
+        uint32_t triangleCount;
+
+        // AABBs
+        Buffer aabbs;
+        uint32_t aabbsCount;
+    };
+    struct BLAS : ResourceRef {
+        BLAS(Resource* res = nullptr) : ResourceRef(res) {
+        }
+    };
+
+    struct BLASInstance {
+        BLAS blas;
+        uint32_t customId = 0u;
+        float transform[12] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+    };
+    struct TLAS : ResourceRef {
+        TLAS(Resource* res = nullptr) : ResourceRef(res) {
+        }
+    };
+
+    BLAS CreateBLAS(const BLASDesc& desc);
+    TLAS CreateTLAS(uint32_t maxBlasCount, bool allowUpdate);
+
+    template <std::size_t _index, typename T>
+    struct _Constant_Impl {
+        _Constant_Impl(T const& v) : val(v) {}
+       private:
+        T val;
+    };
+    template <std::size_t _index>
+    struct _Constant_Impl<_index, Image> {
+        _Constant_Impl(Image const& v) : val(v.GetRID()) {}
+       private:
+        RID val;
+    };
+    template <std::size_t _index>
+    struct _Constant_Impl<_index, Buffer> {
+        _Constant_Impl(Buffer const& v) : val(v.GetRID()) {}
+       private:
+        RID val;
+    };
+    template <std::size_t _index>
+    struct _Constant_Impl<_index, TLAS> {
+        _Constant_Impl(TLAS const& v) : val(v.GetRID()) {}
+       private:
+        RID val;
+    };
+    template <std::size_t Index, typename... Types>
+    struct _ConstantRecurr {};
+
+    template <std::size_t Index, typename T, typename... Types>
+    struct _ConstantRecurr<Index, T, Types...> 
+        : public _Constant_Impl<Index, typename std::remove_reference_t<T>>, public _ConstantRecurr<Index + 1, Types...> {};
+    
+    template <typename T, typename... Types>
+    struct Constant : public _ConstantRecurr<0, T, Types...> { };
+    
+    template <typename... CArgs>
+    Constant(CArgs... args) -> Constant<CArgs...>;
+    
+
     struct EvkDesc {
         std::string applicationName = "";
         std::uint32_t applicationVersion = 0;
@@ -265,10 +321,6 @@ namespace evk {
         std::vector<std::string> instanceExtensions = {};
         uint32_t frameBufferingCount = 3;
     };
-
-    RID GetRID(const ResourceRef& ref); // TODO: make it a method
-    const BufferDesc& GetDesc(const Buffer& res);
-    const ImageDesc& GetDesc(const Image& res);
 
     bool InitializeEVK(const EvkDesc& info);
     void Shutdown();
@@ -335,6 +387,8 @@ namespace evk {
     void CmdDrawIndexedIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countBufferOffset, uint32_t drawCount, uint32_t stride);
     int CmdBeginTimestamp(const char* name);
     void CmdEndTimestamp(int id);
+    void CmdBuildBLAS(const std::vector<BLAS>& blases, bool update = false);
+    void CmdBuildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update = false);
 
     template <typename... Args>
     void CmdPush(const Constant<Args...>& data) {
@@ -375,50 +429,4 @@ namespace evk {
         CmdEndTimestamp(id);
     }
 
-#if EVK_RT
-    enum class GeometryType {
-        Triangles,
-        AABBs,
-    };
-
-    struct AABB {
-        float minX, minY, minZ;
-        float maxX, maxY, maxZ;
-    };
-
-    struct BLASDesc {
-        GeometryType geometry;
-        uint32_t stride;  // if no extra data: 6*sizeof(float) for AABBs or 3*sizeof(float) for triangles
-
-        // Triangles
-        Buffer vertices;
-        uint32_t vertexCount;
-        Buffer indices;
-        uint32_t triangleCount;
-
-        // AABBs
-        Buffer aabbs;
-        uint32_t aabbsCount;
-    };
-    struct BLAS : ResourceRef {
-        BLAS(Resource* res = nullptr) : ResourceRef(res) {
-        }
-    };
-
-    struct BLASInstance {
-        BLAS blas;
-        uint32_t customId = 0u;
-        float transform[12] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
-    };
-    struct TLAS : ResourceRef {
-        TLAS(Resource* res = nullptr) : ResourceRef(res) {
-        }
-    };
-
-    BLAS CreateBLAS(const BLASDesc& desc);
-    TLAS CreateTLAS(uint32_t maxBlasCount, bool allowUpdate);
-
-    void CmdBuildBLAS(const std::vector<BLAS>& blases, bool update = false);
-    void CmdBuildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update = false);
-#endif
 }  // namespace evk

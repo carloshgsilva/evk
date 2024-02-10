@@ -103,6 +103,17 @@ namespace evk {
             GetFrame().toDelete.push_back(this);
         }
     }
+    RID ResourceRef::GetRID() const {
+        EVK_ASSERT(res != nullptr, "Trying to get resource id of invalid resource");
+
+        EVK_ASSERT(!dynamic_cast<Internal_Image*>(res) || ((uint32_t) dynamic_cast<Internal_Image*>(res)->desc.usage & (uint32_t)ImageUsage::Sampled || (uint32_t) dynamic_cast<Internal_Image*>(res)->desc.usage & (uint32_t)ImageUsage::Storage),
+                   "Image '%s' must have ImageUsage::Sampled or ImageUsage::Storage", dynamic_cast<Internal_Image*>(res)->desc.name.c_str());
+
+        EVK_ASSERT(!dynamic_cast<Internal_Buffer*>(res) || ((uint32_t) dynamic_cast<Internal_Buffer*>(res)->desc.usage & (uint32_t)BufferUsage::Storage), "Buffer '%s' must have BufferUsage::Storage",
+                   dynamic_cast<Internal_Buffer*>(res)->desc.name.c_str());
+
+        return res->resourceid;
+    }
 
     ////////////
     // Buffer //
@@ -201,17 +212,6 @@ namespace evk {
         EVK_ASSERT(GetDesc(buffer).memoryType != MemoryType::GPU, "Trying to read from buffer '%s', but its memory type is GPU!", GetDesc(buffer).name.c_str());
         EVK_ASSERT(offset + size <= res->desc.size, "Trying to read Buffer '%s' out of range!", res->desc.name.c_str());
         std::memcpy(dst, (void*)((size_t)res->mappedData + offset), size);
-    }
-    RID GetRID(const ResourceRef& ref) {
-        EVK_ASSERT(ref.res != nullptr, "Trying to get resource id of invalid resource");
-
-        EVK_ASSERT(!dynamic_cast<Internal_Image*>(ref.res) || ((uint32_t) dynamic_cast<Internal_Image*>(ref.res)->desc.usage & (uint32_t)ImageUsage::Sampled || (uint32_t) dynamic_cast<Internal_Image*>(ref.res)->desc.usage & (uint32_t)ImageUsage::Storage),
-                   "Image '%s' must have ImageUsage::Sampled or ImageUsage::Storage", dynamic_cast<Internal_Image*>(ref.res)->desc.name.c_str());
-
-        EVK_ASSERT(!dynamic_cast<Internal_Buffer*>(ref.res) || ((uint32_t) dynamic_cast<Internal_Buffer*>(ref.res)->desc.usage & (uint32_t)BufferUsage::Storage), "Buffer '%s' must have BufferUsage::Storage",
-                   dynamic_cast<Internal_Buffer*>(ref.res)->desc.name.c_str());
-
-        return ref.res->resourceid;
     }
 
     ///////////
@@ -884,7 +884,7 @@ namespace evk {
                 .pNext = &feature_bufferDeviceAddress,
                 .synchronization2 = true,
             };
-#if EVK_RT
+
             VkPhysicalDevice8BitStorageFeatures feature_8bitStorage = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES,
                 .pNext = &feature_sync2,
@@ -914,7 +914,7 @@ namespace evk {
                 .pNext = &feature_accelerationStructure,
                 .rayQuery = VK_TRUE,
             };
-#endif
+
 
             // Create device and get queue
             std::vector<const char*> deviceExtensions = {
@@ -922,12 +922,10 @@ namespace evk {
                 VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
                 VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
 
-#if EVK_RT
                 VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
                 VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
                 VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
                 VK_KHR_RAY_QUERY_EXTENSION_NAME,
-#endif
             };
 
 // Check device extensions support
@@ -955,11 +953,8 @@ namespace evk {
             deviceci.pQueueCreateInfos = &deviceQueueci;
             deviceci.enabledExtensionCount = (uint32_t)deviceExtensions.size();
             deviceci.ppEnabledExtensionNames = deviceExtensions.data();
-#if EVK_RT
             deviceci.pNext = &feature_rayQuery;
-#else
-            deviceci.pNext = &feature_bufferDeviceAddress;
-#endif
+
 
             CHECK_VK(vkCreateDevice(S.physicalDevice, &deviceci, nullptr, &S.device));
             vkGetDeviceQueue(S.device, S.queueFamily, 0, &S.queue);
@@ -995,9 +990,7 @@ namespace evk {
                 {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, STORAGE_COUNT},
                 {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SAMPLER_COUNT},
                 {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, IMAGE_COUNT},
-#if EVK_RT
                 {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, TLAS_COUNT},
-#endif
             };
             VkDescriptorPoolCreateInfo poolci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
             poolci.poolSizeCount = (uint32_t)poolSizes.size();
@@ -1011,9 +1004,7 @@ namespace evk {
                 {BINDING_STORAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, STORAGE_COUNT, VK_SHADER_STAGE_ALL},
                 {BINDING_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SAMPLER_COUNT, VK_SHADER_STAGE_ALL},
                 {BINDING_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, IMAGE_COUNT, VK_SHADER_STAGE_ALL},
-#if EVK_RT
                 {BINDING_TLAS, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, TLAS_COUNT, VK_SHADER_STAGE_ALL},
-#endif
             };
 
             // Flag each binding as partially bound and update after bind
@@ -1022,9 +1013,7 @@ namespace evk {
                 VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
                 VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
                 VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
-#if EVK_RT
                 VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
-#endif
             };
             setLayoutBindingsFlags.bindingCount = (uint32_t)bindingFlags.size();
             setLayoutBindingsFlags.pBindingFlags = bindingFlags.data();
@@ -1096,7 +1085,6 @@ namespace evk {
 
         // Raytracing
         {
-#if EVK_RT
             VkDevice device = GetState().device;
             GetState().vkGetAccelerationStructureBuildSizesKHR = (PFN_vkGetAccelerationStructureBuildSizesKHR)vkGetDeviceProcAddr(device, "vkGetAccelerationStructureBuildSizesKHR");
             GetState().vkCreateAccelerationStructureKHR = (PFN_vkCreateAccelerationStructureKHR)vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR");
@@ -1107,7 +1095,6 @@ namespace evk {
             GetState().vkGetRayTracingShaderGroupHandlesKHR = (PFN_vkGetRayTracingShaderGroupHandlesKHR)vkGetDeviceProcAddr(device, "vkGetRayTracingShaderGroupHandlesKHR");
             GetState().vkCmdTraceRaysKHR = (PFN_vkCmdTraceRaysKHR)vkGetDeviceProcAddr(device, "vkCmdTraceRaysKHR");
             GetState().vkDestroyAccelerationStructureKHR = (PFN_vkDestroyAccelerationStructureKHR)vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR");
-#endif
         }
 
         _WaitFrameCompletion();
@@ -1753,7 +1740,6 @@ namespace evk {
         }
     }
 
-#if EVK_RT
     BLAS CreateBLAS(const BLASDesc& desc) {
         auto& S = GetState();
         Internal_BLAS* res = new Internal_BLAS();
@@ -2051,5 +2037,4 @@ namespace evk {
         // Build the TLAS
         S.vkCmdBuildAccelerationStructuresKHR(GetFrame().cmd, 1, &res.buildInfo, &pBuildOffsetInfo);
     }
-#endif
 }  // namespace evk
