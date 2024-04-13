@@ -1394,6 +1394,7 @@ namespace evk {
         vkCmdPipelineBarrier2(GetFrame().cmd, &dependency);
     }
     void CmdFill(Buffer dst, uint32_t data, uint64_t size, uint64_t offset) {
+        EVK_ASSERT(size > 0, "Size must be bigger than 0");
         EVK_ASSERT(size % 4 == 0, "Trying to fill buffer '%s', but size is %lld which is not a multiple of 4", GetDesc(dst).name.c_str(), size);
         vkCmdFillBuffer(GetFrame().cmd, ToInternal(dst).buffer, offset, size, data);
     }
@@ -1487,6 +1488,8 @@ namespace evk {
         vkCmdCopyBufferToImage(GetFrame().cmd, ToInternal(src).buffer, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()), copies);
     }
     void CmdCopy(Buffer& src, Buffer& dst, uint64_t size, uint64_t srcOffset, uint64_t dstOffset) {
+        EVK_ASSERT(size > 0, "Size must be bigger than 0");
+
         VkBufferCopy copy{};
         copy.srcOffset = srcOffset;
         copy.dstOffset = dstOffset;
@@ -1496,6 +1499,8 @@ namespace evk {
     }
 
     void CmdCopy(void* src, Image& dst, uint64_t size, uint32_t mip, uint32_t layer) {
+        EVK_ASSERT(size > 0, "Size must be bigger than 0");
+
         auto& F = GetFrame();
         auto& extent = GetDesc(dst).extent;
 
@@ -1520,9 +1525,10 @@ namespace evk {
         vkCmdCopyBufferToImage(GetFrame().cmd, ToInternal(F.stagingBuffer).buffer, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }
     void CmdCopy(void* src, Buffer& dst, uint64_t size, uint64_t dstOffset) {
-        auto& F = GetFrame();
-
+        EVK_ASSERT(size > 0, "Size must be bigger than 0");
         // EVK_ASSERT(F.stagingOffset + size < 64'000'000, "Staging buffer out of memory");
+
+        auto& F = GetFrame();
         if (F.stagingOffset + size >= 64'000'000) {
             printf("[evk] [warn] Creating extra staging buffer of size %llu!!! FIXME\n", size);
             Buffer tempStaging = CreateBuffer({
