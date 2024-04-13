@@ -1662,14 +1662,14 @@ namespace evk {
         auto& S = GetState();
         VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, 0, S.frames[S.swapchainSemaphoreIndex].imageReadySemaphore, 0, &S.swapchainIndex);
 
-        CmdBarrier(F.image, ImageLayout::Undefined, ImageLayout::Attachment);
+        CmdBarrier(S.frames[S.swapchainIndex].image, ImageLayout::Undefined, ImageLayout::Attachment);
 
         ClearValue clears[] = {ClearColor{0.0f, 0.0f, 0.0f, 1.0f}};
-        CmdBeginRender(&F.image, clears, 1);
+        CmdBeginRender(&S.frames[S.swapchainIndex].image, clears, 1);
     }
     void CmdEndPresent() {
         CmdEndRender();
-        CmdBarrier(GetFrame().image, ImageLayout::Attachment, ImageLayout::Present);
+        CmdBarrier(GetState().frames[GetState().swapchainIndex].image, ImageLayout::Attachment, ImageLayout::Present);
     }
     void CmdViewport(float x, float y, float w, float h, float minDepth, float maxDepth) {
         VkViewport viewport = {};
