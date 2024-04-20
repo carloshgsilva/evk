@@ -663,9 +663,6 @@ namespace evk {
                 S.frame = (int)S.frames.size() - 1;
                 RecreateSwapchain();
             }
-
-            S.swapchainSemaphoreIndex++;
-            S.swapchainSemaphoreIndex = S.swapchainIndex % S.frames.size();
         }
     }
     void _WaitFrameCompletion() {
@@ -909,9 +906,14 @@ namespace evk {
                 .accelerationStructureCaptureReplay = VK_TRUE,
                 .descriptorBindingAccelerationStructureUpdateAfterBind = VK_TRUE,
             };
+            VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR feature_rtPositionFetch = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR,
+                .pNext = &feature_accelerationStructure,
+                .rayTracingPositionFetch = true,
+            };
             VkPhysicalDeviceRayQueryFeaturesKHR feature_rayQuery = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
-                .pNext = &feature_accelerationStructure,
+                .pNext = &feature_rtPositionFetch,
                 .rayQuery = VK_TRUE,
             };
 
@@ -926,6 +928,7 @@ namespace evk {
                 VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
                 VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
                 VK_KHR_RAY_QUERY_EXTENSION_NAME,
+                VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME,
             };
 
 // Check device extensions support
@@ -1489,6 +1492,7 @@ namespace evk {
     }
     void CmdCopy(Buffer& src, Buffer& dst, uint64_t size, uint64_t srcOffset, uint64_t dstOffset) {
         EVK_ASSERT(size > 0, "Size must be bigger than 0");
+        EVK_ASSERT((size + dstOffset) <= ToInternal(dst).allocation->GetSize(), "size + dstOffset must be smaller or equal than buffer size");
 
         VkBufferCopy copy{};
         copy.srcOffset = srcOffset;
@@ -1538,25 +1542,12 @@ namespace evk {
             });
             uint64_t staging = uint64_t(tempStaging.GetPtr());
             std::memcpy((void*)staging, src, size);
-
-            VkBufferCopy copy{};
-            copy.srcOffset = 0;
-            copy.dstOffset = dstOffset;
-            copy.size = size;
-
-            vkCmdCopyBuffer(GetFrame().cmd, ToInternal(tempStaging).buffer, ToInternal(dst).buffer, 1, &copy);
+            CmdCopy(tempStaging, dst, size, 0u, dstOffset);
         } else {
             uint64_t staging = uint64_t(F.stagingBuffer.GetPtr()) + F.stagingOffset;
             std::memcpy((void*)staging, src, size);
-
-            VkBufferCopy copy{};
-            copy.srcOffset = F.stagingOffset;
-            copy.dstOffset = dstOffset;
-            copy.size = size;
-
+            CmdCopy(F.stagingBuffer, dst, size, F.stagingOffset, dstOffset);
             F.stagingOffset += size;
-
-            vkCmdCopyBuffer(GetFrame().cmd, ToInternal(F.stagingBuffer).buffer, ToInternal(dst).buffer, 1, &copy);
         }
     }
 
@@ -1660,8 +1651,8 @@ namespace evk {
         F.doingPresent = true;
 
         auto& S = GetState();
+        S.swapchainSemaphoreIndex = S.swapchainIndex;
         VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, 0, S.frames[S.swapchainSemaphoreIndex].imageReadySemaphore, 0, &S.swapchainIndex);
-
         CmdBarrier(S.frames[S.swapchainIndex].image, ImageLayout::Undefined, ImageLayout::Attachment);
 
         ClearValue clears[] = {ClearColor{0.0f, 0.0f, 0.0f, 1.0f}};
@@ -1754,6 +1745,10 @@ namespace evk {
         res->indexBuffer = desc.indices;
         if (desc.geometry == GeometryType::Triangles) {
             EVK_ASSERT(desc.stride != 0, "BLASDesc::stride must be different than 0 for triangles");
+            EVK_ASSERT(desc.indices, "BLASDesc::indices must not be null");
+            EVK_ASSERT(desc.vertices, "BLASDesc::vertices must not be null");
+            EVK_ASSERT(desc.triangleCount > 0, "BLASDesc::triangleCount must not be zero");
+
             VkAccelerationStructureGeometryTrianglesDataKHR triangles = {
                 .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
                 .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
@@ -1779,6 +1774,9 @@ namespace evk {
             res->ranges.push_back(range);
             res->primCounts.push_back(range.primitiveCount);
         } else if (desc.geometry == GeometryType::AABBs) {
+            EVK_ASSERT(desc.aabbs, "BLASDesc::aabbs must not be null");
+            EVK_ASSERT(desc.aabbsCount, "BLASDesc::aabbsCount must not be zero");
+
             VkAccelerationStructureGeometryAabbsDataKHR aabbs = {
                 .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR,
                 .data = ToInternal(desc.aabbs).deviceAddress,
@@ -1803,7 +1801,7 @@ namespace evk {
         res->buildInfo = VkAccelerationStructureBuildGeometryInfoKHR{
             .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
             .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-            .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,
+            .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR|VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR,
             .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
             .geometryCount = static_cast<uint32_t>(res->geometries.size()),
             .pGeometries = res->geometries.data(),
