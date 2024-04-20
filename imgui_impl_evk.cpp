@@ -149,7 +149,7 @@ IMGUI_IMPL_API void ImGui_ImplEvk_RenderDrawData(ImDrawData* draw_data) {
                     translate[1] = -1.0f - draw_data->DisplayPos.y * scale[1];
 
                     int rid = (int)(uint64_t)pcmd->TextureId;
-                    if(rid == 0) rid = GetRID(g_fontImage);
+                    if(rid == 0) rid = g_fontImage.GetRID();
                     CmdPush(&rid, sizeof(int), sizeof(float)*4);
                     CmdScissor((int32_t)clip_rect.x, (int32_t)clip_rect.y, (uint32_t)(clip_rect.z - clip_rect.x), (uint32_t)(clip_rect.w - clip_rect.y));
                     CmdDrawIndexed(pcmd->ElemCount, 1, pcmd->IdxOffset + global_idx_offset, pcmd->VtxOffset + global_vtx_offset, 0);
