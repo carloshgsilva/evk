@@ -160,16 +160,13 @@ float length(const vec4& a) {
 }
 
 vec2 normalize(const vec2& a) {
-    float l = length(a);
-    return vec2(a.x / l, a.y / l);
+    return a / length(a);
 }
 vec3 normalize(const vec3& a) {
-    float l = length(a);
-    return vec3(a.x / l, a.y / l, a.z / l);
+    return a / length(a);
 }
 vec4 normalize(const vec4& a) {
-    float l = length(a);
-    return quat(a.x / l, a.y / l, a.z / l, a.w / l);
+    return a / length(a);
 }
 quat normalize(const quat& a) {
     float l = length(a);
@@ -441,7 +438,6 @@ uint32_t unpart1by2(uint32_t n) {
 uint32_t morton32_encode(uint32_t x, uint32_t y, uint32_t z){
     return part1by2(x) | (part1by2(y) << 1) | (part1by2(z) << 2);
 }
-
 void morton32_decode(uint32_t n, uint32_t& x, uint32_t& y, uint32_t& z){
     x = unpart1by2(n);
     y = unpart1by2(n >> 1);
