@@ -50,9 +50,43 @@ struct mat3 {
 struct mat4 {
     union {
         float a[16];
-        float m[4][4];
         vec4 v[4];
     };
+
+    mat4() {
+        for(int i = 0; i < 16; i++) {
+            a[i] = 0.0f;
+        }
+    }
+    mat4(float d) : mat4() {
+        for(int i = 0; i < 4; i++) {
+            a[i*5] = 1.0f;
+        }
+    }
+    mat4(const vec4& v0, const vec4& v1, const vec4& v2, const vec4& v3) {
+        v[0] = v0;
+        v[1] = v1;
+        v[2] = v2;
+        v[3] = v3;
+    }
+    mat4(float e0, float e1, float e2, float e3, float e4, float e5, float e6, float e7, float e8, float e9, float e10, float e11, float e12, float e13, float e14, float e15) {
+        a[0] = e0;
+        a[1] = e1;
+        a[2] = e2;
+        a[3] = e3;
+        a[4] = e4;
+        a[5] = e5;
+        a[6] = e6;
+        a[7] = e7;
+        a[8] = e8;
+        a[9] = e9;
+        a[10] = e10;
+        a[11] = e11;
+        a[12] = e12;
+        a[13] = e13;
+        a[14] = e14;
+        a[15] = e15;
+    }
 
     vec3 right() {
         return vec3{a[0], a[1], a[2]};
@@ -90,6 +124,17 @@ GLSL_OP(*);
 GLSL_OP(+);
 GLSL_OP(-);
 GLSL_OP(/);
+
+
+float dot(const vec2& a, const vec2& b) {
+    return a.x*b.x + a.y*b.y;
+}
+float dot(const vec3& a, const vec3& b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+float dot(const vec4& a, const vec4& b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
+}
 
 vec3 cross(const vec3& a, const vec3& b) {
     return vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
@@ -328,6 +373,28 @@ void mat4_decompose(mat4 m, vec3& position, quat& rotation, vec3& scale) {
     scale.x = sx;
     scale.y = sy;
     scale.z = sz;
+}
+
+mat4 mat4_look_at(const vec3& at, const vec3& eye, const vec3& up) {
+    const vec3 f = normalize(at - eye);
+    const vec3 s = normalize(cross(f, up));
+    const vec3 u = cross(s, f);
+
+    mat4 m = mat4(1.0f);
+    m[0][0] = s.x;
+    m[1][0] = s.y;
+    m[2][0] = s.z;
+    m[0][1] = u.x;
+    m[1][1] = u.y;
+    m[2][1] = u.z;
+    m[0][2] =-f.x;
+    m[1][2] =-f.y;
+    m[2][2] =-f.z;
+    m[3][0] =-dot(s, eye);
+    m[3][1] =-dot(u, eye);
+    m[3][2] = dot(f, eye);
+
+    return m;
 }
 
 uint32_t part1by2(uint32_t n) {
