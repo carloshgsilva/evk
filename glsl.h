@@ -235,6 +235,20 @@ mat4 inverse(const mat4& m) {
     return ret;
 }
 
+mat4 operator*(const mat4& a, const mat4& b) {
+    mat4 t = {};
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            float v = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                v += a.a[k * 4 + j] * b.a[i * 4 + k];
+            }
+            t.a[i * 4 + j] = v;
+        }
+    }
+    return t;
+}
+
 quat operator*(const quat& a, const quat& b) {
     return quat{
         a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
