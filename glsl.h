@@ -140,19 +140,6 @@ vec3 cross(const vec3& a, const vec3& b) {
     return vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
 }
 
-vec2 normalize(const vec2& a) {
-    float l = sqrtf(a.x*a.x + a.y*a.y);
-    return vec2(a.x / l, a.y / l);
-}
-vec3 normalize(const vec3& a) {
-    float l = sqrtf(a.x*a.x + a.y*a.y + a.z*a.z);
-    return vec3(a.x / l, a.y / l, a.z / l);
-}
-vec4 normalize(const vec4& a) {
-    float l = sqrtf(a.x*a.x + a.y*a.y + a.z*a.z + a.w*a.w);
-    return quat(a.x / l, a.y / l, a.z / l, a.w / l);
-}
-
 float length(const vec2& a) {
     float dx = a.x;
     float dy = a.y;
@@ -170,6 +157,23 @@ float length(const vec4& a) {
     float dz = a.z;
     float dw = a.w;
     return sqrtf(dx*dx + dy*dy + dz*dz + dw*dw);
+}
+
+vec2 normalize(const vec2& a) {
+    float l = length(a);
+    return vec2(a.x / l, a.y / l);
+}
+vec3 normalize(const vec3& a) {
+    float l = length(a);
+    return vec3(a.x / l, a.y / l, a.z / l);
+}
+vec4 normalize(const vec4& a) {
+    float l = length(a);
+    return quat(a.x / l, a.y / l, a.z / l, a.w / l);
+}
+quat normalize(const quat& a) {
+    float l = length(a);
+    return quat(a.x / l, a.y / l, a.z / l, a.w / l);
 }
 
 float distance(const vec2& a, const vec2& b) {
@@ -234,10 +238,29 @@ mat4 inverse(const mat4& m) {
     return ret;
 }
 
-vec3 quat_rotate(const quat& q, const vec3& v) {
+quat operator*(const quat& a, const quat& b) {
+    return quat{
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w 
+    };
+}
+vec3 operator*(const quat& q, const vec3& v) {
     vec3 xyz = vec3(q.x, q.y, q.z);
     vec3 t = cross(xyz, cross(xyz, v) + v * q.w);
     return v + t + t;
+}
+quat quat_from_axis_angle(const vec3& axis, float angle) {
+   float factor = sinf( angle / 2.0f );
+
+   quat q;
+   q.x = axis.x * factor;
+   q.y = axis.y * factor;
+   q.z = axis.z * factor;
+
+   q.w = cosf(angle/2.0f);
+   return normalize(q);
 }
 
 mat4 mat4_rotate(const vec3& a, float angle) {
@@ -329,6 +352,7 @@ mat4 quat_to_mat4(const quat& q) {
 
     return m;
 }
+
 
 mat4 mat4_compose(const vec3& position, const quat& rotation, const vec3& scale) {
     mat4 m = quat_to_mat4(rotation);
