@@ -109,11 +109,11 @@ struct quat : public vec4 {
 };
 
 #define GLSL_OP_VEC2(_type, _op) \
-_type operator##_op(const _type& a, const _type& b) { return _type(a.x _op b.x, a.y _op b.y); }
+_type operator _op(const _type& a, const _type& b) { return _type(a.x _op b.x, a.y _op b.y); }
 #define GLSL_OP_VEC3(_type, _op) \
-_type operator##_op(const _type& a, const _type& b) { return _type(a.x _op b.x, a.y _op b.y, a.z _op b.z); }
+_type operator _op(const _type& a, const _type& b) { return _type(a.x _op b.x, a.y _op b.y, a.z _op b.z); }
 #define GLSL_OP_VEC4(_type, _op) \
-_type operator##_op(const _type& a, const _type& b) { return _type(a.x _op b.x, a.y _op b.y, a.z _op b.z, a.w _op b.w); }
+_type operator _op(const _type& a, const _type& b) { return _type(a.x _op b.x, a.y _op b.y, a.z _op b.z, a.w _op b.w); }
 
 #define GLSL_OP(_op)    \
 GLSL_OP_VEC2(vec2, _op) \
