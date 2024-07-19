@@ -195,6 +195,7 @@ namespace evk {
         VkAccelerationStructureBuildSizesInfoKHR sizeInfo = {};
 
         VkAccelerationStructureKHR accel = {};
+        VkDeviceAddress accStructureDeviceAddress = {};
         Buffer buffer;
         Buffer aabbsBuffer;
         Buffer vertexBuffer;

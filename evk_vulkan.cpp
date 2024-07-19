@@ -1959,6 +1959,12 @@ namespace evk {
             };
             vkCmdPipelineBarrier(GetFrame().cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
+            VkAccelerationStructureDeviceAddressInfoKHR addressInfo = {
+                .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+                .accelerationStructure = blas.accel,
+            };
+            blas.accStructureDeviceAddress = S.vkGetAccelerationStructureDeviceAddressKHR(S.device, &addressInfo);
+
             // TODO: Compactation
             // if (batchSize >= batchSizeLimit || i == blases.size() - 1) {
             //    Sync();  // TODO: replace with SubmitSync()
@@ -1986,11 +1992,7 @@ namespace evk {
         for (int i = 0; i < blasInstances.size(); i++) {
             const BLASInstance& blasInstance = blasInstances[i];
             Internal_BLAS& internalBlas = ToInternal(blasInstance.blas);
-
-            VkAccelerationStructureDeviceAddressInfoKHR addressInfo = {
-                .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
-                .accelerationStructure = internalBlas.accel,
-            };
+            EVK_ASSERT(internalBlas.accStructureDeviceAddress != 0u, "BLAS is not built");
 
             VkTransformMatrixKHR transform{};
             transform.matrix[0][0] = blasInstance.transform[0];
@@ -2012,7 +2014,7 @@ namespace evk {
                 .mask = 0xFF,
                 .instanceShaderBindingTableRecordOffset = 0,
                 .flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR,
-                .accelerationStructureReference = S.vkGetAccelerationStructureDeviceAddressKHR(S.device, &addressInfo),
+                .accelerationStructureReference = internalBlas.accStructureDeviceAddress,
             };
         }
         WriteBuffer(res.instancesBuffer, res.instances.data(), blasInstances.size() * sizeof(VkAccelerationStructureInstanceKHR));
