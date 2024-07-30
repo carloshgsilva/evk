@@ -2011,7 +2011,7 @@ namespace evk {
             res.instances[i] = VkAccelerationStructureInstanceKHR{
                 .transform = transform,
                 .instanceCustomIndex = blasInstance.customId,
-                .mask = 0xFF,
+                .mask = blasInstance.mask,
                 .instanceShaderBindingTableRecordOffset = 0,
                 .flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR,
                 .accelerationStructureReference = internalBlas.accStructureDeviceAddress,
