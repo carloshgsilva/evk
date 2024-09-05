@@ -1651,7 +1651,7 @@ namespace evk {
         F.doingPresent = true;
 
         auto& S = GetState();
-        S.swapchainSemaphoreIndex = S.swapchainIndex;
+        S.swapchainSemaphoreIndex = (S.swapchainSemaphoreIndex + 1) % S.frames.size();
         VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, 0, S.frames[S.swapchainSemaphoreIndex].imageReadySemaphore, 0, &S.swapchainIndex);
         CmdBarrier(S.frames[S.swapchainIndex].image, ImageLayout::Undefined, ImageLayout::Attachment);
 
