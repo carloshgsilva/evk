@@ -712,13 +712,26 @@ namespace evk {
             appInfo.pEngineName = desc.engineName.c_str();
             appInfo.engineVersion = desc.engineVersion;
 
+            
+            std::vector<std::string> instanceLayers = {};
+            std::vector<std::string> instanceExtensions = {};
+
+            if (desc.enableSwapchain) {
+                instanceExtensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+                #if WIN32
+                    instanceExtensions.push_back("VK_KHR_win32_surface");
+                #else
+                    #error "Unsupported platform"
+                #endif
+            }
+
             // Instance Info
             std::vector<const char*> extensions;
-            for (auto& name : desc.instanceExtensions) {
+            for (auto& name : instanceExtensions) {
                 extensions.push_back(name.c_str());
             }
             std::vector<const char*> layers;
-            for (auto& name : desc.instanceLayers) {
+            for (auto& name : instanceLayers) {
                 layers.push_back(name.c_str());
             }
 
@@ -1155,6 +1168,7 @@ namespace evk {
     bool RecreateSwapchain() {
         auto& S = GetState();
         CHECK_VK(vkDeviceWaitIdle(S.device));
+        EVK_ASSERT(S.surface != nullptr, "Surface is not initialized!");
 
         auto oldSwapchain = S.swapchain;
         VkSurfaceKHR surface = (VkSurfaceKHR)S.surface;
