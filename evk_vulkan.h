@@ -134,6 +134,7 @@ namespace evk {
     };
     State& GetState();
     FrameData& GetFrame();
+    void SetState(State* state);
 
 #define DEFINE_TO_INTERNAL(libClass) \
     static inline Internal_##libClass& ToInternal(const libClass& ref) { return *((Internal_##libClass*)ref.res); }

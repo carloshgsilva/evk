@@ -612,6 +612,11 @@ namespace evk {
         EVK_ASSERT(GState, "EVK not intialized! did you call evk::Initialize()?");
         return *GState;
     }
+    void SetState(State* state) {
+        EVK_ASSERT(state != nullptr, "State is null!");
+        EVK_ASSERT(GState == nullptr, "State already initialized!");
+        GState = state;
+    }
     FrameData& GetFrame() {
         return GetState().frames[GetState().frame];
     }
