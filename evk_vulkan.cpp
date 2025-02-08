@@ -96,6 +96,15 @@ namespace evk {
         }
     }
 
+    bool DoesFormatHaveStencil(Format format) {
+        switch (format) {
+            case Format::D24UnormS8Uint:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     bool RecreateSwapchain();
 
     void Resource::decRef() {
@@ -516,7 +525,10 @@ namespace evk {
         renderingCreateInfo.colorAttachmentCount = renderingColorAttachmentCount;
         renderingCreateInfo.pColorAttachmentFormats = renderingFormats;
         renderingCreateInfo.depthAttachmentFormat = renderingDepthStencilFormat;
-        renderingCreateInfo.stencilAttachmentFormat = renderingDepthStencilFormat;
+        renderingCreateInfo.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+        if (DoesFormatHaveStencil(desc.attachments.back())) {
+            renderingCreateInfo.stencilAttachmentFormat = renderingDepthStencilFormat;
+        }
         renderingCreateInfo.viewMask = 0;
         renderingCreateInfo.pNext = nullptr;
 
@@ -1307,7 +1319,10 @@ namespace evk {
         bool isDepth = DoesFormatHaveDepth(GetDesc(image).format);
         VkImageAspectFlags aspects = {};
         if (isDepth) {
-            aspects |= VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+            aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (DoesFormatHaveStencil(GetDesc(image).format)) {
+                aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            }
         } else {
             aspects |= VK_IMAGE_ASPECT_COLOR_BIT;
         }
@@ -1587,21 +1602,23 @@ namespace evk {
 
         GetFrame().insideRenderPass = true;
 
-        bool hasDepthStencil = false;
+        bool hasDepth = false;
+        bool hasStencil = false;
         uint32_t colorAttachmentCount = 0;
         VkRenderingAttachmentInfoKHR attachInfos[MAX_ATTACHMENTS_COUNT];
         for (int i = 0; i < attachmentCount; i++) {
             auto& desc = GetDesc(attachments[i]);
             auto& attach = attachInfos[i];
             auto& clear = clearValues[i];
-            bool isDepth = DoesFormatHaveDepth(desc.format);
+            bool isDepthStencil = DoesFormatHaveDepth(desc.format);
+            bool isStencil = DoesFormatHaveStencil(desc.format);
             EVK_ASSERT((uint32_t)ToInternal(attachments[i]).desc.usage & (uint32_t)ImageUsage::Attachment, "Image '%s' which is attachment %d don't have ImageUsage::Attachment", GetDesc(attachments[i]).name.c_str(), i);
 
             attach = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
-            if (isDepth) {
-                EVK_ASSERT(hasDepthStencil == false, "Only one depth stencil allowed!");
+            if (isDepthStencil || isStencil) {
                 EVK_ASSERT(i == attachmentCount - 1, "DepthStencil attachment must be in the last attachment index!");
-                hasDepthStencil = true;
+                hasDepth = isDepthStencil;
+                hasStencil = isStencil;
             } else {
                 colorAttachmentCount++;
             }
@@ -1615,7 +1632,7 @@ namespace evk {
             attach.loadOp = clearValues ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             attach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             if (clearValues) {
-                if (isDepth) {
+                if (isDepthStencil || isStencil) {
                     VkClearDepthStencilValue clearDepthStencil;
                     clearDepthStencil.depth = clear.depthStencil.depth;
                     clearDepthStencil.stencil = clear.depthStencil.stencil;
@@ -1638,8 +1655,8 @@ namespace evk {
         info.viewMask = 0;
         info.colorAttachmentCount = colorAttachmentCount;
         info.pColorAttachments = attachInfos;
-        info.pDepthAttachment = hasDepthStencil ? &attachInfos[attachmentCount - 1] : nullptr;
-        info.pStencilAttachment = hasDepthStencil ? &attachInfos[attachmentCount - 1] : nullptr;
+        info.pDepthAttachment = hasDepth ? &attachInfos[attachmentCount - 1] : nullptr;
+        info.pStencilAttachment = hasStencil ? &attachInfos[attachmentCount - 1] : nullptr;
         info.pNext = nullptr;
 
         VkViewport viewport{};
