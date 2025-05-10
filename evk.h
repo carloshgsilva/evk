@@ -318,6 +318,8 @@ namespace evk {
         std::uint32_t applicationVersion = 0;
         std::string engineName = "";
         std::uint32_t engineVersion = 0;
+        std::vector<std::string> instanceLayers = {};
+        std::vector<std::string> instanceExtensions = {};
         uint32_t frameBufferingCount = 3;
         bool enableSwapchain = false;
     };
