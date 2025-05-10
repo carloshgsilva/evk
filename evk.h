@@ -379,6 +379,7 @@ namespace evk {
     void CmdScissor(int32_t x, int32_t y, uint32_t w, uint32_t h);
     void CmdPush(void* data, uint32_t size, uint32_t offset = 0);
     void CmdClear(Image image, ClearValue value);
+    void CmdLineWidth(float width);
     void CmdDraw(uint32_t vertexCount, uint32_t instanceCount = 1, uint32_t firstVertex = 0, uint32_t firstInstance = 0);
     void CmdDrawIndexed(uint32_t indexCount, uint32_t instanceCount = 1, uint32_t firstIndex = 0, int32_t vertexOffset = 0, uint32_t firstInstance = 0);
     void CmdDrawIndirect(Buffer& buffer, uint64_t offset, uint32_t drawCount, uint32_t stride);
