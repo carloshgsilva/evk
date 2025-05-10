@@ -409,7 +409,7 @@ namespace evk {
         VkViewport viewport = {0.0f, 0.0f, 1024.0f, 720.0f, 0.0f, 1.0f};
         VkRect2D scissor = {{0, 0}, {std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::max()}};
         std::vector<VkPipelineColorBlendAttachmentState> attachments;
-        std::vector<VkDynamicState> dynamicState = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        std::vector<VkDynamicState> dynamicState = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_LINE_WIDTH};
 
         VkPipelineShaderStageCreateInfo stages[2];
         stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -867,6 +867,7 @@ namespace evk {
             features.shaderStorageImageReadWithoutFormat = true;
             features.shaderStorageImageWriteWithoutFormat = true;
             features.independentBlend = true;
+            features.wideLines = true;
             
             VkPhysicalDeviceShaderAtomicFloatFeaturesEXT feature_atomicFloat = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
@@ -1675,6 +1676,8 @@ namespace evk {
         scissor.extent.height = extent.height;
         vkCmdSetScissor(GetFrame().cmd, 0, 1, &scissor);
 
+        vkCmdSetLineWidth(GetFrame().cmd, 1.0f);
+
         vkCmdBeginRendering(GetFrame().cmd, &info);
     }
     void CmdEndRender() {
@@ -1736,6 +1739,9 @@ namespace evk {
             VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = desc.mipCount, .baseArrayLayer = 0, .layerCount = desc.layerCount};
             vkCmdClearColorImage(GetFrame().cmd, ToInternal(image).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &vkValue, 1, &range);
         }
+    }
+    void CmdLineWidth(float width) {
+        vkCmdSetLineWidth(GetFrame().cmd, width);
     }
     void CmdDraw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
         vkCmdDraw(GetFrame().cmd, vertexCount, instanceCount, firstVertex, firstInstance);

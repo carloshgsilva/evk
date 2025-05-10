@@ -200,7 +200,7 @@ namespace evk {
         std::string name = "";
         uint64_t size = 0;
         BufferUsage usage = BufferUsage::TransferSrc;
-        MemoryType memoryType = MemoryType::CPU;
+        MemoryType memoryType = MemoryType::GPU;
     };
     struct Buffer : ResourceRef {
         Buffer(Resource* res = nullptr) : ResourceRef(res) {
