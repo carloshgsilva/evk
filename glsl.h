@@ -1,3 +1,6 @@
+#pragma once
+
+#include <cmath>
 
 using uint = unsigned int;
 
