@@ -987,7 +987,6 @@ namespace evk {
 
             // Create device and get queue
             std::vector<const char*> deviceExtensions = {
-                VK_KHR_SWAPCHAIN_EXTENSION_NAME,
                 VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
                 VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
 
@@ -998,6 +997,11 @@ namespace evk {
                 VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME,
                 VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME,
             };
+
+            // Conditionally enable swapchain device extension only if swapchain support requested
+            if (desc.enableSwapchain) {
+                deviceExtensions.insert(deviceExtensions.begin(), VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+            }
 
 // Check device extensions support
 #if EVK_DEBUG
