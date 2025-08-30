@@ -120,6 +120,10 @@ struct MatMul : Tensor {
 
 struct Graph {
     std::vector<Tensor*> tensors;
+    evk::Pipeline pipeline = evk::CreatePipeline({
+        .name = "MatMul",
+        .CS = evk::loadSpirvFile("shaders/bin/matmul.comp.spv"),
+    });
 
     Graph() {
     }
@@ -175,47 +179,35 @@ struct Graph {
     }
 };
 
-int main() {
-    set_unhandled_exception_filter();
-
+void test_graph() {
     Graph g;
     Tensor* a = g.one();
     Tensor* b = g.one();
     Tensor* c = g.matmul(a, b);
     g.forward();
     g.optimizer_zero();
-    c->grad[0] = 1.0f;
+    c->grad[0] = 1.0f;                                                                  
     g.backward();
     g.optimizer_step();
  
     printf("a.grad[0] = %f\n", a->grad[0]);
     printf("b.grad[0] = %f\n", b->grad[0]);
     printf("c.grad[0] = %f\n", c->grad[0]);
+}
 
+int main() {
+    set_unhandled_exception_filter();
 
+    evk::InitializeEVK({
+        .applicationName = "evk_example",
+        .applicationVersion = 1,
+        .engineName = "evk_example_engine",
+        .engineVersion = 1,
+        .enableSwapchain = false,
+    });
 
-    // evk::EvkDesc desc;
-    // desc.applicationName = "evk_example";
-    // desc.applicationVersion = 1;
-    // desc.engineName = "evk_example_engine";
-    // desc.engineVersion = 1;
-    // desc.enableSwapchain = false; // keep simple: no surface
+    test_graph();
 
-    // if (!evk::InitializeEVK(desc)) {
-    //     std::cerr << "Failed to initialize EVK" << std::endl;
-    //     return -1;
-    // }
-
-    // uint64_t size = 4292870144ull;
-    // std::cout << "Buffer size: " << size << std::endl;
-    // evk::Buffer buffer = evk::CreateBuffer({
-    //     .size = size,
-    // });
-
-    // // Query some properties to ensure linking works
-    // uint32_t frames = evk::GetFrameBufferingCount();
-    // std::cout << "EVK initialized with frame buffering count: " << frames << std::endl;
-
-    // evk::Shutdown();
+    evk::Shutdown();
     return 0;
 }

@@ -2,6 +2,8 @@
 
 #include <vector>
 #include <string>
+#include <fstream>
+#include <iterator>
 
 namespace evk {
     constexpr int MAX_VERTEX_BINDING_COUNT = 4;
@@ -430,6 +432,22 @@ namespace evk {
         int id = CmdBeginTimestamp(name);
         callback();
         CmdEndTimestamp(id);
+    }
+
+    // Loads a SPIR-V binary from disk into a std::vector<uint8_t>.
+    // Returns an empty vector on failure.
+    inline std::vector<uint8_t> loadSpirvFile(const std::string& path) {
+        std::vector<uint8_t> data;
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file) return data;
+        std::streamsize size = file.tellg();
+        if (size <= 0) return data;
+        data.resize((size_t)size);
+        file.seekg(0, std::ios::beg);
+        if (!file.read(reinterpret_cast<char*>(data.data()), size)) {
+            data.clear();
+        }
+        return data;
     }
 
 }  // namespace evk
