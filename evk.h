@@ -199,7 +199,7 @@ namespace evk {
     struct BufferDesc {
         std::string name = "";
         uint64_t size = 0;
-        BufferUsage usage = BufferUsage::TransferSrc;
+        BufferUsage usage = BufferUsage::Storage;
         MemoryType memoryType = MemoryType::GPU;
     };
     struct Buffer : ResourceRef {
