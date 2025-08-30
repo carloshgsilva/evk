@@ -11,8 +11,11 @@ endif()
 add_library(evk "${CMAKE_CURRENT_SOURCE_DIR}/evk_vulkan.cpp")
 target_include_directories(evk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(evk PRIVATE cxx_std_20)
-
 # vulkan
 find_package(Vulkan REQUIRED)
 target_link_libraries(evk PUBLIC Vulkan::Vulkan)
 target_compile_definitions(evk PUBLIC "EVK_VULKAN=1")
+
+add_executable(evk_example "${CMAKE_CURRENT_SOURCE_DIR}/examples/simple/main.cpp")
+target_link_libraries(evk_example PRIVATE evk)
+set_target_properties(evk_example PROPERTIES CXX_STANDARD 20)

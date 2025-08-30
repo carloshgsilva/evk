@@ -1,0 +1,9 @@
+{
+    "label": "run program",
+    "type": "shell",
+    "command": "${command:cmake.launchTargetPath}",
+    "group": {
+        "kind": "build",
+        "isDefault": true
+    }
+}
