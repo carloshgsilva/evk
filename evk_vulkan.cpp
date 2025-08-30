@@ -1181,11 +1181,9 @@ namespace evk {
         auto& S = GetState();
 
         // release internal resources
-        {
-            for (auto& f : S.frames) {
-                f.image.release();
-                f.stagingBuffer.release();
-            }
+        for (auto& f : S.frames) {
+            f.image.release();
+            f.stagingBuffer.release();
         }
 
         _EndFrame();
@@ -1215,9 +1213,11 @@ namespace evk {
         vkDestroyDescriptorPool(S.device, S.descriptorPool, nullptr);
         vkDestroyDescriptorSetLayout(S.device, S.descriptorSetLayout, nullptr);
         vkDestroyPipelineLayout(S.device, S.pipelineLayout, nullptr);
-        vkDestroySwapchainKHR(S.device, S.swapchain, nullptr);
+        if(S.swapchain != nullptr) {
+            vkDestroySwapchainKHR(S.device, S.swapchain, nullptr);
+            vkDestroySurfaceKHR(S.instance, S.surface, nullptr);
+        }
         vkDestroyDevice(S.device, nullptr);
-        vkDestroySurfaceKHR(S.instance, S.surface, nullptr);
         vkDestroyInstance(S.instance, nullptr);
 
         delete GState;

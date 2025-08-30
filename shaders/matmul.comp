@@ -1,0 +1,7 @@
+#include "evk.frag"
+
+COMPUTE(1, 1, 1)
+void main() {
+    int index = int(gl_GlobalInvocationID.x);
+    printf("index = %d\n", index);
+}

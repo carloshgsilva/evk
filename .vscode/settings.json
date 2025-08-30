@@ -1,4 +1,5 @@
 {
+    "shaderc-lint.shadercOutputDir": "shaders/bin",
     "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
     "files.associations": {
         "algorithm": "cpp",
