@@ -1,198 +1,229 @@
 #include <iostream>
 #include <evk.h>
+#include <cassert>
 
 #include "win_dbg.h"
 
 struct Shape {
-    uint64_t values[8];
-    uint32_t count;
+    static constexpr uint32_t MAX_DIMENSIONS = 8;
+    uint32_t values[MAX_DIMENSIONS];
+    uint32_t size;
 
-    uint64_t operator[] (uint64_t index) const {
+    Shape() {
+        size = 0;
+    }
+    Shape(std::initializer_list<uint32_t> shape_values) {
+        assert(shape_values.size() <= MAX_DIMENSIONS);
+        this->size = uint32_t(shape_values.size());
+        int i = 0;
+        for (auto it = shape_values.begin(); it != shape_values.end(); ++it) {
+            this->values[i] = *it;
+            ++i;
+        }
+    }
+
+    uint32_t operator[] (int index) const {
+        assert(index < int(size));
+        if(index < 0) index = size + index;
+        assert(index >= 0 && index < int(size));
         return values[index];
+    }
+
+    // return the number of dimensions/rank
+    uint32_t rank() const {
+        return size;
+    }
+
+    // return the total number of elements
+    uint32_t count() const {
+        uint32_t c = 1;
+        for (uint32_t i = 0; i < size; ++i) {
+            c *= values[i];
+        }
+        return c;
+    }
+
+    // return the batch merged size
+    // e.g. shape = (2, 3, 4, 5) and element_count = 2, then return 2 * 3
+    uint32_t batch_size(uint32_t element_count) const {
+        assert(element_count <= size);
+        uint32_t b = 1;
+        for(uint32_t i = 0; i < size - element_count; ++i) {
+            b *= values[i];
+        }
+        return b;
     }
 };
 
 struct Tensor {
-    float* buffer;
-    uint64_t size;
+    evk::Buffer buffer;
     Shape shape;
-    bool is_param;
-    float* grad;
+    std::vector<float> cpu_data;
 
-    void optimizer_zero() {
-        if (grad) {
-            for (uint64_t i = 0; i < size; ++i) grad[i] = 0.0f;
-        }
-    }
-    void optimizer_step() {
-        if (is_param && grad) {
-            // simple SGD with lr = 0.01
-            const float lr = 0.01f;
-            for (uint64_t i = 0; i < size; ++i) buffer[i] -= lr * grad[i];
-        }
-    }
-
-    Tensor(const Shape& shape, bool is_param = false) {
+    Tensor(const Shape& shape) {
         this->shape = shape;
-        this->is_param = is_param;
         // compute total size as product of first `count` dimensions
-        uint64_t s = 1;
-        for (uint32_t i = 0; i < shape.count; ++i) s *= shape.values[i];
-        this->size = s;
-        buffer = new float[s];
-        grad = new float[s];
-        // initialize to zero
-        for (uint64_t i = 0; i < s; ++i) { buffer[i] = 0.0f; grad[i] = 0.0f; }
+        uint32_t s = shape.count() * sizeof(float);
+        buffer = evk::CreateBuffer({
+            .size = s,
+            .usage = evk::BufferUsage::Storage,
+        });
     }
 
-    virtual void forward() {
-        // base tensor has no-op forward
+    // copies data from CPU to GPU
+    void set_cpu(const std::vector<float>& data) {
+        assert(data.size() == shape.count());
+        cpu_data = data;
+        evk::CmdCopy(cpu_data.data(), buffer, shape.count() * sizeof(float));
+        evk::Sync();
     }
-    virtual void backward() {
-        // base tensor has no-op backward
+
+    // allocates and copies data from GPU to CPU
+    std::vector<float>& cpu() {
+        cpu_data.resize(shape.count());
+        evk::Buffer cpu_buffer = evk::CreateBuffer({
+            .size = shape.count() * sizeof(float),
+            .usage = evk::BufferUsage::TransferDst,
+            .memoryType = evk::MemoryType::CPU,
+        });
+        evk::CmdCopy(buffer, cpu_buffer, shape.count() * sizeof(float));
+        evk::Sync();
+        evk::ReadBuffer(cpu_buffer, cpu_data.data(), shape.count() * sizeof(float), 0);
+        return cpu_data;
+    }
+
+    void print() {
+        printf("Tensor (");
+        for (uint32_t i = 0; i < shape.rank(); ++i) {
+            if(i != 0) printf(", ");
+            printf("%d", shape[i]);
+        }
+        printf("): [");
+        std::vector<float>& data = cpu();
+        for (uint32_t i = 0; i < shape.count(); ++i) {
+            if(i != 0) printf(" ");
+            printf("%f", data[i]);
+        }
+        printf("]\n");
     }
 };
 
-struct MatMul : Tensor {
-    Tensor* a;
-    Tensor* b;
-    MatMul(Tensor* a, Tensor* b) : Tensor(Shape{}, false) {
-        // set shape properly
-        Shape s;
-        s.count = 2;
-        s.values[0] = a->shape.values[0];
-        s.values[1] = b->shape.values[1];
-        this->shape = s;
-        uint64_t sz = s.values[0] * s.values[1];
-        this->size = sz;
-        delete[] buffer;
-        delete[] grad;
-        buffer = new float[sz];
-        grad = new float[sz];
-        for (uint64_t i = 0; i < sz; ++i) { buffer[i] = 0.0f; grad[i] = 0.0f; }
-        this->a = a;
-        this->b = b;
+// pure fp16 and u16 tensors machine learning library
+// it's not an auto-grad framework, but it has backward of the functions
+namespace evk::ai {
+    struct Pipelines {
+        evk::Pipeline matmul;
+    };
+    std::unique_ptr<Pipelines> pipelines;
+
+    void initialize() {
+        pipelines = std::make_unique<Pipelines>();
+        pipelines->matmul = evk::CreatePipeline({
+            .name = "matmul",
+            .CS = evk::loadSpirvFile("shaders/bin/matmul.comp.spv"),
+        });
+    }
+    void shutdown() {
+        pipelines.reset();
+    }
+
+    void matmul(Tensor& a, Tensor& b, Tensor& c) {
+        assert(a.shape.rank() >= 2);
+        assert(b.shape.rank() >= 2);
+        assert(c.shape.rank() >= 2);
+        assert(a.shape.batch_size(2) == b.shape.batch_size(2));
+        assert(a.shape[-1] == b.shape[-2]);
+        evk::CmdBind(pipelines->matmul);
+        // Determine batch size B. If tensor rank >= 3 use first dim as batch, otherwise 1.
+        uint32_t batch = 1;
+        if (a.shape.rank() >= 3) batch = a.shape.batch_size(2);
+
+        // infer matrix dims: A is M x K, B is K x N
+        uint32_t M = (a.shape.rank() >= 1) ? a.shape[0] : 1;
+        uint32_t K = (a.shape.rank() >= 2) ? a.shape[1] : 1;
+        uint32_t N = (b.shape.rank() >= 2) ? b.shape[1] : 1;
+
+        evk::CmdPush(evk::Constant{
+            a.buffer.GetRID(),
+            b.buffer.GetRID(),
+            c.buffer.GetRID(),
+            batch,
+            M,
+            K,
+            N
+        });
+
+        // dispatch groups based on TILE size in shader (TILE = 16)
+        const uint32_t TILE = 16u;
+        uint32_t groupX = (N + TILE - 1) / TILE; // covers columns (N)
+        uint32_t groupY = (M + TILE - 1) / TILE; // covers rows (M)
+        evk::CmdDispatch(groupX, groupY, batch);
+    }
+    void matmul_bwd(Tensor& a, Tensor& b, Tensor& c) {
+        evk::CmdBind(pipelines->matmul);
+        evk::CmdPush(evk::Constant{
+            a.buffer.GetRID(),
+            b.buffer.GetRID(),
+            c.buffer.GetRID()
+        });
+    }
+}
+
+
+struct Layer {
+    // MLP
+    // Attention
+
+    std::unique_ptr<Tensor> one;
+};
+
+struct Transformer {
+    std::unique_ptr<Tensor> input;
+    std::unique_ptr<Tensor> weights;
+    // std::vector<Layer> layers;
+    std::unique_ptr<Tensor> output;
+
+    Transformer(uint32_t num_layers) {
+        // for (uint32_t i = 0; i < num_layers; ++i) {
+        //     layers.push_back(Layer());
+        // }
+        weights = std::make_unique<Tensor>(Shape({2, 2}));
+        input = std::make_unique<Tensor>(Shape({2, 2}));
+        output = std::make_unique<Tensor>(Shape({2, 2}));
     }
 
     void forward() {
-        // assume a: (m x k), b: (k x n) -> this: (m x n)
-        uint64_t m = a->shape.values[0];
-        uint64_t k = a->shape.values[1];
-        uint64_t n = b->shape.values[1];
-        for (uint64_t i = 0; i < m; ++i) {
-            for (uint64_t j = 0; j < n; ++j) {
-                float sum = 0.0f;
-                for (uint64_t t = 0; t < k; ++t) {
-                    sum += a->buffer[i*k + t] * b->buffer[t*n + j];
-                }
-                buffer[i*n + j] = sum;
-            }
-        }
+        evk::ai::matmul(*input, *weights, *output);
+        // for (auto& layer : layers) {
+        // }
+        evk::Sync();
     }
 
     void backward() {
-        printf("MatMul backward\n");
-        // compute gradients w.r.t a and b assuming grad contains dL/dC
-        uint64_t m = a->shape.values[0];
-        uint64_t k = a->shape.values[1];
-        uint64_t n = b->shape.values[1];
-        // accumulate into a->grad and b->grad
-        for (uint64_t i = 0; i < m; ++i) {
-            for (uint64_t t = 0; t < k; ++t) {
-                float acc = 0.0f;
-                for (uint64_t j = 0; j < n; ++j) {
-                    acc += grad[i*n + j] * b->buffer[t*n + j];
-                }
-                a->grad[i*k + t] += acc;
-            }
-        }
-        for (uint64_t t = 0; t < k; ++t) {
-            for (uint64_t j = 0; j < n; ++j) {
-                float acc = 0.0f;
-                for (uint64_t i = 0; i < m; ++i) {
-                    acc += a->buffer[i*k + t] * grad[i*n + j];
-                }
-                b->grad[t*n + j] += acc;
-            }
-        }
+        evk::ai::matmul_bwd(*output, *weights, *input);
+        // for (auto& layer : layers) {
+        // }
+        evk::Sync();
     }
 };
 
-struct Graph {
-    std::vector<Tensor*> tensors;
-    evk::Pipeline pipeline = evk::CreatePipeline({
-        .name = "MatMul",
-        .CS = evk::loadSpirvFile("shaders/bin/matmul.comp.spv"),
-    });
-
-    Graph() {
-    }
-    ~Graph() {
-        for (auto t : tensors) {
-            delete t;
-        }
-    }
-
-    Tensor* zero() {
-        Shape s; s.count = 2; s.values[0] = 1; s.values[1] = 1;
-        Tensor* t = new Tensor(s, false);
-        t->buffer[0] = 0.0f;
-        tensors.push_back(t);
-        return t;
-    }
-    Tensor* one() {
-        Shape s; s.count = 2; s.values[0] = 1; s.values[1] = 1;
-        Tensor* t = new Tensor(s, false);
-        t->buffer[0] = 1.0f;
-        tensors.push_back(t);
-        return t;
-    }
-    Tensor* matmul(Tensor* a, Tensor* b) {
-        MatMul* m = new MatMul(a, b);
-        tensors.push_back(m); 
-        return m;
-    }
-
-
-    void forward() {
-        for (auto t : tensors) {
-            t->forward();
-        }
-    }
-    void backward() {
-        for (auto it = tensors.rbegin(); it != tensors.rend(); ++it) {
-            (*it)->backward();
-        }
-    }
-
-    // zero the gradients
-    void optimizer_zero() {
-        for (auto t : tensors) {
-            t->optimizer_zero();
-        }
-    }
-    // step the optimizer and apply the gradients
-    void optimizer_step() {
-        for (auto t : tensors) {
-            t->optimizer_step();
-        }
-    }
-};
 
 void test_graph() {
-    Graph g;
-    Tensor* a = g.one();
-    Tensor* b = g.one();
-    Tensor* c = g.matmul(a, b);
-    g.forward();
-    g.optimizer_zero();
-    c->grad[0] = 1.0f;                                                                  
-    g.backward();
-    g.optimizer_step();
- 
-    printf("a.grad[0] = %f\n", a->grad[0]);
-    printf("b.grad[0] = %f\n", b->grad[0]);
-    printf("c.grad[0] = %f\n", c->grad[0]);
+    evk::ai::initialize();
+
+    Transformer transformer(1);
+    transformer.input->set_cpu({1.0f, 2.0f, 3.0f, 4.0f});
+    transformer.weights->set_cpu({1.0f, 2.0f, 3.0f, 4.0f});
+    transformer.forward();
+
+    transformer.input->print();
+    transformer.weights->print();
+    transformer.output->print();
+    // transformer.backward();
+    
+    // printf("input.grad[0] = %f\n", transformer.input->grad[0]);
+    // printf("weights.grad[0] = %f\n", transformer.weights->grad[0]);
+    // printf("output.grad[0] = %f\n", transformer.output->grad[0]);
 }
 
 int main() {
@@ -208,6 +239,7 @@ int main() {
 
     test_graph();
 
+    evk::ai::shutdown();
     evk::Shutdown();
     return 0;
 }

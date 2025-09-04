@@ -61,6 +61,13 @@
         "xtr1common": "cpp",
         "xutility": "cpp",
         "cinttypes": "cpp",
-        "fstream": "cpp"
+        "fstream": "cpp",
+        "chrono": "cpp",
+        "filesystem": "cpp",
+        "forward_list": "cpp",
+        "iomanip": "cpp",
+        "sstream": "cpp",
+        "array": "cpp",
+        "span": "cpp"
     }
 }
