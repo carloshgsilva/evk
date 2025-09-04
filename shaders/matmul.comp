@@ -1,7 +1,91 @@
 #include "evk.frag"
 
-COMPUTE(1, 1, 1)
+PUSH(
+    int aBufferRID;
+    int bBufferRID;
+    int cBufferRID;
+    uint B; // B = batch size (optional, set to 1 if unused)
+    uint M; // M = rows of A / output rows
+    uint K; // K = shared dimension (columns of A / rows of B)
+    uint N; // N = columns of B / output columns
+)
+
+BINDING_BUFFER_RW(float_buffer,
+    float at[];
+)
+
+// TILED MATMUL
+// Expects buffers packed in row-major:
+// A: B x M x K at binding aBufferRID
+// B: B x K x N at binding bBufferRID
+// C: B x M x N at binding cBufferRID
+
+// Tune tile size for target GPU. Keep local_size_x * local_size_y <= 1024 generally.
+#define TILE 16
+// shared memory tiles must be declared at global scope
+shared float Asub[TILE][TILE];
+shared float Bsub[TILE][TILE];
+
+COMPUTE(TILE, TILE, 1)
 void main() {
-    int index = int(gl_GlobalInvocationID.x);
-    printf("index = %d\n", index);
+    // global indices
+    uvec2 gid = uvec2(gl_GlobalInvocationID.xy);
+    uint row = gid.y; // y is row (M)
+    uint col = gid.x; // x is col (N)
+    // batch index (z dimension)
+    uint batchIdx = gl_GlobalInvocationID.z;
+    // compute per-batch base offsets (assumes host arranges buffers per-batch contiguously)
+    uint aBase = batchIdx * (M * K);
+    uint bBase = batchIdx * (K * N);
+    uint cBase = batchIdx * (M * N);
+
+    // Shared memory tiles for A and B (declared at global scope)
+    float acc = 0.0;
+
+    // Loop over tiles of K dimension
+    for (uint t = 0; t < (K + TILE - 1) / TILE; ++t) {
+        // Each invocation loads one element of A and one of B into shared memory if within bounds
+        uint aRow = row;
+        uint aCol = t * TILE + gl_LocalInvocationID.x;
+        uint bRow = t * TILE + gl_LocalInvocationID.y;
+        uint bCol = col;
+
+        // compute flat indices for buffers: A is M x K row-major, B is K x N row-major
+        float aVal = 0.0;
+        float bVal = 0.0;
+        if (aRow < M && aCol < K) {
+            // compute index relative to per-batch A base
+            uint aIndex = aBase + aRow * K + aCol;
+            aVal = float_buffer[aBufferRID].at[aIndex];
+        }
+        if (bRow < K && bCol < N) {
+            // compute index relative to per-batch B base
+            uint bIndex = bBase + bRow * N + bCol;
+            bVal = float_buffer[bBufferRID].at[bIndex];
+        }
+
+        Asub[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = aVal;
+        Bsub[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = bVal;
+
+        // ensure tile loads complete
+        barrier();
+
+        // compute partial products
+        for (uint k = 0; k < TILE; ++k) {
+            uint globalK = t * TILE + k;
+            if (globalK < K) {
+                acc += Asub[gl_LocalInvocationID.y][k] * Bsub[k][gl_LocalInvocationID.x];
+            }
+        }
+
+        // wait for all threads before next tile
+        barrier();
+    }
+
+    // Write output if within bounds
+    if (row < M && col < N) {
+        // write result to per-batch C base
+        uint outIndex = cBase + row * N + col;
+        float_buffer[cBufferRID].at[outIndex] = acc;
+    }
 }
