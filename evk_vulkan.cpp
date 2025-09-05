@@ -452,6 +452,24 @@ namespace evk {
         stages[1].flags = 0;
         stages[1].pNext = nullptr;
 
+        // Setup specialization constants if provided in desc.constants
+        VkSpecializationInfo specializationInfo{};
+        std::vector<VkSpecializationMapEntry> specEntries;
+        if (desc.constants.count > 0) {
+            specEntries.resize(desc.constants.count);
+            for (uint32_t i = 0; i < desc.constants.count; ++i) {
+                specEntries[i].constantID = i;
+                specEntries[i].offset = i * 4; // each entry is 4 bytes
+                specEntries[i].size = 4;
+            }
+            specializationInfo.mapEntryCount = (uint32_t)specEntries.size();
+            specializationInfo.pMapEntries = specEntries.data();
+            specializationInfo.dataSize = desc.constants.count * 4;
+            specializationInfo.pData = desc.constants.data;
+            stages[0].pSpecializationInfo = &specializationInfo;
+            stages[1].pSpecializationInfo = &specializationInfo;
+        }
+
         VkPipelineVertexInputStateCreateInfo vertexInfo = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         vertexInfo.vertexBindingDescriptionCount = (uint32_t)bindings.size();
         vertexInfo.pVertexBindingDescriptions = bindings.data();
@@ -580,10 +598,32 @@ namespace evk {
     }
     VkPipeline createComputePipeline(const PipelineDesc& desc, VkShaderModule computeShader) {
         VkComputePipelineCreateInfo pipelineci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        pipelineci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        pipelineci.stage.module = computeShader;
-        pipelineci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipelineci.stage.pName = "main";
+
+        VkPipelineShaderStageCreateInfo stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stage.module = computeShader;
+        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.pName = "main";
+
+        // specialization constants
+        VkSpecializationInfo specializationInfo{};
+        std::vector<VkSpecializationMapEntry> specEntries;
+        if (desc.constants.count > 0) {
+            specEntries.resize(desc.constants.count);
+            for (uint32_t i = 0; i < desc.constants.count; ++i) {
+                specEntries[i].constantID = i;
+                specEntries[i].offset = i * 4;
+                specEntries[i].size = 4;
+            }
+            specializationInfo.mapEntryCount = (uint32_t)specEntries.size();
+            specializationInfo.pMapEntries = specEntries.data();
+            specializationInfo.dataSize = desc.constants.count * 4;
+            specializationInfo.pData = desc.constants.data;
+            stage.pSpecializationInfo = &specializationInfo;
+        } else {
+            stage.pSpecializationInfo = nullptr;
+        }
+
+        pipelineci.stage = stage;
         pipelineci.layout = GetState().pipelineLayout;
 
         VkPipeline pipeline = VK_NULL_HANDLE;

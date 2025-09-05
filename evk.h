@@ -172,12 +172,53 @@ namespace evk {
         RID GetRID() const;
     };
 
+    template <std::size_t _index, typename T>
+    struct _Constant_Impl {
+        _Constant_Impl(T const& v) : val(v) {}
+       public:
+        T val;
+    };
+    template <std::size_t Index, typename... Types>
+    struct _ConstantRecurr {};
+
+    template <std::size_t Index, typename T, typename... Types>
+    struct _ConstantRecurr<Index, T, Types...> 
+        : public _Constant_Impl<Index, typename std::remove_reference_t<T>>, public _ConstantRecurr<Index + 1, Types...> {};
+    
+    template <typename T, typename... Types>
+    struct Constant : public _ConstantRecurr<0, T, Types...> { };
+    
+    template <typename... CArgs>
+    Constant(CArgs... args) -> Constant<CArgs...>;
+
+    struct ConstantRaw{
+        uint8_t data[128] = {};
+        uint32_t size = 0;
+        uint32_t count = 0; // number of 32-bit entries
+
+        ConstantRaw() {
+            size = 0;
+            count = 0;
+        }
+
+        template <typename ...Types>
+        ConstantRaw(const Constant<Types...>& c) {
+            size = (uint32_t)sizeof(c);
+            if (size > sizeof(data)) size = sizeof(data);
+            std::memcpy(data, &c, size);
+            count = size / 4; // treat constants as 32-bit slots
+        }
+    };
+    
+
     struct PipelineDesc {
         std::string name = {};
 
         std::vector<uint8_t> VS = {};
         std::vector<uint8_t> FS = {};
         std::vector<uint8_t> CS = {};
+        
+        ConstantRaw constants = {};
 
         std::vector<std::vector<Format>> bindings = {};
         std::vector<Format> attachments = {};
@@ -277,43 +318,7 @@ namespace evk {
     BLAS CreateBLAS(const BLASDesc& desc);
     TLAS CreateTLAS(uint32_t maxBlasCount, bool allowUpdate);
 
-    template <std::size_t _index, typename T>
-    struct _Constant_Impl {
-        _Constant_Impl(T const& v) : val(v) {}
-       private:
-        T val;
-    };
-    template <std::size_t _index>
-    struct _Constant_Impl<_index, Image> {
-        _Constant_Impl(Image const& v) : val(v.GetRID()) {}
-       private:
-        RID val;
-    };
-    template <std::size_t _index>
-    struct _Constant_Impl<_index, Buffer> {
-        _Constant_Impl(Buffer const& v) : val(v.GetRID()) {}
-       private:
-        RID val;
-    };
-    template <std::size_t _index>
-    struct _Constant_Impl<_index, TLAS> {
-        _Constant_Impl(TLAS const& v) : val(v.GetRID()) {}
-       private:
-        RID val;
-    };
-    template <std::size_t Index, typename... Types>
-    struct _ConstantRecurr {};
 
-    template <std::size_t Index, typename T, typename... Types>
-    struct _ConstantRecurr<Index, T, Types...> 
-        : public _Constant_Impl<Index, typename std::remove_reference_t<T>>, public _ConstantRecurr<Index + 1, Types...> {};
-    
-    template <typename T, typename... Types>
-    struct Constant : public _ConstantRecurr<0, T, Types...> { };
-    
-    template <typename... CArgs>
-    Constant(CArgs... args) -> Constant<CArgs...>;
-    
 
     struct EvkDesc {
         std::string applicationName = "";
