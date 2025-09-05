@@ -113,6 +113,7 @@ struct Tensor {
 namespace evk::ai {
     struct Pipelines {
         evk::Pipeline matmul;
+        evk::Pipeline matmul_bwd;
     };
     std::unique_ptr<Pipelines> pipelines;
 
@@ -122,17 +123,25 @@ namespace evk::ai {
             .name = "matmul",
             .CS = evk::loadSpirvFile("shaders/bin/matmul.comp.spv"),
         });
+        pipelines->matmul_bwd = evk::CreatePipeline({
+            .name = "matmul_bwd",
+            .CS = evk::loadSpirvFile("shaders/bin/matmul.comp.spv"),
+            .constants = evk::Constant{1, 1}, // TRANSPOSE_A = 1, SUM_C = 1
+        });
     }
     void shutdown() {
         pipelines.reset();
     }
 
+    // C = A * B
+    // (...B, M, N) = (...B, M, K) * (...B, K, N)
     void matmul(Tensor& a, Tensor& b, Tensor& c) {
         assert(a.shape.rank() >= 2);
         assert(b.shape.rank() >= 2);
         assert(c.shape.rank() >= 2);
         assert(a.shape.batch_size(2) == b.shape.batch_size(2));
         assert(a.shape[-1] == b.shape[-2]);
+
         evk::CmdBind(pipelines->matmul);
         // Determine batch size B. If tensor rank >= 3 use first dim as batch, otherwise 1.
         uint32_t batch = 1;
@@ -159,13 +168,35 @@ namespace evk::ai {
         uint32_t groupY = (M + TILE - 1) / TILE; // covers rows (M)
         evk::CmdDispatch(groupX, groupY, batch);
     }
-    void matmul_bwd(Tensor& a, Tensor& b, Tensor& c) {
-        evk::CmdBind(pipelines->matmul);
+
+    // dL/dB = A^T * dL/dC
+    // (...B, M, N) = (...B, K, M)^T * (...B, K, N)
+    // a is already transposed
+    void matmul_bwd(Tensor& a_transposed, Tensor& c_grad, Tensor& b_grad) {
+        assert(a_transposed.shape.rank() >= 2);
+        assert(c_grad.shape.rank() >= 2);
+        assert(b_grad.shape.rank() >= 2);
+        assert(a_transposed.shape.batch_size(2) == c_grad.shape.batch_size(2));
+        assert(a_transposed.shape[-2] == c_grad.shape[-2]);
+
+        evk::CmdBind(pipelines->matmul_bwd);
         evk::CmdPush(evk::Constant{
-            a.buffer.GetRID(),
-            b.buffer.GetRID(),
-            c.buffer.GetRID()
+            a_transposed.buffer.GetRID(),
+            c_grad.buffer.GetRID(),
+            b_grad.buffer.GetRID()
         });
+        // Dispatch sizes must match forward's layout. Recompute dims from buffers' shapes.
+        uint32_t batch = 1;
+        if (a_transposed.shape.rank() >= 3) batch = a_transposed.shape.batch_size(2);
+
+        uint32_t M = (a_transposed.shape.rank() >= 1) ? a_transposed.shape[0] : 1; // rows
+        uint32_t K = (a_transposed.shape.rank() >= 2) ? a_transposed.shape[1] : 1; // cols
+        uint32_t N = (c_grad.shape.rank() >= 2) ? c_grad.shape[1] : 1;
+
+        const uint32_t TILE = 16u;
+        uint32_t groupX = (N + TILE - 1) / TILE;
+        uint32_t groupY = (M + TILE - 1) / TILE;
+        evk::CmdDispatch(groupX, groupY, batch);
     }
 }
 
@@ -182,6 +213,8 @@ struct Transformer {
     std::unique_ptr<Tensor> weights;
     // std::vector<Layer> layers;
     std::unique_ptr<Tensor> output;
+    std::unique_ptr<Tensor> output_grad;
+    // std::unique_ptr<Tensor> weights_grad;
 
     Transformer(uint32_t num_layers) {
         // for (uint32_t i = 0; i < num_layers; ++i) {
@@ -190,6 +223,8 @@ struct Transformer {
         weights = std::make_unique<Tensor>(Shape({2, 2}));
         input = std::make_unique<Tensor>(Shape({2, 2}));
         output = std::make_unique<Tensor>(Shape({2, 2}));
+        output_grad = std::make_unique<Tensor>(Shape({2, 2}));
+        // weights_grad = std::make_unique<Tensor>(Shape({2, 2}));
     }
 
     void forward() {
@@ -200,7 +235,15 @@ struct Transformer {
     }
 
     void backward() {
-        evk::ai::matmul_bwd(*output, *weights, *input);
+        std::vector<float> target_output = {-2.0f, -4.0f, -6.0f, -8.0f};
+        std::vector<float>& output_cpu = output->cpu();
+        std::vector<float>& output_grad_cpu = output_grad->cpu();
+        for (uint32_t i = 0; i < target_output.size(); ++i) {
+            output_grad_cpu[i] = (target_output[i] - output_cpu[i])*0.05f;
+        }
+        output_grad->set_cpu(output_grad_cpu);
+
+        evk::ai::matmul_bwd(*input, *output_grad, *weights);
         // for (auto& layer : layers) {
         // }
         evk::Sync();
@@ -214,12 +257,21 @@ void test_graph() {
     Transformer transformer(1);
     transformer.input->set_cpu({1.0f, 2.0f, 3.0f, 4.0f});
     transformer.weights->set_cpu({1.0f, 2.0f, 3.0f, 4.0f});
-    transformer.forward();
 
     transformer.input->print();
     transformer.weights->print();
-    transformer.output->print();
-    // transformer.backward();
+    
+    for (uint32_t i = 0; i < 2500; ++i) {
+        printf("[iteration %d]\n", i);
+        transformer.forward();
+        transformer.backward();
+        printf("Weights: ");
+        transformer.weights->print();
+        printf("Output: ");
+        transformer.output->print();
+        printf("Output grad: ");
+        transformer.output_grad->print();
+    }
     
     // printf("input.grad[0] = %f\n", transformer.input->grad[0]);
     // printf("weights.grad[0] = %f\n", transformer.weights->grad[0]);

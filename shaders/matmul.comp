@@ -1,5 +1,8 @@
 #include "evk.frag"
 
+CONSTANT(0) uint TRANSPOSE_A = 0;
+CONSTANT(1) uint SUM_C = 0;
+
 PUSH(
     int aBufferRID;
     int bBufferRID;
@@ -55,7 +58,14 @@ void main() {
         float bVal = 0.0;
         if (aRow < M && aCol < K) {
             // compute index relative to per-batch A base
-            uint aIndex = aBase + aRow * K + aCol;
+            // respect TRANSPOSE_A specialization constant: when set, A is stored transposed (K x M)
+            uint aIndex;
+            if (TRANSPOSE_A == 0u) {
+                aIndex = aBase + aRow * K + aCol;
+            } else {
+                // stored as K x M row-major when transposed: index = aBase + col * M + row
+                aIndex = aBase + aCol * M + aRow;
+            }
             aVal = float_buffer[aBufferRID].at[aIndex];
         }
         if (bRow < K && bCol < N) {
@@ -86,6 +96,10 @@ void main() {
     if (row < M && col < N) {
         // write result to per-batch C base
         uint outIndex = cBase + row * N + col;
-        float_buffer[cBufferRID].at[outIndex] = acc;
+        if (SUM_C == 0u) {
+            float_buffer[cBufferRID].at[outIndex] = acc;
+        } else {
+            float_buffer[cBufferRID].at[outIndex] += acc;
+        }
     }
 }
