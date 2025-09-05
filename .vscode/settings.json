@@ -68,6 +68,10 @@
         "iomanip": "cpp",
         "sstream": "cpp",
         "array": "cpp",
-        "span": "cpp"
+        "span": "cpp",
+        "expected": "cpp",
+        "map": "cpp",
+        "set": "cpp",
+        "xtree": "cpp"
     }
 }
