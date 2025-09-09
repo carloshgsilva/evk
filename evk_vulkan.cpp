@@ -908,89 +908,7 @@ namespace evk {
             features.shaderStorageImageWriteWithoutFormat = true;
             features.independentBlend = true;
             features.wideLines = true;
-            
-            VkPhysicalDeviceShaderAtomicFloatFeaturesEXT feature_atomicFloat = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
-                .shaderBufferFloat32Atomics = true,
-                .shaderBufferFloat32AtomicAdd = true,
-            };
-            VkPhysicalDeviceShaderAtomicInt64Features feature_atomicint64 = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES,
-                .pNext = &feature_atomicFloat,
-                .shaderBufferInt64Atomics = true,
-            };
-            VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT feature_imageatomicint64 = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT,
-                .pNext = &feature_atomicint64,
-                .shaderImageInt64Atomics = true,
-            };
-            // Feature Descriptor Indexing Feature
-            VkPhysicalDeviceDescriptorIndexingFeatures feature_indexing = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
-                .pNext = &feature_imageatomicint64,
-                .shaderSampledImageArrayNonUniformIndexing = true,
-                .shaderStorageBufferArrayNonUniformIndexing = true,
-                .shaderStorageImageArrayNonUniformIndexing = true,
-                .descriptorBindingSampledImageUpdateAfterBind = true,
-                .descriptorBindingStorageImageUpdateAfterBind = true,
-                .descriptorBindingStorageBufferUpdateAfterBind = true,
-                .descriptorBindingUpdateUnusedWhilePending = true,
-                .descriptorBindingPartiallyBound = true,
-                .runtimeDescriptorArray = true,
-            };
-            VkPhysicalDeviceDynamicRenderingFeatures feature_dynamicRendering = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
-                .pNext = &feature_indexing,
-                .dynamicRendering = true,
-            };
-            VkPhysicalDeviceBufferDeviceAddressFeatures feature_bufferDeviceAddress = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
-                .pNext = &feature_dynamicRendering,
-                .bufferDeviceAddress = true,
-            };
-            VkPhysicalDeviceSynchronization2Features feature_sync2 = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
-                .pNext = &feature_bufferDeviceAddress,
-                .synchronization2 = true,
-            };
 
-            VkPhysicalDevice8BitStorageFeatures feature_8bitStorage = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES,
-                .pNext = &feature_sync2,
-                .storageBuffer8BitAccess = true,
-                .uniformAndStorageBuffer8BitAccess = true,
-            };
-            VkPhysicalDevice16BitStorageFeatures feature_16bitStorage = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
-                .pNext = &feature_8bitStorage,
-                .storageBuffer16BitAccess = true,
-                .uniformAndStorageBuffer16BitAccess = true,
-            };
-            VkPhysicalDeviceRayTracingPipelineFeaturesKHR feature_rayTracingPipeline = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
-                .pNext = &feature_16bitStorage,
-                .rayTracingPipeline = VK_TRUE,
-            };
-            VkPhysicalDeviceAccelerationStructureFeaturesKHR feature_accelerationStructure = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
-                .pNext = &feature_rayTracingPipeline,
-                .accelerationStructure = VK_TRUE,
-                .accelerationStructureCaptureReplay = VK_TRUE,
-                .descriptorBindingAccelerationStructureUpdateAfterBind = VK_TRUE,
-            };
-            VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR feature_rtPositionFetch = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR,
-                .pNext = &feature_accelerationStructure,
-                .rayTracingPositionFetch = true,
-            };
-            VkPhysicalDeviceRayQueryFeaturesKHR feature_rayQuery = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
-                .pNext = &feature_rtPositionFetch,
-                .rayQuery = VK_TRUE,
-            };
-
-
-            // Create device and get queue
             std::vector<const char*> deviceExtensions = {
                 VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
                 VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
@@ -1002,6 +920,122 @@ namespace evk {
                 VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME,
             };
 
+            // Query supported device extensions so we can conditionally enable optional ones
+            std::vector<VkExtensionProperties> supportedExtensions;
+            uint32_t supportedExtensionsCount = 0;
+            CHECK_VK(vkEnumerateDeviceExtensionProperties(S.physicalDevice, NULL, &supportedExtensionsCount, NULL));
+            supportedExtensions.resize(supportedExtensionsCount);
+            CHECK_VK(vkEnumerateDeviceExtensionProperties(S.physicalDevice, NULL, &supportedExtensionsCount, supportedExtensions.data()));
+
+            auto isExtensionSupported = [&](const char* name) {
+                for (const auto& e : supportedExtensions) {
+                    if (std::strcmp(e.extensionName, name) == 0) return true;
+                }
+                return false;
+            };
+
+            // Common feature struct for pNext chaining
+            typedef struct VkFeature {
+                VkStructureType    sType;
+                void*              pNext;
+            };
+            VkFeature* pNext_lastFeature = {};
+            auto add_feature = [&](auto& feature) {
+                feature.pNext = pNext_lastFeature;
+                pNext_lastFeature = (VkFeature*)&feature;
+            };
+            
+            VkPhysicalDeviceShaderAtomicFloatFeaturesEXT feature_atomicFloat = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+                .shaderBufferFloat32Atomics = true,
+                .shaderBufferFloat32AtomicAdd = true,
+            };
+            add_feature(feature_atomicFloat);
+            VkPhysicalDeviceShaderAtomicInt64Features feature_atomicint64 = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES,
+                .shaderBufferInt64Atomics = true,
+            };
+            add_feature(feature_atomicint64);
+            VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT feature_imageatomicint64 = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT,
+                .shaderImageInt64Atomics = true,
+            };
+            add_feature(feature_imageatomicint64);
+            VkPhysicalDeviceDescriptorIndexingFeatures feature_indexing = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+                .shaderSampledImageArrayNonUniformIndexing = true,
+                .shaderStorageBufferArrayNonUniformIndexing = true,
+                .shaderStorageImageArrayNonUniformIndexing = true,
+                .descriptorBindingSampledImageUpdateAfterBind = true,
+                .descriptorBindingStorageImageUpdateAfterBind = true,
+                .descriptorBindingStorageBufferUpdateAfterBind = true,
+                .descriptorBindingUpdateUnusedWhilePending = true,
+                .descriptorBindingPartiallyBound = true,
+                .runtimeDescriptorArray = true,
+            };
+            add_feature(feature_indexing);
+            VkPhysicalDeviceDynamicRenderingFeatures feature_dynamicRendering = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+                .dynamicRendering = true,
+            };
+            add_feature(feature_dynamicRendering);
+            VkPhysicalDeviceBufferDeviceAddressFeatures feature_bufferDeviceAddress = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
+                .bufferDeviceAddress = true,
+            };
+            add_feature(feature_bufferDeviceAddress);
+            VkPhysicalDeviceSynchronization2Features feature_sync2 = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
+                .synchronization2 = true,
+            };
+            add_feature(feature_sync2);
+            VkPhysicalDevice8BitStorageFeatures feature_8bitStorage = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES,
+                .storageBuffer8BitAccess = true,
+                .uniformAndStorageBuffer8BitAccess = true,
+            };
+            add_feature(feature_8bitStorage);
+            VkPhysicalDevice16BitStorageFeatures feature_16bitStorage = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+                .storageBuffer16BitAccess = true,
+                .uniformAndStorageBuffer16BitAccess = true,
+            };
+            add_feature(feature_16bitStorage);
+
+            // Ray Tracing features
+            VkPhysicalDeviceRayTracingPipelineFeaturesKHR feature_rayTracingPipeline = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
+                .rayTracingPipeline = VK_TRUE,
+            };
+            add_feature(feature_rayTracingPipeline);
+            VkPhysicalDeviceAccelerationStructureFeaturesKHR feature_accelerationStructure = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+                .accelerationStructure = VK_TRUE,
+                .accelerationStructureCaptureReplay = VK_TRUE,
+                .descriptorBindingAccelerationStructureUpdateAfterBind = VK_TRUE,
+            };
+            add_feature(feature_accelerationStructure);
+            VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR feature_rtPositionFetch = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR,
+                .rayTracingPositionFetch = true,
+            };
+            add_feature(feature_rtPositionFetch);
+            VkPhysicalDeviceRayQueryFeaturesKHR feature_rayQuery = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+                .rayQuery = VK_TRUE,
+            };
+            add_feature(feature_rayQuery);
+
+            // Cooperative Matrix features
+            VkPhysicalDeviceCooperativeMatrixFeaturesKHR feature_coop = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+                .cooperativeMatrix = VK_TRUE,
+            };
+            if(isExtensionSupported(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+                deviceExtensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+                add_feature(feature_coop);
+            }
+
             // Conditionally enable swapchain device extension only if swapchain support requested
             if (desc.enableSwapchain) {
                 deviceExtensions.insert(deviceExtensions.begin(), VK_KHR_SWAPCHAIN_EXTENSION_NAME);
@@ -1009,11 +1043,6 @@ namespace evk {
 
 // Check device extensions support
 #if EVK_DEBUG
-            std::vector<VkExtensionProperties> supportedExtensions;
-            uint32_t supportedExtensionsCount = 0;
-            CHECK_VK(vkEnumerateDeviceExtensionProperties(S.physicalDevice, NULL, &supportedExtensionsCount, NULL));
-            supportedExtensions.resize(supportedExtensionsCount);
-            CHECK_VK(vkEnumerateDeviceExtensionProperties(S.physicalDevice, NULL, &supportedExtensionsCount, supportedExtensions.data()));
             for (auto& ext1 : deviceExtensions) {
                 bool found = false;
                 for (auto& ext2 : supportedExtensions) {
@@ -1032,7 +1061,7 @@ namespace evk {
             deviceci.pQueueCreateInfos = &deviceQueueci;
             deviceci.enabledExtensionCount = (uint32_t)deviceExtensions.size();
             deviceci.ppEnabledExtensionNames = deviceExtensions.data();
-            deviceci.pNext = &feature_rayQuery;
+            deviceci.pNext = pNext_lastFeature;
 
 
             CHECK_VK(vkCreateDevice(S.physicalDevice, &deviceci, nullptr, &S.device));

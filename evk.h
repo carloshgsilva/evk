@@ -328,7 +328,7 @@ namespace evk {
         std::vector<std::string> instanceLayers = {};
         std::vector<std::string> instanceExtensions = {};
         uint32_t frameBufferingCount = 3;
-        bool enableSwapchain = false;
+        bool enableSwapchain = false; // VK_KHR_swapchain
     };
 
     bool InitializeEVK(const EvkDesc& info);
