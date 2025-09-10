@@ -1,0 +1,150 @@
+#include "evk.frag"
+
+// Backward for fused attention (MQA), given upstream dO.
+// Computes gradients dQ, dK, dV with shared K/V across heads.
+// O = softmax(S) V, S = (Q K^T) * scale
+// dV = P^T dO, where P is softmax(S) row-wise
+// dS = (dP) hadamard Jacobian of softmax with P
+//    where dP = dO V^T
+// Efficient form: For each i: dS[i,j] = (dot(dO[i,:], V[j,:]) - sum_k P[i,k]*dot(dO[i,:],V[k,:])) * P[i,j]
+// Then dQ[i,:] += sum_j dS[i,j] * K[j,:] * scale
+// and dK[j,:] += sum_i dS[i,j] * Q[i,:] * scale
+
+PUSH(
+    int qBufferRID;
+    int kBufferRID;
+    int vBufferRID;
+    int oBufferRID;   // not strictly needed
+    int dOBufferRID;
+    int dQBufferRID;
+    int dKBufferRID;
+    int dVBufferRID;
+    uint B;
+    uint H;
+    uint N;
+    uint D;
+    float scale;
+)
+
+BINDING_BUFFER_RW(float_buffer,
+    float at[];
+)
+
+COMPUTE(1, 1, 1)
+void main() {
+    // One (b,h,i) per invocation; accumulate dQ[i,:] and dV, and also accumulate dK across i.
+    uint i = gl_GlobalInvocationID.x; // query index
+    uint bh = gl_GlobalInvocationID.z; // combined batch-head index
+    if (i >= N) return;
+    if (bh >= B * H) return;
+
+    uint b = bh / H;
+    uint h = bh % H;
+
+    uint headStride = N * D;
+    uint qhBase = (b * H + h) * headStride; // per-head base for Q/O/dO/dQ
+    uint kvBase = b * headStride;           // shared K/V/dK/dV base for this batch (H=1)
+
+    uint baseQ = qhBase;
+    uint baseK = kvBase;
+    uint baseV = kvBase;
+    uint baseO = qhBase;
+
+    uint baseDO = qhBase;
+    uint baseDQ = qhBase;
+    uint baseDK = kvBase;
+    uint baseDV = kvBase;
+
+    // Reconstruct softmax probabilities P[i,j] with numerically-stable two-pass like forward
+    // Pass 1: compute m and denom for row i
+    float m = -3.402823466e+38; // -FLT_MAX
+    float denom = 0.0;
+    uint qRow = baseQ + i * D;
+    for (uint j = 0u; j < N; ++j) {
+        uint kRow = baseK + j * D;
+        float s = 0.0;
+        for (uint d = 0u; d < D; ++d) {
+            float qv = float_buffer[qBufferRID].at[qRow + d];
+            float kv = float_buffer[kBufferRID].at[kRow + d];
+            s += qv * kv;
+        }
+        s *= scale;
+        float m_new = max(m, s);
+        denom = denom * exp(m - m_new) + exp(s - m_new);
+        m = m_new;
+    }
+
+    // Compute t = sum_k P[i,k]*dot(dO[i,:],V[k,:])
+    float t = 0.0;
+    for (uint kIdx = 0u; kIdx < N; ++kIdx) {
+        // compute exp(s_k - m)
+        uint kRow = baseK + kIdx * D;
+        float s = 0.0;
+        for (uint d = 0u; d < D; ++d) {
+            float qv = float_buffer[qBufferRID].at[qRow + d];
+            float kv = float_buffer[kBufferRID].at[kRow + d];
+            s += qv * kv;
+        }
+        s *= scale;
+        float w = exp(s - m);
+        float p = w / max(denom, 1e-20);
+
+        // dot(dO[i,:], V[k,:])
+        float dot_dO_V = 0.0;
+        uint dORow = baseDO + i * D;
+        uint vRow = baseV + kIdx * D;
+        for (uint d = 0u; d < D; ++d) {
+            float dov = float_buffer[dOBufferRID].at[dORow + d];
+            float vv = float_buffer[vBufferRID].at[vRow + d];
+            dot_dO_V += dov * vv;
+        }
+        t += p * dot_dO_V;
+    }
+
+    // Accumulate dQ[i,:] and dV, and partial dK
+    // Initialize local accumulators for dQ[i,:]
+    float dQlocal = 0.0; // unused placeholder to ensure valid GLSL syntax in some drivers
+    for (uint d = 0u; d < D; ++d) {
+        float dQid = 0.0;
+        for (uint j = 0u; j < N; ++j) {
+            // P[i,j]
+            uint kRow = baseK + j * D;
+            float s = 0.0;
+            for (uint kd = 0u; kd < D; ++kd) {
+                float qv = float_buffer[qBufferRID].at[qRow + kd];
+                float kv = float_buffer[kBufferRID].at[kRow + kd];
+                s += qv * kv;
+            }
+            s *= scale;
+            float w = exp(s - m);
+            float p = w / max(denom, 1e-20);
+
+            // alpha = (dot(dO[i,:], V[j,:]) - t) * p
+            float dot_dO_V = 0.0;
+            uint dORow = baseDO + i * D;
+            uint vRow = baseV + j * D;
+            for (uint vd = 0u; vd < D; ++vd) {
+                float dov = float_buffer[dOBufferRID].at[dORow + vd];
+                float vv = float_buffer[vBufferRID].at[vRow + vd];
+                dot_dO_V += dov * vv;
+            }
+            float alpha = (dot_dO_V - t) * p;
+
+            // dQ[i,d] += alpha * K[j,d] * scale
+            float kdval = float_buffer[kBufferRID].at[kRow + d];
+            dQid += alpha * kdval * scale;
+
+            // dK[j,d] += alpha * Q[i,d] * scale  (accumulate atomically)
+            float qidval = float_buffer[qBufferRID].at[qRow + d];
+            atomicAdd(float_buffer[dKBufferRID].at[baseDK + j * D + d], alpha * qidval * scale);
+
+            // dV[j,d] += P[i,j] * dO[i,d] (accumulate atomically)
+            float dovd = float_buffer[dOBufferRID].at[dORow + d];
+            atomicAdd(float_buffer[dVBufferRID].at[baseDV + j * D + d], p * dovd);
+        }
+        // write dQ[i,d]
+        float_buffer[dQBufferRID].at[baseDQ + i * D + d] += dQid;
+    }
+}
+
+

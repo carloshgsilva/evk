@@ -5,7 +5,8 @@
 #extension GL_EXT_shader_image_load_formatted  : require
 #extension GL_EXT_shader_atomic_float  : require
 #extension GL_EXT_ray_query : enable
-#extension GL_EXT_ray_tracing_position_fetch : require
+#extension GL_EXT_ray_tracing_position_fetch : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 #extension GL_EXT_debug_printf : enable
 #define printf debugPrintfEXT

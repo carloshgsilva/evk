@@ -1,0 +1,42 @@
+#include "evk.frag"
+
+PUSH(
+    int inRID;
+    int outRID;
+    uint rank;
+    uint dimI;
+    uint dimJ;
+)
+
+BINDING_BUFFER_RW(float_buffer,
+    float at[];
+)
+
+// We'll implement a tiled 2D transpose for each batch. The shader treats all dims except dimI and dimJ as batch.
+COMPUTE(64, 1, 1)
+void main() {
+    // Linear per-element copy. Each invocation handles one element in the flattened per-batch matrix.
+    uint globalId = gl_GlobalInvocationID.x;
+    uint batchIdx = gl_GlobalInvocationID.y;
+
+    uint rows = dimI;
+    uint cols = dimJ;
+    uint batchSize = rows * cols;
+    uint batchBase = batchIdx * batchSize;
+
+    uint elem = globalId; // linear index within rows*cols
+    if (elem >= batchSize) return;
+
+    uint r = elem / cols; // original row
+    uint c = elem % cols; // original col
+
+    // read input element
+    uint inIdx = batchBase + r * cols + c;
+    float v = float_buffer[inRID].at[inIdx];
+
+    // compute transposed location: output is arranged such that rows and cols swapped
+    uint outIdx = batchBase + c * rows + r; // write column-major style to represent transpose
+    float_buffer[outRID].at[outIdx] = v;
+}
+
+
