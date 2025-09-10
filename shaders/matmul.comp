@@ -113,120 +113,113 @@ void main() {
 #extension GL_KHR_cooperative_matrix : enable
 #extension GL_KHR_memory_scope_semantics : enable
 
-// We build a 32x32 macro tile using four 16x16 cooperative subtiles.
+// Workgroup computes one 32x32 C tile using 4 subgroups (2x2 of 16x16 subtiles)
+#define TILE 32
 #define SUB_TILE 16
-#define MACRO_TILE 32
 
-// Shared memory staging for a macro 32x32 tile per K-slice (16)
-// Asmem: 32x16 (rows along M, cols along K-slice)
-// Bsmem: 16x32 (rows along K-slice, cols along N)
-shared float16_t Asmem[MACRO_TILE * SUB_TILE];
-shared float16_t Bsmem[SUB_TILE * MACRO_TILE];
+// Shared staging for A and B tiles in fp16
+shared float16_t Asub[TILE * TILE];
+shared float16_t Bsub[TILE * TILE];
 
-// 4 subgroups per workgroup (y=0..3), each subgroup is 32 lanes in X
 COMPUTE(32, 4, 1)
 void main() {
-    // Workgroup mapping (with host dispatch: Y = tilesCols*tilesRows, Z = batch):
-    //   X: fixed to 1 workgroup; local_size_x=32 satisfies subgroup constraint
-    //   Y: linearized 2D tile index over (rows, cols)
-    //   Z: batch index
-    uint tilesRows = (M + MACRO_TILE - 1u) / MACRO_TILE;
-    uint tilesCols = (N + MACRO_TILE - 1u) / MACRO_TILE;
+    // Workgroup mapping (host dispatch: X = tilesCols, Y = tilesRows, Z = batch)
+    uint tilesRows = (M + TILE - 1u) / TILE;
+    uint tilesCols = (N + TILE - 1u) / TILE;
     uint batchIdx = gl_WorkGroupID.z;
-    uint tileLinear = gl_WorkGroupID.y;
-    uint tileRowIndex = (tilesCols == 0u) ? 0u : (tileLinear / tilesCols);
-    uint tileColIndex = (tilesCols == 0u) ? 0u : (tileLinear % tilesCols);
+    uint tileRowIndex = gl_WorkGroupID.y;
+    uint tileColIndex = gl_WorkGroupID.x;
 
     uint aBase = batchIdx * (M * K);
     uint bBase = batchIdx * (K * N);
     uint cBase = batchIdx * (M * N);
 
-    // Macro tile origin for this workgroup
-    uint tileRow0 = tileRowIndex * MACRO_TILE;
-    uint tileCol0 = tileColIndex * MACRO_TILE;
+    // 32x32 tile origin for this workgroup
+    uint tileRow0 = tileRowIndex * TILE;
+    uint tileCol0 = tileColIndex * TILE;
 
-    // Map the 4 subgroups (y=0..3) to 2x2 subtiles inside the 32x32 tile
-    uint subGroupId = gl_LocalInvocationID.y; // 0..3, one subgroup per y-row
-    uint subRow = subGroupId & 1u;            // 0 or 1 (rows of sub-tiles)
-    uint subCol = subGroupId >> 1;            // 0 or 1 (cols of sub-tiles)
-    uint subRowOffset = subRow * SUB_TILE;    // 0 or 16
-    uint subColOffset = subCol * SUB_TILE;    // 0 or 16
+    // Optional guard if host dispatch over-covers
+    if (tileRow0 >= M || tileCol0 >= N) {
+        return;
+    }
 
-    // Cooperative matrices per subgroup (each handles 16x16)
-    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> tile_A;
-    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> tile_B;
+    // Map 4 subgroups across Y dimension into a 2x2 grid of 16x16 subtiles
+    // local_size_x = 32 (one subgroup), local_size_y = 4 (four subgroups total)
+    uint subgroupIdx = gl_LocalInvocationID.y; // 0..3
+    uint subTileRow = subgroupIdx >> 1;        // 0 or 1
+    uint subTileCol = subgroupIdx & 1u;        // 0 or 1
+    uint subTileRow0 = tileRow0 + subTileRow * SUB_TILE;
+    uint subTileCol0 = tileCol0 + subTileCol * SUB_TILE;
+
+    // Per-subgroup accumulator (16x16)
     coopmat<float, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> accumulator =
         coopmat<float, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
 
-    // Loop K in 16-wide tiles; stage macro tiles to shared memory then load coopmats from shared
-    for (uint t = 0; t < (K + SUB_TILE - 1u) / SUB_TILE; ++t) {
-        // Cooperative load into shared memory across the whole workgroup
-        const uint wgSize = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
-        uint linearThread = gl_LocalInvocationID.z * (gl_WorkGroupSize.x * gl_WorkGroupSize.y)
-                          + gl_LocalInvocationID.y * gl_WorkGroupSize.x
-                          + gl_LocalInvocationID.x;
+    // Loop K in 32-wide tiles; each workgroup loads A(32x32) and B(32x32) into shared
+    for (uint kTile0 = 0; kTile0 < K; kTile0 += TILE) {
+        // Coop load of 32x32 tiles into shared memory (all 128 threads contribute)
+        uint linearThread = gl_LocalInvocationID.y * 32u + gl_LocalInvocationID.x; // 0..127
+        for (uint idx = linearThread; idx < TILE * TILE; idx += 128u) {
+            uint r = idx / TILE; // 0..31
+            uint c = idx % TILE; // 0..31
 
-        const uint totalA = MACRO_TILE * SUB_TILE; // 32*16
-        const uint totalB = SUB_TILE * MACRO_TILE; // 16*32
-        const uint total  = totalA + totalB;
+            // Global indices for A and B
+            uint aRow = tileRow0 + r;
+            uint aCol = kTile0 + c;
+            uint bRow = kTile0 + r;
+            uint bCol = tileCol0 + c;
 
-        for (uint idx = linearThread; idx < total; idx += wgSize) {
-            if (idx < totalA) {
-                // Fill Asmem row-major [32 x 16]
-                uint i = idx;
-                uint aRow = i / SUB_TILE;      // 0..31
-                uint aCol = i % SUB_TILE;      // 0..15
-                uint gRowA = tileRow0 + aRow;
-                uint gColA = t * SUB_TILE + aCol;
-                float aVal = 0.0;
-                if (gRowA < M && gColA < K) {
-                    uint aIndex;
-                    if (TRANSPOSE_A == 0u) {
-                        aIndex = aBase + gRowA * K + gColA;
-                    } else {
-                        // A stored as KxM when transposed
-                        aIndex = aBase + gColA * M + gRowA;
-                    }
-                    aVal = float_buffer[aBufferRID].at[aIndex];
+            float16_t aVal16 = float16_t(0.0);
+            float16_t bVal16 = float16_t(0.0);
+
+            // Bounds-safe loads; zero-pad outside
+            if (aRow < M && aCol < K) {
+                uint aIndex;
+                if (TRANSPOSE_A == 0u) {
+                    // A as MxK row-major
+                    aIndex = aBase + aRow * K + aCol;
+                } else {
+                    // A stored transposed as KxM row-major
+                    aIndex = aBase + aCol * M + aRow;
                 }
-                Asmem[aRow * SUB_TILE + aCol] = float16_t(aVal);
-            } else {
-                // Fill Bsmem row-major [16 x 32]
-                uint j = idx - totalA;
-                uint bRow = j / MACRO_TILE;    // 0..15
-                uint bCol = j % MACRO_TILE;    // 0..31
-                uint gRowB = t * SUB_TILE + bRow;
-                uint gColB = tileCol0 + bCol;
-                float bVal = 0.0;
-                if (gRowB < K && gColB < N) {
-                    uint bIndex = bBase + gRowB * N + gColB;
-                    bVal = float_buffer[bBufferRID].at[bIndex];
-                }
-                Bsmem[bRow * MACRO_TILE + bCol] = float16_t(bVal);
+                aVal16 = float16_t(float_buffer[aBufferRID].at[aIndex]);
             }
+            if (bRow < K && bCol < N) {
+                uint bIndex = bBase + bRow * N + bCol; // B as KxN row-major
+                bVal16 = float16_t(float_buffer[bBufferRID].at[bIndex]);
+            }
+
+            Asub[idx] = aVal16;
+            Bsub[idx] = bVal16;
         }
 
-        // Ensure shared tiles are fully populated before coop loads
+        // Ensure tiles are fully populated before compute
         barrier();
 
-        // Compute subgroup-specific top-left offsets inside shared tiles
-        uint aSharedOffset = subRowOffset * SUB_TILE; // (row * width)
-        uint bSharedOffset = subColOffset;            // (row=0, col offset)
+        // Process this 32-wide K block as two 16-wide steps
+        for (uint kInner = 0u; kInner < TILE; kInner += SUB_TILE) {
+            // Load 16x16 fragments from shared memory for this subgroup's subtile
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> tile_A;
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> tile_B;
 
-        // Load cooperative tiles from shared memory
-        coopMatLoad(tile_A, Asmem, aSharedOffset, SUB_TILE, 0);
-        coopMatLoad(tile_B, Bsmem, bSharedOffset, MACRO_TILE, 0);
+            // A subtile starts at (subTileRow*16, kInner)
+            uint aSharedBase = (subTileRow * SUB_TILE) * TILE + kInner;
+            // B subtile starts at (kInner, subTileCol*16)
+            uint bSharedBase = kInner * TILE + (subTileCol * SUB_TILE);
 
-        // FMA accumulate
-        accumulator = coopMatMulAdd(tile_A, tile_B, accumulator);
+            coopMatLoad(tile_A, Asub, aSharedBase, TILE, 0);
+            coopMatLoad(tile_B, Bsub, bSharedBase, TILE, 0);
 
-        // Wait before next K-slice staging reuse
+            // FMA accumulate 16x16
+            accumulator = coopMatMulAdd(tile_A, tile_B, accumulator);
+        }
+
+        // Wait before overwriting shared tiles in next K block
         barrier();
     }
 
-    // Store the resulting 16x16 subtile into C. We assume M,N are multiples of 16.
-    // For ragged edges, the host should pad or dispatch trimmed groups accordingly.
-    uint cElement = cBase + (tileRow0 + subRowOffset) * N + (tileCol0 + subColOffset);
+    // Store the resulting 16x16 subtile into C (assumes tiles fit or host guards)
+    uint cElement = cBase + subTileRow0 * N + subTileCol0;
     uint cStride = N;
     if (SUM_C == 0u) {
         coopMatStore(accumulator, float_buffer[cBufferRID].at, cElement, cStride, 0);
