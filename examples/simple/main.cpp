@@ -469,7 +469,9 @@ void test_matmul() {
 
     evk::Sync();
     for(auto ts: evk::GetTimestamps()) {
-        printf("%s:%.3fms\n", ts.name, float(ts.end - ts.start));
+        float ms = float(ts.end - ts.start);
+        float tflops = float(2.0f * size * size * size) / (ms / 1000.0f) / 1e12f;
+        printf("%s:%.3fms (%.3ftflops)\n", ts.name, ms, tflops);
     }
 
     a->print();
