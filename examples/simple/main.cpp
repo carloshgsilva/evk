@@ -261,8 +261,8 @@ namespace evk::ai {
         const uint32_t TILE = 32u;
         uint32_t tilesCols = (N + TILE - 1) / TILE; // columns (N)
         uint32_t tilesRows = (M + TILE - 1) / TILE; // rows (M)
-        // Map: X=1, Y=tilesCols*tilesRows (linearized), Z=batch
-        evk::CmdDispatch(1u, tilesCols * tilesRows, batch);
+        // Map: X=tilesCols, Y=tilesRows, Z=batch
+        evk::CmdDispatch(tilesCols, tilesRows, batch);
     }
 
     // dL/dB = A^T * dL/dC
@@ -302,7 +302,8 @@ namespace evk::ai {
         const uint32_t TILE = 32u;
         uint32_t tilesCols = (N + TILE - 1) / TILE;
         uint32_t tilesRows = (M + TILE - 1) / TILE;
-        evk::CmdDispatch(1u, tilesCols * tilesRows, batch);
+        // X=sizeX, Y=sizeY, Z=batch
+        evk::CmdDispatch(tilesCols, tilesRows, batch);
 #endif
     }
 
