@@ -935,7 +935,7 @@ namespace evk {
             };
 
             // Common feature struct for pNext chaining
-            typedef struct VkFeature {
+            struct VkFeature {
                 VkStructureType    sType;
                 void*              pNext;
             };
@@ -951,18 +951,26 @@ namespace evk {
                 .shaderBufferFloat32AtomicAdd = true,
             };
             add_feature(feature_atomicFloat);
-            VkPhysicalDeviceShaderAtomicInt64Features feature_atomicint64 = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES,
-                .shaderBufferInt64Atomics = true,
-            };
-            add_feature(feature_atomicint64);
             VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT feature_imageatomicint64 = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT,
                 .shaderImageInt64Atomics = true,
             };
             add_feature(feature_imageatomicint64);
-            VkPhysicalDeviceDescriptorIndexingFeatures feature_indexing = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+            VkPhysicalDevice16BitStorageFeatures feature_16bitStorage = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+                .storageBuffer16BitAccess = true,
+                .uniformAndStorageBuffer16BitAccess = true,
+            };
+            add_feature(feature_16bitStorage);
+
+            // Vulkan 1.2 features
+            VkPhysicalDeviceVulkan12Features feature_vulkan12 = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                .storageBuffer8BitAccess = VK_TRUE,
+                .shaderBufferInt64Atomics = VK_TRUE,
+                .shaderSharedInt64Atomics = VK_TRUE,
+                .shaderFloat16 = VK_TRUE,
+                .descriptorIndexing = VK_TRUE,
                 .shaderSampledImageArrayNonUniformIndexing = true,
                 .shaderStorageBufferArrayNonUniformIndexing = true,
                 .shaderStorageImageArrayNonUniformIndexing = true,
@@ -972,35 +980,17 @@ namespace evk {
                 .descriptorBindingUpdateUnusedWhilePending = true,
                 .descriptorBindingPartiallyBound = true,
                 .runtimeDescriptorArray = true,
+                .bufferDeviceAddress = VK_TRUE,
+                .vulkanMemoryModel = VK_TRUE,
+                .vulkanMemoryModelDeviceScope = VK_TRUE,
             };
-            add_feature(feature_indexing);
-            VkPhysicalDeviceDynamicRenderingFeatures feature_dynamicRendering = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+            add_feature(feature_vulkan12);
+            VkPhysicalDeviceVulkan13Features feature_vulkan13 = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+                .synchronization2 = true,
                 .dynamicRendering = true,
             };
-            add_feature(feature_dynamicRendering);
-            VkPhysicalDeviceBufferDeviceAddressFeatures feature_bufferDeviceAddress = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
-                .bufferDeviceAddress = true,
-            };
-            add_feature(feature_bufferDeviceAddress);
-            VkPhysicalDeviceSynchronization2Features feature_sync2 = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
-                .synchronization2 = true,
-            };
-            add_feature(feature_sync2);
-            VkPhysicalDevice8BitStorageFeatures feature_8bitStorage = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES,
-                .storageBuffer8BitAccess = true,
-                .uniformAndStorageBuffer8BitAccess = true,
-            };
-            add_feature(feature_8bitStorage);
-            VkPhysicalDevice16BitStorageFeatures feature_16bitStorage = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
-                .storageBuffer16BitAccess = true,
-                .uniformAndStorageBuffer16BitAccess = true,
-            };
-            add_feature(feature_16bitStorage);
+            add_feature(feature_vulkan13);
 
             // Ray Tracing features
             VkPhysicalDeviceRayTracingPipelineFeaturesKHR feature_rayTracingPipeline = {
@@ -1034,6 +1024,22 @@ namespace evk {
             if(isExtensionSupported(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
                 deviceExtensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
                 add_feature(feature_coop);
+            }
+
+            // Cooperative Matrix 2 features NV
+            VkPhysicalDeviceCooperativeMatrix2FeaturesNV feature_coop2 = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV,
+                .cooperativeMatrixWorkgroupScope = VK_TRUE,
+                .cooperativeMatrixFlexibleDimensions = VK_TRUE,
+                .cooperativeMatrixReductions = VK_TRUE,
+                .cooperativeMatrixConversions = VK_TRUE,
+                .cooperativeMatrixPerElementOperations = VK_TRUE,
+                .cooperativeMatrixTensorAddressing = VK_TRUE,
+                .cooperativeMatrixBlockLoads = VK_TRUE,
+            };
+            if(isExtensionSupported(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME)) {
+                deviceExtensions.push_back(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME);
+                add_feature(feature_coop2);
             }
 
             // Conditionally enable swapchain device extension only if swapchain support requested
