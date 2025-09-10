@@ -47,10 +47,8 @@ LONG WINAPI CustomUnhandledExceptionFilter(EXCEPTION_POINTERS* pExceptionInfo) {
         pSymbol->SizeOfStruct = sizeof(SYMBOL_INFO);
         pSymbol->MaxNameLen = MAX_SYM_NAME;
 
-        if (SymFromAddr(hProcess, stack_frame.AddrPC.Offset, &displacement64, pSymbol)) {
-            std::cerr << "  " << i << ": " << pSymbol->Name;
-        } else {
-            std::cerr << "  " << i << ": " << "Unknown symbol" << " at 0x" << std::hex << stack_frame.AddrPC.Offset;
+        if (!SymFromAddr(hProcess, stack_frame.AddrPC.Offset, &displacement64, pSymbol)) {
+            continue;
         }
 
         // Try to get source file and line number for this address
@@ -62,11 +60,10 @@ LONG WINAPI CustomUnhandledExceptionFilter(EXCEPTION_POINTERS* pExceptionInfo) {
             // Only log file/line if the source file is inside the current project directory
             std::string fileName = lineInfo.FileName ? lineInfo.FileName : std::string();
             std::string fileLower = toLower(fileName);
-            if (fileLower.find("vctools", 0) == -1) {
-                std::cerr << " (" << lineInfo.FileName << ":" << std::dec << (lineInfo.LineNumber) << ")";
+            if (fileLower.find("vctools", 0) == -1 && pSymbol->Name) {
+                std::cerr << "-> " << pSymbol->Name << "() [" << lineInfo.FileName << ":" << std::dec << (lineInfo.LineNumber) << "]" << std::endl;
             }
         }
-        std::cerr << std::endl;
     }
 
     SymCleanup(hProcess);
