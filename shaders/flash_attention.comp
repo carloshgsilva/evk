@@ -1,0 +1,81 @@
+#include "evk.frag"
+
+// Fused attention forward (MQA) with online softmax in a single pass.
+// Layout targets avoiding head permutation by packing heads into D:
+// Shapes (row-major):
+// Dh is always 32 for fast softmax summing with subgroupAdd
+// Q: (B, N, D)      where D = H * Dh, concatenated heads
+// K: (B, N, Dh)     shared across heads
+// V: (B, N, Dh)     shared across heads
+// O: (B, N, D)      laid out like Q, concatenated heads
+
+PUSH(
+    int qBufferRID;
+    int kBufferRID;
+    int vBufferRID;
+    int oBufferRID;
+    // uint B;      // batch size
+    // uint H;      // heads
+    // uint N;      // sequence length
+    // uint D;      // total model dim (D = H * Dh)
+    float scale; // 1/sqrt(Dh)
+)
+
+BINDING_BUFFER_RW(float_buffer,
+    float at[];
+)
+
+CONSTANT(0) int D = 512;
+#define TILE 32
+CONSTANT(2) int H = 8;
+CONSTANT(3) int Hd = 32;
+CONSTANT(4) int N = 1024;
+
+// load tile K and V into
+shared float Q_block[TILE][H][Hd];
+shared float K_block[TILE][Hd];
+shared float V_block[TILE][Hd];
+shared float S_block[TILE][H];
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+COMPUTE(TILE, TILE, 1)
+void main() {
+    // #define TIME_COOP 16
+    // coopmat<float16_t, gl_ScopeSubgroup, TIME_COOP, TIME_COOP, gl_MatrixUseAccumulator> accumulator = coopmat<float16_t, gl_ScopeSubgroup, TIME_COOP, TIME_COOP, gl_MatrixUseAccumulator>(0.0f);
+    // accumulator = coopmatMulAdd(accumulator, accumulator, accumulator);
+    // uint q_i = gl_GlobalInvocationID.x; // query position
+    // uint kv_sub_i = gl_GlobalInvocationID.y; // KV position
+    // uint b_i = gl_GlobalInvocationID.z; // batch index
+
+    // // load Q
+    // Q_block[gl_WorkGroupID.x][gl_WorkGroupID.x][gl_LocalInvocationID.x] = float_buffer[qBufferRID].at[b_i * (N*Hd) + n * Hd + q_i];
+    // float q = float_buffer[qBufferRID].at[q_i];
+
+    // // loop over sequence length with TILE size
+    // for(int n = 0; n < N ; n += KV_TILE) {
+    //     // 1. load K and V (using query index as key/value index)
+    //     if (gl_WorkGroupID.x == 0) { // only the first work group loads K and V since it's a MQA
+    //         K_block[kv_sub_i][q_i] = float_buffer[kBufferRID].at[b_i * (N*Hd) + n * Hd + q_i];
+    //         V_block[kv_sub_i][q_i] = float_buffer[vBufferRID].at[b_i * (N*Hd) + n * Hd + q_i];
+    //     }
+    //     barrier();
+
+    //     // 2. calculate S[i, j] = Q[i] * KT[j]
+    //     float s_acc = subgroupAdd(q * K_block[kv_sub_i][q_i]);
+
+    //     // 3. calculate max(S[i, j])
+    //     float s_max = 1.0;//subgroupMax(s_acc);
+
+    //     // denominator for softmax (placeholder until full reduction implemented)
+    //     float denom = 1.0;
+
+    //     // 4. calculate P[i, j] = softmax(S[i, j])
+    //     float p = exp(s_acc - s_max) / max(denom, 1e-20);
+
+    // }
+}
+
+

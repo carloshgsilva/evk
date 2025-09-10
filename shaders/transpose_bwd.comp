@@ -1,0 +1,40 @@
+#include "evk.frag"
+
+// Backward transpose is identical to forward: transpose is its own inverse.
+
+PUSH(
+    int inRID;
+    int outRID;
+    uint rank;
+    uint dimI;
+    uint dimJ;
+)
+
+BINDING_BUFFER_RW(float_buffer,
+    float at[];
+)
+
+COMPUTE(64, 1, 1)
+void main() {
+    uint globalId = gl_GlobalInvocationID.x;
+    uint batchIdx = gl_GlobalInvocationID.y;
+
+    uint rows = dimI;
+    uint cols = dimJ;
+    uint batchSize = rows * cols;
+    uint batchBase = batchIdx * batchSize;
+
+    uint elem = globalId;
+    if (elem >= batchSize) return;
+
+    uint r = elem / cols;
+    uint c = elem % cols;
+
+    uint inIdx = batchBase + r * cols + c;
+    float v = float_buffer[inRID].at[inIdx];
+
+    uint outIdx = batchBase + c * rows + r;
+    float_buffer[outRID].at[outIdx] = v;
+}
+
+
