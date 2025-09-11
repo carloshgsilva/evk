@@ -1062,22 +1062,6 @@ namespace evk {
                 add_feature(feature_coop);
             }
 
-            // Cooperative Matrix 2 features NV
-            VkPhysicalDeviceCooperativeMatrix2FeaturesNV feature_coop2 = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV,
-                .cooperativeMatrixWorkgroupScope = VK_TRUE,
-                .cooperativeMatrixFlexibleDimensions = VK_TRUE,
-                .cooperativeMatrixReductions = VK_TRUE,
-                .cooperativeMatrixConversions = VK_TRUE,
-                .cooperativeMatrixPerElementOperations = VK_TRUE,
-                .cooperativeMatrixTensorAddressing = VK_TRUE,
-                .cooperativeMatrixBlockLoads = VK_TRUE,
-            };
-            if(isExtensionSupported(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME)) {
-                deviceExtensions.push_back(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME);
-                add_feature(feature_coop2);
-            }
-
             // Conditionally enable swapchain device extension only if swapchain support requested
             if (desc.enableSwapchain) {
                 deviceExtensions.insert(deviceExtensions.begin(), VK_KHR_SWAPCHAIN_EXTENSION_NAME);
