@@ -1685,7 +1685,7 @@ namespace evk {
         GetFrame().insideRenderPass = false;
         vkCmdEndRendering(GetFrame().cmd);
     }
-    void CmdBeginPresent() {
+    void CmdBeginPresent(ClearValue clearValue) {
         auto& F = GetFrame();
         EVK_ASSERT(!F.doingPresent, "CmdBeginPresent have already been called this frame.");
         F.doingPresent = true;
@@ -1695,7 +1695,7 @@ namespace evk {
         VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, 0, S.frames[S.swapchainSemaphoreIndex].imageReadySemaphore, 0, &S.swapchainIndex);
         CmdBarrier(S.frames[S.swapchainIndex].image, ImageLayout::Undefined, ImageLayout::Attachment);
 
-        ClearValue clears[] = {ClearColor{0.0f, 0.0f, 0.0f, 1.0f}};
+        ClearValue clears[] = {clearValue};
         CmdBeginRender(&S.frames[S.swapchainIndex].image, clears, 1);
     }
     void CmdEndPresent() {
