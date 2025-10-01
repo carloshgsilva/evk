@@ -1,0 +1,152 @@
+#include "evk.frag"
+
+CONSTANT(0) uint TRANSPOSE_A = 0;
+CONSTANT(1) uint SUM_C = 0;
+
+PUSH(
+    int aBufferRID;
+    int bBufferRID;
+    int cBufferRID;
+    uint B; // B = batch size (optional, set to 1 if unused)
+    uint M; // M = rows of A / output rows
+    uint K; // K = shared dimension (columns of A / rows of B)
+    uint N; // N = columns of B / output columns
+)
+
+BINDING_BUFFER_RW(float_buffer,
+    float at[];
+)
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+
+// Workgroup computes one 32x32 C tile using 4 subgroups (2x2 of 16x16 subtiles)
+#define TILE 32
+#define SUB_TILE 16
+
+// Shared staging for A and B tiles in fp16
+shared float16_t Asub[TILE * TILE];
+shared float16_t Bsub[TILE * TILE];
+// Shared staging for C when edge tiles need bounds-safe stores
+shared float Cshared[TILE * TILE];
+
+COMPUTE(32, 4, 1)
+void main() {
+    // Workgroup mapping (host dispatch: X = tilesCols, Y = tilesRows, Z = batch)
+    uint tilesRows = (M + TILE - 1u) / TILE;
+    uint tilesCols = (N + TILE - 1u) / TILE;
+    uint batchIdx = gl_WorkGroupID.z;
+    uint tileRowIndex = gl_WorkGroupID.y;
+    uint tileColIndex = gl_WorkGroupID.x;
+
+    uint aBase = batchIdx * (M * K);
+    uint bBase = batchIdx * (K * N);
+    uint cBase = batchIdx * (M * N);
+
+    // 32x32 tile origin for this workgroup
+    uint tileRow0 = tileRowIndex * TILE;
+    uint tileCol0 = tileColIndex * TILE;
+
+    // Optional guard if host dispatch over-covers
+    if (tileRow0 >= M || tileCol0 >= N) {
+        return;
+    }
+
+    // Map 4 subgroups across Y dimension into a 2x2 grid of 16x16 subtiles
+    // local_size_x = 32 (one subgroup), local_size_y = 4 (four subgroups total)
+    uint subgroupIdx = gl_LocalInvocationID.y; // 0..3
+    uint subTileRow = subgroupIdx >> 1;        // 0 or 1
+    uint subTileCol = subgroupIdx & 1u;        // 0 or 1
+    uint subTileRow0 = tileRow0 + subTileRow * SUB_TILE;
+    uint subTileCol0 = tileCol0 + subTileCol * SUB_TILE;
+
+    // Per-subgroup accumulator (16x16)
+    coopmat<float, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> accumulator =
+        coopmat<float, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+
+    // Loop K in 32-wide tiles; each workgroup loads A(32x32) and B(32x32) into shared
+    for (uint kTile0 = 0; kTile0 < K; kTile0 += TILE) {
+        // Coop load of 32x32 tiles into shared memory (all 128 threads contribute), vectorized by 4 along columns
+        uint linearThread = gl_LocalInvocationID.y * 32u + gl_LocalInvocationID.x; // 0..127
+        const uint VEC = 4u;                          // load 4 contiguous elements per iteration
+        const uint groupsPerTile = (TILE * TILE) / VEC; // 1024/4 = 256 groups
+        for (uint g = linearThread; g < groupsPerTile; g += 128u) {
+            uint base = g * VEC;
+            uint r = base / TILE;           // 0..31
+            uint c0 = base % TILE;          // 0,4,8,...,28
+
+            uint aRow = tileRow0 + r;
+            uint bRow = kTile0 + r;
+
+            // Unroll VEC=4 small loop for better ILP
+            for (uint j = 0u; j < VEC; ++j) {
+                uint c = c0 + j;
+
+                // Global indices for A and B
+                uint aCol = kTile0 + c;
+                uint bCol = tileCol0 + c;
+
+                float16_t aVal16 = float16_t(0.0);
+                float16_t bVal16 = float16_t(0.0);
+
+                // Bounds-safe loads; zero-pad outside
+                if (aRow < M && aCol < K) {
+                    uint aIndex;
+                    if (TRANSPOSE_A == 0u) {
+                        // A as MxK row-major
+                        aIndex = aBase + aRow * K + aCol;
+                    } else {
+                        // A stored transposed as KxM row-major
+                        aIndex = aBase + aCol * M + aRow;
+                    }
+                    aVal16 = float16_t(float_buffer[aBufferRID].at[aIndex]);
+                }
+                if (bRow < K && bCol < N) {
+                    uint bIndex = bBase + bRow * N + bCol; // B as KxN row-major
+                    bVal16 = float16_t(float_buffer[bBufferRID].at[bIndex]);
+                }
+
+                Asub[r * TILE + c] = aVal16;
+                Bsub[r * TILE + c] = bVal16;
+            }
+        }
+
+        // Ensure tiles are fully populated before compute
+        barrier();
+
+        // Process this 32-wide K block as two 16-wide steps
+        for (uint kInner = 0u; kInner < TILE; kInner += SUB_TILE) {
+            // Load 16x16 fragments from shared memory for this subgroup's subtile
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> tile_A;
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> tile_B;
+
+            // A subtile starts at (subTileRow*16, kInner)
+            uint aSharedBase = (subTileRow * SUB_TILE) * TILE + kInner;
+            // B subtile starts at (kInner, subTileCol*16)
+            uint bSharedBase = kInner * TILE + (subTileCol * SUB_TILE);
+
+            coopMatLoad(tile_A, Asub, aSharedBase, TILE, 0);
+            coopMatLoad(tile_B, Bsub, bSharedBase, TILE, 0);
+
+            // FMA accumulate 16x16
+            accumulator = coopMatMulAdd(tile_A, tile_B, accumulator);
+        }
+
+        // Wait before overwriting shared tiles in next K block
+        barrier();
+    }
+
+    // Store the resulting 16x16 subtile into C
+    uint cElement = cBase + subTileRow0 * N + subTileCol0;
+    uint cStride = N;
+    if (SUM_C == 0u) {
+        coopMatStore(accumulator, float_buffer[cBufferRID].at, cElement, cStride, 0);
+    } else {
+        coopmat<float, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> cTile;
+        coopMatLoad(cTile, float_buffer[cBufferRID].at, cElement, cStride, 0);
+        cTile = cTile + accumulator;
+        coopMatStore(cTile, float_buffer[cBufferRID].at, cElement, cStride, 0);
+    }
+}
