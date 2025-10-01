@@ -200,6 +200,7 @@ namespace evk::ai {
     struct Pipelines {
         evk::Pipeline matmul;
         evk::Pipeline matmul_bwd;
+        evk::Pipeline matmul_coop;
         evk::Pipeline flash_attn;
         evk::Pipeline flash_attn_bwd;
     };
@@ -215,6 +216,10 @@ namespace evk::ai {
             .name = "matmul_bwd",
             .CS = evk::loadSpirvFile("shaders/bin/matmul.comp.spv"),
             .constants = evk::Constant{1, 1}, // TRANSPOSE_A = 1, SUM_C = 1
+        });
+        pipelines->matmul_coop = evk::CreatePipeline({
+            .name = "matmul_coop",
+            .CS = evk::loadSpirvFile("shaders/bin/matmul_coop.comp.spv"),
         });
         pipelines->flash_attn = evk::CreatePipeline({
             .name = "flash_attention",
@@ -238,7 +243,6 @@ namespace evk::ai {
         assert(a.shape.batch_size(2) == b.shape.batch_size(2));
         assert(a.shape[-1] == b.shape[-2]);
 
-        evk::CmdBind(pipelines->matmul);
         // Determine batch size B. If tensor rank >= 3 use first dim as batch, otherwise 1.
         uint32_t batch = 1;
         if (a.shape.rank() >= 3) batch = a.shape.batch_size(2);
@@ -258,11 +262,22 @@ namespace evk::ai {
             N
         });
 
-        const uint32_t TILE = 32u;
-        uint32_t tilesCols = (N + TILE - 1) / TILE; // columns (N)
-        uint32_t tilesRows = (M + TILE - 1) / TILE; // rows (M)
-        // Map: X=tilesCols, Y=tilesRows, Z=batch
-        evk::CmdDispatch(tilesCols, tilesRows, batch);
+        constexpr bool USE_COOP = true;
+        if (USE_COOP) {
+            const uint32_t TILE = 32u;
+            uint32_t tilesCols = (N + TILE - 1) / TILE; // columns (N)
+            uint32_t tilesRows = (M + TILE - 1) / TILE; // rows (M)
+            // Map: X=tilesCols, Y=tilesRows, Z=batch
+            evk::CmdBind(pipelines->matmul_coop);
+            evk::CmdDispatch(tilesCols, tilesRows, batch);
+        } else {
+            const uint32_t TILE = 16u; // matches matmul.comp local size
+            uint32_t tilesCols = (N + TILE - 1) / TILE; // columns (N)
+            uint32_t tilesRows = (M + TILE - 1) / TILE; // rows (M)
+            // Map: X=tilesCols, Y=tilesRows, Z=batch
+            evk::CmdBind(pipelines->matmul);
+            evk::CmdDispatch(tilesCols, tilesRows, batch);
+        }
     }
 
     // dL/dB = A^T * dL/dC
@@ -299,7 +314,7 @@ namespace evk::ai {
         uint32_t groupY = (M + TILE - 1) / TILE;
         evk::CmdDispatch(groupX, groupY, batch);
 #else
-        const uint32_t TILE = 32u;
+        const uint32_t TILE = 16u; // matches matmul.comp local size
         uint32_t tilesCols = (N + TILE - 1) / TILE;
         uint32_t tilesRows = (M + TILE - 1) / TILE;
         // X=sizeX, Y=sizeY, Z=batch
@@ -459,8 +474,8 @@ void test_matmul() {
     Tensor* b = new Tensor({size, size});
     Tensor* c = new Tensor({size, size});
 
-    a->identity(1.0f);
-    b->identity(2.0f);
+    a->identity(2.0f);
+    b->identity(3.0f);
 
     for (uint32_t i = 0; i < 5; ++i) {
         evk::CmdTimestamp("matmul", [&]() {
