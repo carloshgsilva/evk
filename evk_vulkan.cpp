@@ -1239,7 +1239,7 @@ namespace evk {
             .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
             .preTransform = transform,
             .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-            .presentMode = VK_PRESENT_MODE_FIFO_KHR,  // VK_PRESENT_MODE_MAILBOX_KHR = v-sync off,
+            .presentMode = VK_PRESENT_MODE_MAILBOX_KHR,
             .clipped = false,
             .oldSwapchain = oldSwapchain,
         };
