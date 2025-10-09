@@ -23,17 +23,17 @@ BINDING_BUFFER_RW(float_buffer,
 #extension GL_KHR_memory_scope_semantics : enable
 
 // Workgroup configuration - optimized for shared memory cooperative matrix operations
-#define TILE_K 64
-#define TILE_M 64
-#define TILE_N 64
+#define TILE_K 96
+#define TILE_M 96
+#define TILE_N 96
 #define SUB_TILE 16
 
 // Shared memory with padding to avoid bank conflicts (similar to shmem.comp approach)
-#define ROW_PAD 4  // Pad each row by 4 elements to avoid bank conflicts
+#define ROW_PAD 2  // Pad each row by 2 elements to avoid bank conflicts
 shared float16_t Asub[TILE_M * (TILE_K + ROW_PAD)];
 shared float16_t Bsub[TILE_N * (TILE_K + ROW_PAD)];
 
-COMPUTE(256, 1, 1)
+COMPUTE(576, 1, 1)
 void main() {
     // Workgroup mapping (host dispatch: X = tilesCols, Y = tilesRows, Z = batch)
     uint tilesRows = (M + TILE_M - 1u) / TILE_M;
@@ -50,10 +50,11 @@ void main() {
     uint tileRow0 = tileRowIndex * TILE_M;
     uint tileCol0 = tileColIndex * TILE_N;
 
-    // Subgroup configuration - 16 subgroups in 4x4 arrangement for 16x16 subtiles
+    // Subgroup configuration - optimized for better memory access patterns
     uint subgroupIdx = gl_SubgroupID;
-    uint subTileRow = subgroupIdx / 4u;        // 0, 1, 2, or 3
-    uint subTileCol = subgroupIdx % 4u;        // 0, 1, 2, or 3
+    uint subgroupsPerRow = 6u;  // 96/16 = 6 subgroups per row
+    uint subTileRow = subgroupIdx / subgroupsPerRow;        // 0-5
+    uint subTileCol = subgroupIdx % subgroupsPerRow;        // 0-5
     uint subTileRow0 = tileRow0 + subTileRow * SUB_TILE;
     uint subTileCol0 = tileCol0 + subTileCol * SUB_TILE;
 
@@ -66,13 +67,13 @@ void main() {
         // Load A and B tiles into shared memory with optimized access patterns
         // Each thread loads multiple elements to maximize memory bandwidth
 
-        // Calculate linear thread index within workgroup (0-127)
+        // Calculate linear thread index within workgroup (0-575)
         uint threadIdx = gl_LocalInvocationIndex;
 
         // Load A tile: optimized loading pattern for better cache locality
-        uint elementsPerThread = (TILE_M * TILE_K + 255u) / 256u; // Ceiling division
+        uint elementsPerThread = (TILE_M * TILE_K + 575u) / 576u; // Ceiling division
         for (uint elem = 0u; elem < elementsPerThread; elem++) {
-            uint i = threadIdx + elem * 256u;
+            uint i = threadIdx + elem * 576u;
             uint row = i / TILE_K;
             uint col = i % TILE_K;
 
@@ -99,9 +100,9 @@ void main() {
         }
 
         // Load B tile: optimized loading pattern for better cache locality
-        elementsPerThread = (TILE_K * TILE_N + 255u) / 256u; // Ceiling division
+        elementsPerThread = (TILE_K * TILE_N + 575u) / 576u; // Ceiling division
         for (uint elem = 0u; elem < elementsPerThread; elem++) {
-            uint i = threadIdx + elem * 256u;
+            uint i = threadIdx + elem * 576u;
             uint row = i / TILE_N;
             uint col = i % TILE_N;
 
@@ -123,8 +124,8 @@ void main() {
         // Ensure all data is loaded before computation
         barrier();
 
-        // Process this K tile in 16-wide steps for better data reuse
-        for (uint kInner = 0u; kInner < TILE_K; kInner += SUB_TILE) {
+        // Process this K tile in 32-wide steps for better data reuse
+        for (uint kInner = 0u; kInner < TILE_K; kInner += 32u) {
             // Load 16x16 fragments from shared memory for this subgroup's subtile
             coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> tile_A;
             coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> tile_B;
