@@ -497,11 +497,24 @@ void test_matmul() {
     // a->print();
     // b->print();
     // c->print();
-    if(c->cpu()[0] == 6.0f) {
+    bool c_correct = true;
+    std::vector<float>& c_cpu = c->cpu();
+    for(uint32_t i = 0; i < c->shape[0]; ++i) {
+        int idx = i * (c->shape[0] + 1);
+        if(c_cpu[idx] != 6.0f) {
+            int m = idx / c->shape[0];
+            int n = idx % c->shape[0];
+            printf("a * b = c\n");
+            printf("c[%d, %d] = %f (expected 6.0f)\n", m, n, c_cpu[idx]);
+            c_correct = false;
+            break;
+        }
+    }
+
+    if(c_correct) {
         printf("Matrix multiplication is correct!\n");
     } else {
-        printf("c[0] = %f\n", c->cpu()[0]);
-        printf("first c matrix element is not 6.0f, so the matmul is not correct!\n");
+        printf("Failed: Matrix multiplication is not correct!\n");
         assert(false);
     }
 
