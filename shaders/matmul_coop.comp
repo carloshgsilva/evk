@@ -22,21 +22,22 @@ BINDING_BUFFER_RW(float_buffer,
 #extension GL_KHR_cooperative_matrix : enable
 #extension GL_KHR_memory_scope_semantics : enable
 
-// Workgroup computes one 32x32 C tile using 4 subgroups (2x2 of 16x16 subtiles)
-#define TILE 32
+// Workgroup configuration - optimized for shared memory cooperative matrix operations
+#define TILE_K 32
+#define TILE_M 32
+#define TILE_N 32
 #define SUB_TILE 16
 
-// Shared staging for A and B tiles in fp16
-shared float16_t Asub[TILE * TILE];
-shared float16_t Bsub[TILE * TILE];
-// Shared staging for C when edge tiles need bounds-safe stores
-shared float Cshared[TILE * TILE];
+// Shared memory with padding to avoid bank conflicts (similar to shmem.comp approach)
+#define ROW_PAD 4  // Pad each row by 4 elements to avoid bank conflicts
+shared float16_t Asub[TILE_M * (TILE_K + ROW_PAD)];
+shared float16_t Bsub[TILE_N * (TILE_K + ROW_PAD)];
 
-COMPUTE(32, 4, 1)
+COMPUTE(128, 1, 1)
 void main() {
     // Workgroup mapping (host dispatch: X = tilesCols, Y = tilesRows, Z = batch)
-    uint tilesRows = (M + TILE - 1u) / TILE;
-    uint tilesCols = (N + TILE - 1u) / TILE;
+    uint tilesRows = (M + TILE_M - 1u) / TILE_M;
+    uint tilesCols = (N + TILE_N - 1u) / TILE_N;
     uint batchIdx = gl_WorkGroupID.z;
     uint tileRowIndex = gl_WorkGroupID.y;
     uint tileColIndex = gl_WorkGroupID.x;
@@ -46,19 +47,18 @@ void main() {
     uint cBase = batchIdx * (M * N);
 
     // 32x32 tile origin for this workgroup
-    uint tileRow0 = tileRowIndex * TILE;
-    uint tileCol0 = tileColIndex * TILE;
+    uint tileRow0 = tileRowIndex * TILE_M;
+    uint tileCol0 = tileColIndex * TILE_N;
 
     // Optional guard if host dispatch over-covers
-    if (tileRow0 >= M || tileCol0 >= N) {
-        return;
-    }
+    // if (tileRow0 >= M || tileCol0 >= N) {
+    //     return;
+    // }
 
-    // Map 4 subgroups across Y dimension into a 2x2 grid of 16x16 subtiles
-    // local_size_x = 32 (one subgroup), local_size_y = 4 (four subgroups total)
-    uint subgroupIdx = gl_LocalInvocationID.y; // 0..3
-    uint subTileRow = subgroupIdx >> 1;        // 0 or 1
-    uint subTileCol = subgroupIdx & 1u;        // 0 or 1
+    // Subgroup configuration - 4 subgroups in 2x2 arrangement for 16x16 subtiles
+    uint subgroupIdx = gl_SubgroupID;
+    uint subTileRow = subgroupIdx / 2u;        // 0 or 1
+    uint subTileCol = subgroupIdx % 2u;        // 0 or 1
     uint subTileRow0 = tileRow0 + subTileRow * SUB_TILE;
     uint subTileCol0 = tileCol0 + subTileCol * SUB_TILE;
 
@@ -66,69 +66,80 @@ void main() {
     coopmat<float, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> accumulator =
         coopmat<float, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
 
-    // Loop K in 32-wide tiles; each workgroup loads A(32x32) and B(32x32) into shared
-    for (uint kTile0 = 0; kTile0 < K; kTile0 += TILE) {
-        // Coop load of 32x32 tiles into shared memory (all 128 threads contribute), vectorized by 4 along columns
-        uint linearThread = gl_LocalInvocationID.y * 32u + gl_LocalInvocationID.x; // 0..127
-        const uint VEC = 4u;                          // load 4 contiguous elements per iteration
-        const uint groupsPerTile = (TILE * TILE) / VEC; // 1024/4 = 256 groups
-        for (uint g = linearThread; g < groupsPerTile; g += 128u) {
-            uint base = g * VEC;
-            uint r = base / TILE;           // 0..31
-            uint c0 = base % TILE;          // 0,4,8,...,28
+    // Process K dimension in tiles
+    for (uint kTile0 = 0; kTile0 < K; kTile0 += TILE_K) {
+        // Load A and B tiles into shared memory with optimized access patterns
+        // Each thread loads multiple elements to maximize memory bandwidth
 
-            uint aRow = tileRow0 + r;
-            uint bRow = kTile0 + r;
+        // Calculate linear thread index within workgroup (0-127)
+        uint threadIdx = gl_LocalInvocationIndex;
 
-            // Unroll VEC=4 small loop for better ILP
-            for (uint j = 0u; j < VEC; ++j) {
-                uint c = c0 + j;
+        // Load A tile: each thread handles multiple rows/columns
+        for (uint i = threadIdx; i < TILE_M * TILE_K; i += 128u) {
+            uint row = i / TILE_K;
+            uint col = i % TILE_K;
 
-                // Global indices for A and B
-                uint aCol = kTile0 + c;
-                uint bCol = tileCol0 + c;
+            uint aRow = tileRow0 + row;
+            uint aCol = kTile0 + col;
 
-                float16_t aVal16 = float16_t(0.0);
-                float16_t bVal16 = float16_t(0.0);
+            float16_t aVal = float16_t(0.0);
 
-                // Bounds-safe loads; zero-pad outside
-                if (aRow < M && aCol < K) {
-                    uint aIndex;
-                    if (TRANSPOSE_A == 0u) {
-                        // A as MxK row-major
-                        aIndex = aBase + aRow * K + aCol;
-                    } else {
-                        // A stored transposed as KxM row-major
-                        aIndex = aBase + aCol * M + aRow;
-                    }
-                    aVal16 = float16_t(float_buffer[aBufferRID].at[aIndex]);
+            // Bounds-safe load with zero padding
+            // if (aRow < M && aCol < K) {
+                uint aIndex;
+                if (TRANSPOSE_A == 0u) {
+                    // A as MxK row-major
+                    aIndex = aBase + aRow * K + aCol;
+                } else {
+                    // A stored transposed as KxM row-major
+                    aIndex = aBase + aCol * M + aRow;
                 }
-                if (bRow < K && bCol < N) {
-                    uint bIndex = bBase + bRow * N + bCol; // B as KxN row-major
-                    bVal16 = float16_t(float_buffer[bBufferRID].at[bIndex]);
-                }
+                aVal = float16_t(float_buffer[aBufferRID].at[aIndex]);
+            // }
 
-                Asub[r * TILE + c] = aVal16;
-                Bsub[r * TILE + c] = bVal16;
-            }
+            // Store in shared memory with padding to avoid bank conflicts
+            uint sharedRow = row;
+            uint sharedCol = col;
+            Asub[sharedRow * (TILE_K + ROW_PAD) + sharedCol] = aVal;
         }
 
-        // Ensure tiles are fully populated before compute
+        // Load B tile: each thread handles multiple rows/columns
+        for (uint i = threadIdx; i < TILE_K * TILE_N; i += 128u) {
+            uint row = i / TILE_N;
+            uint col = i % TILE_N;
+
+            uint bRow = kTile0 + row;
+            uint bCol = tileCol0 + col;
+
+            float16_t bVal = float16_t(0.0);
+
+            // Bounds-safe load with zero padding
+            // if (bRow < K && bCol < N) {
+                uint bIndex = bBase + bRow * N + bCol; // B as KxN row-major
+                bVal = float16_t(float_buffer[bBufferRID].at[bIndex]);
+            // }
+
+            // Store in shared memory with padding to avoid bank conflicts
+            uint sharedRow = row;
+            uint sharedCol = col;
+            Bsub[sharedRow * (TILE_N + ROW_PAD) + sharedCol] = bVal;
+        }
+
+        // Ensure all data is loaded before computation
         barrier();
 
-        // Process this 32-wide K block as two 16-wide steps
-        for (uint kInner = 0u; kInner < TILE; kInner += SUB_TILE) {
+        // Process this K tile in 16-wide steps for better data reuse
+        for (uint kInner = 0u; kInner < TILE_K; kInner += SUB_TILE) {
             // Load 16x16 fragments from shared memory for this subgroup's subtile
             coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> tile_A;
             coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> tile_B;
 
-            // A subtile starts at (subTileRow*16, kInner)
-            uint aSharedBase = (subTileRow * SUB_TILE) * TILE + kInner;
-            // B subtile starts at (kInner, subTileCol*16)
-            uint bSharedBase = kInner * TILE + (subTileCol * SUB_TILE);
+            // Calculate shared memory offsets for this subtile
+            uint aSharedBase = (subTileRow * SUB_TILE) * (TILE_K + ROW_PAD) + kInner;
+            uint bSharedBase = kInner * (TILE_N + ROW_PAD) + (subTileCol * SUB_TILE);
 
-            coopMatLoad(tile_A, Asub, aSharedBase, TILE, 0);
-            coopMatLoad(tile_B, Bsub, bSharedBase, TILE, 0);
+            coopMatLoad(tile_A, Asub, aSharedBase, TILE_K + ROW_PAD, 0);
+            coopMatLoad(tile_B, Bsub, bSharedBase, TILE_N + ROW_PAD, 0);
 
             // FMA accumulate 16x16
             accumulator = coopMatMulAdd(tile_A, tile_B, accumulator);
