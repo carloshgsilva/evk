@@ -23,17 +23,18 @@ BINDING_BUFFER_RW(float_buffer,
 #extension GL_KHR_memory_scope_semantics : enable
 
 // Workgroup configuration - optimized for shared memory cooperative matrix operations
-#define TILE_K 96
-#define TILE_M 96
-#define TILE_N 96
+#define TILE_K 128
+#define TILE_M 128
+#define TILE_N 128
 #define SUB_TILE 16
 
 // Shared memory with padding to avoid bank conflicts (similar to shmem.comp approach)
+// Using optimized loading pattern with better memory access
 #define ROW_PAD 2  // Pad each row by 2 elements to avoid bank conflicts
 shared float16_t Asub[TILE_M * (TILE_K + ROW_PAD)];
 shared float16_t Bsub[TILE_N * (TILE_K + ROW_PAD)];
 
-COMPUTE(576, 1, 1)
+COMPUTE(1024, 1, 1)
 void main() {
     // Workgroup mapping (host dispatch: X = tilesCols, Y = tilesRows, Z = batch)
     uint tilesRows = (M + TILE_M - 1u) / TILE_M;
@@ -52,9 +53,9 @@ void main() {
 
     // Subgroup configuration - optimized for better memory access patterns
     uint subgroupIdx = gl_SubgroupID;
-    uint subgroupsPerRow = 6u;  // 96/16 = 6 subgroups per row
-    uint subTileRow = subgroupIdx / subgroupsPerRow;        // 0-5
-    uint subTileCol = subgroupIdx % subgroupsPerRow;        // 0-5
+    uint subgroupsPerRow = 8u;  // 128/16 = 8 subgroups per row
+    uint subTileRow = subgroupIdx / subgroupsPerRow;        // 0-7
+    uint subTileCol = subgroupIdx % subgroupsPerRow;        // 0-7
     uint subTileRow0 = tileRow0 + subTileRow * SUB_TILE;
     uint subTileCol0 = tileCol0 + subTileCol * SUB_TILE;
 
@@ -70,10 +71,10 @@ void main() {
         // Calculate linear thread index within workgroup (0-575)
         uint threadIdx = gl_LocalInvocationIndex;
 
-        // Load A tile: optimized loading pattern for better cache locality
-        uint elementsPerThread = (TILE_M * TILE_K + 575u) / 576u; // Ceiling division
+        // Load A tile: optimized loading pattern with better memory access
+        uint elementsPerThread = (TILE_M * TILE_K + 1023u) / 1024u; // Ceiling division
         for (uint elem = 0u; elem < elementsPerThread; elem++) {
-            uint i = threadIdx + elem * 576u;
+            uint i = threadIdx + elem * 1024u;
             uint row = i / TILE_K;
             uint col = i % TILE_K;
 
@@ -99,10 +100,10 @@ void main() {
             Asub[sharedRow * (TILE_K + ROW_PAD) + sharedCol] = aVal;
         }
 
-        // Load B tile: optimized loading pattern for better cache locality
-        elementsPerThread = (TILE_K * TILE_N + 575u) / 576u; // Ceiling division
+        // Load B tile: optimized loading pattern with better memory access
+        elementsPerThread = (TILE_K * TILE_N + 1023u) / 1024u; // Ceiling division
         for (uint elem = 0u; elem < elementsPerThread; elem++) {
-            uint i = threadIdx + elem * 576u;
+            uint i = threadIdx + elem * 1024u;
             uint row = i / TILE_N;
             uint col = i % TILE_N;
 
