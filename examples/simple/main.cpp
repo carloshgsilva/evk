@@ -264,7 +264,7 @@ namespace evk::ai {
 
         constexpr bool USE_COOP = true;
         if (USE_COOP) {
-            const uint32_t TILE = 32u;
+            const uint32_t TILE = 64u;
             uint32_t tilesCols = (N + TILE - 1) / TILE; // columns (N)
             uint32_t tilesRows = (M + TILE - 1) / TILE; // rows (M)
             // Map: X=tilesCols, Y=tilesRows, Z=batch
