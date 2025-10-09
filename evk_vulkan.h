@@ -8,8 +8,8 @@
 #if defined(_DEBUG) || defined(EVK_DEBUG)
 #define EVK_ASSERT(cond, message, ...)                                                        \
     if (!(cond)) {                                                                            \
-        printf("\033[1;33m %s() \033[1;31m" message "\033[0m", __FUNCTION__, ##__VA_ARGS__); \
-        abort();                                                                              \
+        printf("\033[1;33m %s() \033[1;31m" message "\033[0m", __FUNCTION__, ##__VA_ARGS__);  \
+        exit(1);                                                                              \
     }
 
 #define CHECK_VK(cmd) EVK_ASSERT(cmd == VK_SUCCESS, #cmd)  // printf("%s\n", #cmd);
