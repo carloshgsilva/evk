@@ -28,12 +28,15 @@ BINDING_BUFFER_RW(float_buffer,
 #define TILE_N 64
 #define SUB_TILE 16
 
+// Workgroup size - tune for occupancy
+#define WG_SIZE 512
+
 // Shared memory with padding to avoid bank conflicts
 #define ROW_PAD 8  // Pad each row by 8 elements to avoid bank conflicts
 shared float16_t Asub[TILE_M * (TILE_K + ROW_PAD)];
-shared float16_t Bsub[TILE_N * (TILE_K + ROW_PAD)];
+shared float16_t Bsub[TILE_K * (TILE_N + ROW_PAD)];
 
-COMPUTE(512, 1, 1)
+COMPUTE(WG_SIZE, 1, 1)
 void main() {
     // Workgroup mapping (host dispatch: X = tilesCols, Y = tilesRows, Z = batch)
     uint tilesRows = (M + TILE_M - 1u) / TILE_M;
@@ -72,10 +75,10 @@ void main() {
 
         // Load A tile: simple sequential loading (let each thread handle different parts)
         uint totalElementsA = TILE_M * TILE_K;
-        uint elementsPerThreadA = (totalElementsA + 511u) / 512u; // Ceiling division for 512 threads
+        uint elementsPerThreadA = (totalElementsA + WG_SIZE - 1u) / WG_SIZE; // Ceiling division by workgroup size
 
         for (uint i = 0u; i < elementsPerThreadA; i++) {
-            uint idx = threadIdx + i * 512u;
+            uint idx = threadIdx + i * WG_SIZE;
             if (idx < totalElementsA) {
                 uint row = idx / TILE_K;
                 uint col = idx % TILE_K;
@@ -105,10 +108,10 @@ void main() {
 
         // Load B tile: simple sequential loading
         uint totalElementsB = TILE_K * TILE_N;
-        uint elementsPerThreadB = (totalElementsB + 511u) / 512u; // Ceiling division for 512 threads
+        uint elementsPerThreadB = (totalElementsB + WG_SIZE - 1u) / WG_SIZE; // Ceiling division by workgroup size
 
         for (uint i = 0u; i < elementsPerThreadB; i++) {
-            uint idx = threadIdx + i * 512u;
+            uint idx = threadIdx + i * WG_SIZE;
             if (idx < totalElementsB) {
                 uint row = idx / TILE_N;
                 uint col = idx % TILE_N;
