@@ -73,59 +73,51 @@ void main() {
         uint elementsPerThread = (TILE_M * TILE_K + 255u) / 256u; // Ceiling division
         for (uint elem = 0u; elem < elementsPerThread; elem++) {
             uint i = threadIdx + elem * 256u;
-            if (i < TILE_M * TILE_K) {
-                uint row = i / TILE_K;
-                uint col = i % TILE_K;
+            uint row = i / TILE_K;
+            uint col = i % TILE_K;
 
-                uint aRow = tileRow0 + row;
-                uint aCol = kTile0 + col;
+            uint aRow = tileRow0 + row;
+            uint aCol = kTile0 + col;
 
-                float16_t aVal = float16_t(0.0);
+            float16_t aVal = float16_t(0.0);
 
-                // Bounds-safe load with zero padding
-                // if (aRow < M && aCol < K) {
-                    uint aIndex;
-                    if (TRANSPOSE_A == 0u) {
-                        // A as MxK row-major
-                        aIndex = aBase + aRow * K + aCol;
-                    } else {
-                        // A stored transposed as KxM row-major
-                        aIndex = aBase + aCol * M + aRow;
-                    }
-                    aVal = float16_t(float_buffer[aBufferRID].at[aIndex]);
-                // }
-
-                // Store in shared memory with padding to avoid bank conflicts
-                uint sharedRow = row;
-                uint sharedCol = col;
-                Asub[sharedRow * (TILE_K + ROW_PAD) + sharedCol] = aVal;
+            // No bounds check (assumes it's always aligned)
+            uint aIndex;
+            if (TRANSPOSE_A == 0u) {
+                // A as MxK row-major
+                aIndex = aBase + aRow * K + aCol;
+            } else {
+                // A stored transposed as KxM row-major
+                aIndex = aBase + aCol * M + aRow;
             }
+            aVal = float16_t(float_buffer[aBufferRID].at[aIndex]);
+
+            // Store in shared memory with padding to avoid bank conflicts
+            uint sharedRow = row;
+            uint sharedCol = col;
+            Asub[sharedRow * (TILE_K + ROW_PAD) + sharedCol] = aVal;
         }
 
         // Load B tile: optimized loading pattern for better cache locality
         elementsPerThread = (TILE_K * TILE_N + 255u) / 256u; // Ceiling division
         for (uint elem = 0u; elem < elementsPerThread; elem++) {
             uint i = threadIdx + elem * 256u;
-            if (i < TILE_K * TILE_N) {
-                uint row = i / TILE_N;
-                uint col = i % TILE_N;
+            uint row = i / TILE_N;
+            uint col = i % TILE_N;
 
-                uint bRow = kTile0 + row;
-                uint bCol = tileCol0 + col;
+            uint bRow = kTile0 + row;
+            uint bCol = tileCol0 + col;
 
-                float16_t bVal = float16_t(0.0);
+            float16_t bVal = float16_t(0.0);
 
-                // Bounds-safe load with zero padding
-                // if (bRow < K && bCol < N) {
-                    uint bIndex = bBase + bRow * N + bCol; // B as KxN row-major
-                    bVal = float16_t(float_buffer[bBufferRID].at[bIndex]);
-                // }
+            // Bounds-safe load with zero padding
+            uint bIndex = bBase + bRow * N + bCol; // B as KxN row-major
+            bVal = float16_t(float_buffer[bBufferRID].at[bIndex]);
 
-                // Store in shared memory with padding to avoid bank conflicts
-                uint sharedRow = row;
-                uint sharedCol = col;
-                Bsub[sharedRow * (TILE_N + ROW_PAD) + sharedCol] = bVal;
-            }
+            // Store in shared memory with padding to avoid bank conflicts
+            uint sharedRow = row;
+            uint sharedCol = col;
+            Bsub[sharedRow * (TILE_N + ROW_PAD) + sharedCol] = bVal;
         }
 
         // Ensure all data is loaded before computation
