@@ -484,15 +484,26 @@ void test_matmul() {
     }
 
     evk::Sync();
+    float avg_ms = 0.0f;
+    float total_count = 0.0f;
     for(auto ts: evk::GetTimestamps()) {
-        float ms = float(ts.end - ts.start);
-        float tflops = float(2.0f * size * size * size) / (ms / 1000.0f) / 1e12f;
-        printf("%s:%.3fms (%.3ftflops)\n", ts.name, ms, tflops);
+        avg_ms += float(ts.end - ts.start);
+        total_count += 1.0f;
     }
+    avg_ms /= total_count;
+    float tflops = float(2.0f * size * size * size) / (avg_ms / 1000.0f) / 1e12f;
+    printf("matmul: %.3fms (%.3ftflops)\n", avg_ms, tflops);
 
-    a->print();
-    b->print();
-    c->print();
+    // a->print();
+    // b->print();
+    // c->print();
+    if(c->cpu()[0] == 6.0f) {
+        printf("Matrix multiplication is correct!\n");
+    } else {
+        printf("c[0] = %f\n", c->cpu()[0]);
+        printf("first c matrix element is not 6.0f, so the matmul is not correct!\n");
+        assert(false);
+    }
 
     delete a;
     delete b;
