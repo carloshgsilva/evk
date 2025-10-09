@@ -1,5 +1,8 @@
 #include "evk.frag"
 
+// Coopmat version of matmul.comp
+// Doesn't have bounds check, assumes 16 aligned dimensions
+
 CONSTANT(0) uint TRANSPOSE_A = 0;
 CONSTANT(1) uint SUM_C = 0;
 
@@ -23,7 +26,7 @@ BINDING_BUFFER_RW(float_buffer,
 #extension GL_KHR_memory_scope_semantics : enable
 
 // Workgroup configuration - optimized for shared memory cooperative matrix operations
-#define TILE_K 64
+#define TILE_K 64 // always 16 to match the cooperative matrix size
 #define TILE_M 64
 #define TILE_N 64
 #define SUB_TILE 16
@@ -79,31 +82,27 @@ void main() {
 
         for (uint i = 0u; i < elementsPerThreadA; i++) {
             uint idx = threadIdx + i * WG_SIZE;
-            if (idx < totalElementsA) {
-                uint row = idx / TILE_K;
-                uint col = idx % TILE_K;
+            uint row = idx / TILE_K;
+            uint col = idx % TILE_K;
 
-                uint aRow = tileRow0 + row;
-                uint aCol = kTile0 + col;
+            uint aRow = tileRow0 + row;
+            uint aCol = kTile0 + col;
 
-                float16_t aVal = float16_t(0.0);
+            float16_t aVal = float16_t(0.0);
 
-                // Bounds check
-                if (aRow < M && aCol < K) {
-                    uint aIndex;
-                    if (TRANSPOSE_A == 0u) {
-                        // A as MxK row-major
-                        aIndex = aBase + aRow * K + aCol;
-                    } else {
-                        // A stored transposed as KxM row-major
-                        aIndex = aBase + aCol * M + aRow;
-                    }
-                    aVal = float16_t(float_buffer[aBufferRID].at[aIndex]);
-                }
-
-                // Store in shared memory with padding to avoid bank conflicts
-                Asub[row * (TILE_K + ROW_PAD) + col] = aVal;
+            // Transpose A indexing
+            uint aIndex;
+            if (TRANSPOSE_A == 0u) {
+                // A as MxK row-major
+                aIndex = aBase + aRow * K + aCol;
+            } else {
+                // A stored transposed as KxM row-major
+                aIndex = aBase + aCol * M + aRow;
             }
+            aVal = float16_t(float_buffer[aBufferRID].at[aIndex]);
+
+            // Store in shared memory with padding to avoid bank conflicts
+            Asub[row * (TILE_K + ROW_PAD) + col] = aVal;
         }
 
         // Load B tile: simple sequential loading
@@ -112,24 +111,20 @@ void main() {
 
         for (uint i = 0u; i < elementsPerThreadB; i++) {
             uint idx = threadIdx + i * WG_SIZE;
-            if (idx < totalElementsB) {
-                uint row = idx / TILE_N;
-                uint col = idx % TILE_N;
+            uint row = idx / TILE_N;
+            uint col = idx % TILE_N;
 
-                uint bRow = kTile0 + row;
-                uint bCol = tileCol0 + col;
+            uint bRow = kTile0 + row;
+            uint bCol = tileCol0 + col;
 
-                float16_t bVal = float16_t(0.0);
+            float16_t bVal = float16_t(0.0);
 
-                // Bounds check
-                if (bRow < K && bCol < N) {
-                    uint bIndex = bBase + bRow * N + bCol; // B as KxN row-major
-                    bVal = float16_t(float_buffer[bBufferRID].at[bIndex]);
-                }
+            // B as KxN row-major
+            uint bIndex = bBase + bRow * N + bCol; // B as KxN row-major
+            bVal = float16_t(float_buffer[bBufferRID].at[bIndex]);
 
-                // Store in shared memory with padding to avoid bank conflicts
-                Bsub[row * (TILE_N + ROW_PAD) + col] = bVal;
-            }
+            // Store in shared memory with padding to avoid bank conflicts
+            Bsub[row * (TILE_N + ROW_PAD) + col] = bVal;
         }
 
         // Ensure all data is loaded before computation
