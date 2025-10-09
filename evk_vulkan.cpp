@@ -762,8 +762,8 @@ namespace evk {
             uint64_t start = F.queries[0];
             for (int i = 0; i < F.timestampNames.size(); i++) {
                 TimestampEntry e = {};
-                e.start = (F.queries[i * 2] - start) * 1e-6 / GetState().timestampPeriod;
-                e.end = (F.queries[i * 2 + 1] - start) * 1e-6 / GetState().timestampPeriod;
+                e.start = (F.queries[i * 2] - start) * 1e-6 * GetState().timestampPeriod;
+                e.end = (F.queries[i * 2 + 1] - start) * 1e-6 * GetState().timestampPeriod;
                 e.name = F.timestampNames[i];
                 F.timestampEntries.push_back(e);
             }
