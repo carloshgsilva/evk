@@ -477,7 +477,7 @@ void test_matmul() {
     a->identity(2.0f);
     b->identity(3.0f);
 
-    for (uint32_t i = 0; i < 5; ++i) {
+    for (uint32_t i = 0; i < 32; ++i) {
         evk::CmdTimestamp("matmul", [&]() {
             evk::ai::matmul(*a, *b, *c);
         });
