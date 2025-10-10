@@ -253,13 +253,16 @@ namespace evk::ai {
         uint32_t N = (b.shape.rank() >= 2) ? b.shape[1] : 1;
 
         evk::CmdPush(evk::Constant{
+            a.buffer.GetReference(),
+            b.buffer.GetReference(),
+            c.buffer.GetReference(),
             a.buffer.GetRID(),
             b.buffer.GetRID(),
             c.buffer.GetRID(),
             batch,
             M,
             K,
-            N
+            N,
         });
 
         constexpr bool USE_COOP = true;
@@ -477,18 +480,25 @@ void test_matmul() {
     a->identity(2.0f);
     b->identity(3.0f);
 
-    for (uint32_t i = 0; i < 32; ++i) {
-        evk::CmdTimestamp("matmul", [&]() {
-            evk::ai::matmul(*a, *b, *c);
-        });
+    // warm up
+    for (uint32_t i = 0; i < 4; ++i) {
+        evk::ai::matmul(*a, *b, *c);
     }
 
-    evk::Sync();
     float avg_ms = 0.0f;
     float total_count = 0.0f;
-    for(auto ts: evk::GetTimestamps()) {
-        avg_ms += float(ts.end - ts.start);
-        total_count += 1.0f;
+    for(int it = 0; it < 16; ++it) {
+        for (uint32_t i = 0; i < 32; ++i) {
+            evk::CmdTimestamp("matmul", [&]() {
+                evk::ai::matmul(*a, *b, *c);
+            });
+        }
+
+        evk::Sync();
+        for(auto ts: evk::GetTimestamps()) {
+            avg_ms += float(ts.end - ts.start);
+            total_count += 1.0f;
+        }
     }
     avg_ms /= total_count;
     float tflops = float(2.0f * size * size * size) / (avg_ms / 1000.0f) / 1e12f;
