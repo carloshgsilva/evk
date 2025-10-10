@@ -6,6 +6,119 @@
 
 #include "win_dbg.h"
 
+struct float16_t {
+    uint16_t value;
+
+    // Default constructor
+    float16_t() = default;
+
+    // Constructor from float32
+    explicit float16_t(float f) {
+        value = float_to_float16(f);
+    }
+
+    // Copy constructor
+    float16_t(const float16_t& other) = default;
+
+    // Assignment operator
+    float16_t& operator=(const float16_t& other) = default;
+
+    // Conversion operator to float32
+    explicit operator float() const {
+        return float16_to_float(value);
+    }
+
+    // Static conversion functions
+    static uint16_t float_to_float16(float f) {
+        uint32_t bits = *reinterpret_cast<uint32_t*>(&f);
+
+        // Extract components
+        uint32_t sign = (bits >> 31) & 0x1;
+        uint32_t exponent = (bits >> 23) & 0xFF;
+        uint32_t mantissa = bits & 0x7FFFFF;
+
+        // Handle special cases
+        if (exponent == 0xFF) {
+            // Infinity or NaN
+            if (mantissa == 0) {
+                // Infinity
+                return (sign << 15) | 0x7C00;
+            } else {
+                // NaN - preserve the first 9 bits of mantissa
+                return (sign << 15) | 0x7C00 | ((mantissa >> 13) & 0x3FF);
+            }
+        }
+
+        if (exponent == 0) {
+            // Zero or subnormal
+            if (mantissa == 0) {
+                return sign << 15;
+            }
+            // Subnormal numbers - handled by adjusting exponent
+        }
+
+        // Convert exponent from 32-bit to 16-bit format
+        int32_t new_exponent = int32_t(exponent) - 127 + 15;
+
+        if (new_exponent >= 31) {
+            // Overflow to infinity
+            return (sign << 15) | 0x7C00;
+        }
+
+        if (new_exponent <= 0) {
+            // Underflow to zero or subnormal
+            if (new_exponent < -10) {
+                return sign << 15;
+            }
+            // Subnormal number
+            uint32_t shift = 14 - new_exponent;
+            uint32_t subnormal_mantissa = mantissa >> shift;
+            return (sign << 15) | subnormal_mantissa;
+        }
+
+        // Round mantissa to 10 bits for half precision
+        uint32_t rounded_mantissa = (mantissa + 0x1000) >> 13; // Round to nearest
+
+        return (sign << 15) | (new_exponent << 10) | rounded_mantissa;
+    }
+
+    static float float16_to_float(uint16_t h) {
+        uint32_t sign = (h >> 15) & 0x1;
+        uint32_t exponent = (h >> 10) & 0x1F;
+        uint32_t mantissa = h & 0x3FF;
+
+        if (exponent == 0) {
+            if (mantissa == 0) {
+                // Zero
+                return sign ? -0.0f : 0.0f;
+            } else {
+                // Subnormal number
+                float result = 0.0f;
+                uint32_t bits = (sign << 31) | (exponent << 23) | (mantissa << 13);
+                return *reinterpret_cast<float*>(&bits);
+            }
+        }
+
+        if (exponent == 31) {
+            if (mantissa == 0) {
+                // Infinity
+                uint32_t bits = (sign << 31) | (0xFF << 23);
+                return *reinterpret_cast<float*>(&bits);
+            } else {
+                // NaN
+                uint32_t bits = (sign << 31) | (0xFF << 23) | (mantissa << 13);
+                return *reinterpret_cast<float*>(&bits);
+            }
+        }
+
+        // Normal number
+        uint32_t new_exponent = uint32_t(int32_t(exponent) - 15 + 127);
+        uint32_t bits = (sign << 31) | (new_exponent << 23) | (mantissa << 13);
+
+        return *reinterpret_cast<float*>(&bits);
+    }
+};
+
 struct Shape {
     static constexpr uint32_t MAX_DIMENSIONS = 8;
     uint32_t values[MAX_DIMENSIONS];
@@ -69,12 +182,12 @@ struct Shape {
 struct Tensor {
     evk::Buffer buffer;
     Shape shape;
-    std::vector<float> cpu_data;
+    std::vector<float16_t> cpu_data;
 
     Tensor(const Shape& shape) {
         this->shape = shape;
         // compute total size as product of first `count` dimensions
-        uint32_t s = shape.count() * sizeof(float);
+        uint32_t s = shape.count() * sizeof(float16_t);
         buffer = evk::CreateBuffer({
             .size = s,
             .usage = evk::BufferUsage::Storage,
@@ -82,31 +195,31 @@ struct Tensor {
     }
 
     // copies data from CPU to GPU
-    void set_cpu(const std::vector<float>& data) {
+    void set_cpu(const std::vector<float16_t>& data) {
         assert(data.size() == shape.count());
         cpu_data = data;
-        evk::CmdCopy(cpu_data.data(), buffer, shape.count() * sizeof(float));
+        evk::CmdCopy(cpu_data.data(), buffer, shape.count() * sizeof(float16_t));
         evk::Sync();
     }
 
     // allocates and copies data from GPU to CPU
-    std::vector<float>& cpu() {
+    std::vector<float16_t>& cpu() {
         cpu_data.resize(shape.count());
         evk::Buffer cpu_buffer = evk::CreateBuffer({
-            .size = shape.count() * sizeof(float),
+            .size = shape.count() * sizeof(float16_t),
             .usage = evk::BufferUsage::TransferDst,
             .memoryType = evk::MemoryType::CPU,
         });
-        evk::CmdCopy(buffer, cpu_buffer, shape.count() * sizeof(float));
+        evk::CmdCopy(buffer, cpu_buffer, shape.count() * sizeof(float16_t));
         evk::Sync();
-        evk::ReadBuffer(cpu_buffer, cpu_data.data(), shape.count() * sizeof(float), 0);
+        evk::ReadBuffer(cpu_buffer, cpu_data.data(), shape.count() * sizeof(float16_t), 0);
         return cpu_data;
     }
 
-    void identity(float val = 1.0f) {
+    void identity(float16_t val = float16_t(1.0f)) {
         cpu_data.resize(shape.count());
         for (uint32_t i = 0; i < shape.count(); ++i) {
-            cpu_data[i] = float((i % (shape[0]+1) == 0)? val : 0.0f);
+            cpu_data[i] = float16_t((i % (shape[0]+1) == 0)? val : float16_t(0.0f));
         }
         set_cpu(cpu_data);
     }
@@ -120,7 +233,7 @@ struct Tensor {
         }
         printf("):\n");
 
-        std::vector<float>& data = cpu();
+        std::vector<float16_t>& data = cpu();
 
         // If rank < 2 just fallback to flat print (limited)
         if (shape.rank() < 2) {
@@ -128,7 +241,7 @@ struct Tensor {
             printf("[");
             for (uint32_t i = 0; i < to_show; ++i) {
                 if (i) printf(", ");
-                printf("%g", data[i]);
+                printf("%g", float(data[i]));
             }
             if (to_show < shape.count()) printf(", ...");
             printf("]\n");
@@ -164,7 +277,7 @@ struct Tensor {
                 uint32_t show_cols = (std::min)(cols, max_elements);
                 for (uint32_t c = 0; c < show_cols; ++c) {
                     if (c != 0) printf(", ");
-                    printf("%g", data[row_offset + c]);
+                    printf("%g", float(data[row_offset + c]));
                 }
                 if (show_cols < cols) printf(", ...");
                 printf("]");
@@ -178,7 +291,7 @@ struct Tensor {
                 uint32_t show_cols = (std::min)(cols, max_elements);
                 for (uint32_t c = 0; c < show_cols; ++c) {
                     if (c != 0) printf(", ");
-                    printf("%g", data[last_row_offset + c]);
+                    printf("%g", float(data[last_row_offset + c]));
                 }
                 if (show_cols < cols) printf(", ...");
                 printf("]");
@@ -426,15 +539,15 @@ struct Transformer {
     }
 
     void backward() {
-        std::vector<float> target_output(test_dim * test_dim);
+        std::vector<float16_t> target_output(test_dim * test_dim);
         for (uint32_t i = 0; i < test_dim * test_dim; ++i) {
-            target_output[i] = float(i);
+            target_output[i] = float16_t(float(i));
         }
-        std::vector<float>& output_cpu = output->cpu();
-        std::vector<float>& output_grad_cpu = output_grad->cpu();
+        std::vector<float16_t>& output_cpu = output->cpu();
+        std::vector<float16_t>& output_grad_cpu = output_grad->cpu();
         for (uint32_t i = 0; i < target_output.size(); ++i) {
-            float target = (i % (test_dim+1) == 0)? 5.0f : 0.0f;
-            output_grad_cpu[i] = (target_output[i] - output_cpu[i])*0.005f;
+            float16_t target = (i % (test_dim+1) == 0)? float16_t(5.0f) : float16_t(0.0f);
+            output_grad_cpu[i] = float16_t((float(target_output[i]) - float(output_cpu[i]))*0.005f);
         }
         output_grad->set_cpu(output_grad_cpu);
 
@@ -472,13 +585,13 @@ void test_graph() {
 }
 
 void test_matmul() {
-    const uint32_t size = 16*16*16;
+    const uint32_t size = 4096;
     Tensor* a = new Tensor({size, size});
     Tensor* b = new Tensor({size, size});
     Tensor* c = new Tensor({size, size});
 
-    a->identity(2.0f);
-    b->identity(3.0f);
+    a->identity(float16_t(2.0f));
+    b->identity(float16_t(3.0f));
 
     // warm up
     for (uint32_t i = 0; i < 4; ++i) {
@@ -508,14 +621,14 @@ void test_matmul() {
     // b->print();
     // c->print();
     bool c_correct = true;
-    std::vector<float>& c_cpu = c->cpu();
+    float16_t* c_cpu = (float16_t*)c->cpu().data();
     for(uint32_t i = 0; i < c->shape[0]; ++i) {
         int idx = i * (c->shape[0] + 1);
-        if(c_cpu[idx] != 6.0f) {
+        if(c_cpu[idx].value != float16_t(6.0f).value) {
             int m = idx / c->shape[0];
             int n = idx % c->shape[0];
             printf("a * b = c\n");
-            printf("c[%d, %d] = %f (expected 6.0f)\n", m, n, c_cpu[idx]);
+            printf("c[%d, %d] = %f (expected 6.0f)\n", m, n, float(c_cpu[idx]));
             c_correct = false;
             break;
         }
