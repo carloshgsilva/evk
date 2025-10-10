@@ -236,6 +236,13 @@ namespace evk {
         EVK_ASSERT(buffer->desc.memoryType != MemoryType::GPU, "Trying to write to buffer '%s', but its memory type is GPU!", buffer->desc.name.c_str());
         return buffer->mappedData;
     }
+    uint64_t Buffer::GetReference() {
+        Internal_Buffer* buffer = dynamic_cast<Internal_Buffer*>(res);
+        EVK_ASSERT(buffer, "Invalid Buffer");
+        EVK_ASSERT(buffer->desc.memoryType == MemoryType::GPU, "Trying to get reference of buffer '%s', but its memory type is GPU!", buffer->desc.name.c_str());
+        EVK_ASSERT(buffer->deviceAddress != 0, "Trying to get reference of buffer '%s', but its device address is 0!", buffer->desc.name.c_str());
+        return buffer->deviceAddress;
+    }
     void WriteBuffer(Buffer& buffer, void* src, uint64_t size, uint64_t offset) {
         Internal_Buffer* res = (Internal_Buffer*)buffer.res;
         EVK_ASSERT(GetDesc(buffer).memoryType != MemoryType::GPU, "Trying to write to buffer '%s', but its memory type is GPU!", GetDesc(buffer).name.c_str());
