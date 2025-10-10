@@ -53,18 +53,18 @@ uint coordToOffset(uint i, uint j, uint stride, bool colMajor) {
     return colMajor ? (stride * j + i) : (stride * i + j);
 }
 
-#define BUFFER_REF 0
+#define BUFFER_REF 1
 
 COMPUTE(32, 1, 1)
 void main() {
     uvec2 tileID = uvec2(gl_WorkGroupID.xy);
 
     // Initialize result to zero
-    // [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
-    //     [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
-    //         result[i][j] = coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(1.0);
-    //     }
-    // }
+    [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+            result[i][j] = coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
 
     // On each iteration, load a row of cooperative matrices from matrix A,
     // load a column of cooperative matrices from matrix B, and multiply all
@@ -81,7 +81,7 @@ void main() {
             #endif
         }
         coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> matB;
-        for (uint j = 0; j < C_COLS; ++j) {
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
             uint gj = TILE_N * tileID.x + SUB_TILE * j;
             uint gk = chunkK;
 
