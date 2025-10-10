@@ -1,5 +1,3 @@
-#version 460
-#extension GL_GOOGLE_include_directive : enable
 #include "evk.frag"
 
 // Coopmat version of matmul.comp
@@ -22,15 +20,13 @@ BINDING_BUFFER_RW(float_buffer_16,
     float16_t at[];
 )
 
-layout(buffer_reference) buffer InputA { float16_t x[]; };
-layout(buffer_reference) buffer InputB { float16_t x[]; };
-layout(buffer_reference) buffer InputC { float16_t x[]; };
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 
 
 PUSH(
-    InputA inputA;
-    InputB inputB;
-    InputC inputC;
+    BufferFp16 inputA;
+    BufferFp16 inputB;
+    BufferFp16 inputC;
     int aBufferRID;
     int bBufferRID;
     int cBufferRID;
