@@ -249,6 +249,7 @@ namespace evk {
         Buffer(Resource* res = nullptr) : ResourceRef(res) {
         }
         void* GetPtr();
+        uint64_t GetReference();
     };
     Buffer CreateBuffer(const BufferDesc& desc);
     // TODO: remove WriteBuffer, will be only Buffer::GetPtr()
