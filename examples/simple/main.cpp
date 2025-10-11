@@ -328,7 +328,6 @@ struct Tensor {
 // it's not an auto-grad framework, but it has backward of the functions
 namespace evk::ai {
     struct Pipelines {
-        evk::Pipeline matmul_bwd;
         evk::Pipeline matmul_coop;
         evk::Pipeline flash_attn;
         evk::Pipeline flash_attn_bwd;
@@ -366,11 +365,6 @@ namespace evk::ai {
 
     void initialize() {
         pipelines = std::make_unique<Pipelines>();
-        pipelines->matmul_bwd = evk::CreatePipeline({
-            .name = "matmul_bwd",
-            .CS = evk::loadSpirvFile("shaders/bin/matmul.comp.spv"),
-            .constants = evk::Constant{1, 1}, // TRANSPOSE_A = 1, SUM_C = 1
-        });
         pipelines->matmul_coop = evk::CreatePipeline({
             .name = "matmul_coop",
             .CS = evk::loadSpirvFile("shaders/bin/matmul_coop.comp.spv"),
@@ -424,48 +418,6 @@ namespace evk::ai {
         uint32_t tilesRows = M / TILE; // rows
         evk::CmdBind(get_matmul_pipeline(MatMulConfig{uint16_t(K), uint16_t(N), 0, 0}));
         evk::CmdDispatch(tilesCols, tilesRows, batch);
-    }
-
-    // dL/dB = A^T * dL/dC
-    // (...B, M, N) = (...B, K, M)^T * (...B, K, N)
-    // a is already transposed
-    void matmul_bwd(Tensor& a_transposed, Tensor& c_grad, Tensor& b_grad) {
-        assert(a_transposed.shape.rank() >= 2);
-        assert(c_grad.shape.rank() >= 2);
-        assert(b_grad.shape.rank() >= 2);
-        assert(a_transposed.shape.batch_size(2) == c_grad.shape.batch_size(2));
-        assert(a_transposed.shape[-2] == c_grad.shape[-2]);
-
-        evk::CmdBind(pipelines->matmul_bwd);
-        // Recompute dims under dB = A^T (KxM) * dC (MxN) => dB (KxN)
-        uint32_t batch = 1;
-        if (a_transposed.shape.rank() >= 3) batch = a_transposed.shape.batch_size(2);
-
-        uint32_t M = (a_transposed.shape.rank() >= 1) ? a_transposed.shape[0] : 1; // K (rows of output)
-        uint32_t K = (a_transposed.shape.rank() >= 2) ? a_transposed.shape[1] : 1; // M (shared dim)
-        uint32_t N = (c_grad.shape.rank() >= 2) ? c_grad.shape[1] : 1;
-
-        evk::CmdPush(evk::Constant{
-            a_transposed.buffer.GetRID(),
-            c_grad.buffer.GetRID(),
-            b_grad.buffer.GetRID(),
-            batch,
-            M,
-            K,
-            N
-        });
-
-#if 0
-        uint32_t groupX = (N + TILE - 1) / TILE;
-        uint32_t groupY = (M + TILE - 1) / TILE;
-        evk::CmdDispatch(groupX, groupY, batch);
-#else
-        const uint32_t TILE = 16u; // matches matmul.comp local size
-        uint32_t tilesCols = (N + TILE - 1) / TILE;
-        uint32_t tilesRows = (M + TILE - 1) / TILE;
-        // X=sizeX, Y=sizeY, Z=batch
-        evk::CmdDispatch(tilesCols, tilesRows, batch);
-#endif
     }
 
     // Fused Flash Attention forward (Multi-Query Attention)
@@ -533,7 +485,7 @@ struct Graph {
             evk::ai::matmul(a, b, tensor);
         };
         tensor.backward_fn = [this, &a, &b, &tensor]() {
-            evk::ai::matmul_bwd(a, tensor, b);
+            // TODO: matmul backward
         };
         return tensor;
     }
