@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cmath>
 #include <algorithm>
+#include <functional>
 
 #include "win_dbg.h"
 
@@ -13,7 +14,7 @@ struct float16_t {
     float16_t() = default;
 
     // Constructor from float32
-    explicit float16_t(float f) {
+    float16_t(float f) {
         value = float_to_float16(f);
     }
 
@@ -24,7 +25,7 @@ struct float16_t {
     float16_t& operator=(const float16_t& other) = default;
 
     // Conversion operator to float32
-    explicit operator float() const {
+    operator float() const {
         return float16_to_float(value);
     }
 
@@ -181,8 +182,11 @@ struct Shape {
 
 struct Tensor {
     evk::Buffer buffer;
+    evk::Buffer cpu_buffer;
     Shape shape;
-    std::vector<float16_t> cpu_data;
+
+    std::function<void()> forward_fn;
+    std::function<void()> backward_fn;
 
     Tensor(const Shape& shape) {
         this->shape = shape;
@@ -195,33 +199,42 @@ struct Tensor {
     }
 
     // copies data from CPU to GPU
-    void set_cpu(const std::vector<float16_t>& data) {
-        assert(data.size() == shape.count());
-        cpu_data = data;
-        evk::CmdCopy(cpu_data.data(), buffer, shape.count() * sizeof(float16_t));
+    void cpu_upload() {
+        cpu();
+        evk::CmdCopy(cpu_buffer, buffer, shape.count() * sizeof(float16_t));
         evk::Sync();
     }
-
-    // allocates and copies data from GPU to CPU
-    std::vector<float16_t>& cpu() {
-        cpu_data.resize(shape.count());
-        evk::Buffer cpu_buffer = evk::CreateBuffer({
-            .size = shape.count() * sizeof(float16_t),
-            .usage = evk::BufferUsage::TransferDst,
-            .memoryType = evk::MemoryType::CPU,
-        });
+    void cpu_download() {
+        cpu();
         evk::CmdCopy(buffer, cpu_buffer, shape.count() * sizeof(float16_t));
         evk::Sync();
-        evk::ReadBuffer(cpu_buffer, cpu_data.data(), shape.count() * sizeof(float16_t), 0);
-        return cpu_data;
+    }
+    float16_t* cpu() {
+        if(!cpu_buffer) {
+            cpu_buffer = evk::CreateBuffer({
+                .size = shape.count() * sizeof(float16_t),
+                .usage = evk::BufferUsage::TransferDst | evk::BufferUsage::TransferSrc,
+                .memoryType = evk::MemoryType::CPU,
+            });
+        }
+        return (float16_t*)cpu_buffer.GetPtr();
     }
 
-    void identity(float16_t val = float16_t(1.0f)) {
-        cpu_data.resize(shape.count());
+    Tensor& identity(float16_t val = float16_t(1.0f)) {
+        float16_t* data = cpu();
         for (uint32_t i = 0; i < shape.count(); ++i) {
-            cpu_data[i] = float16_t((i % (shape[0]+1) == 0)? val : float16_t(0.0f));
+            data[i] = float16_t((i % (shape[0]+1) == 0)? val : float16_t(0.0f));
         }
-        set_cpu(cpu_data);
+        cpu_upload();
+        return *this;
+    }
+    Tensor& random(float16_t val = float16_t(0.0f)) {
+        float16_t* data = cpu();
+        for (uint32_t i = 0; i < shape.count(); ++i) {
+            data[i] = float16_t(float(rand()) / float(RAND_MAX));
+        }
+        cpu_upload();
+        return *this;
     }
 
     void print(uint32_t max_elements = 8, uint32_t max_batch = 4) {
@@ -233,7 +246,8 @@ struct Tensor {
         }
         printf("):\n");
 
-        std::vector<float16_t>& data = cpu();
+        cpu_download();
+        float16_t* data = cpu();
 
         // If rank < 2 just fallback to flat print (limited)
         if (shape.rank() < 2) {
@@ -305,13 +319,15 @@ struct Tensor {
 
         printf("]\n");
     }
+
+    private:
+    std::vector<float16_t> cpu_data;
 };
 
 // pure fp16 and u16 tensors machine learning library
 // it's not an auto-grad framework, but it has backward of the functions
 namespace evk::ai {
     struct Pipelines {
-        evk::Pipeline matmul;
         evk::Pipeline matmul_bwd;
         evk::Pipeline matmul_coop;
         evk::Pipeline flash_attn;
@@ -319,12 +335,37 @@ namespace evk::ai {
     };
     std::unique_ptr<Pipelines> pipelines;
 
+    struct MatMulConfig{
+        uint16_t k;
+        uint16_t n;
+        uint16_t transpose_a;
+        uint16_t sum_c;
+    
+        operator uint64_t() const {
+            return *(uint64_t*)this;
+        }
+    };
+    
+    std::unordered_map<uint64_t, evk::Pipeline> matmul_configs;
+    
+    evk::Pipeline get_matmul_pipeline(MatMulConfig config) {
+        uint64_t key = config;
+        auto it = matmul_configs.find(key);
+        if (it != matmul_configs.end()) {
+            return it->second;
+        }
+        evk::Pipeline pipeline = evk::CreatePipeline({
+            .name = "matmul",
+            .CS = evk::loadSpirvFile("shaders/bin/matmul_coop.comp.spv"),
+            .constants = evk::Constant{uint32_t(config.k), uint32_t(config.n), uint32_t(config.transpose_a), uint32_t(config.sum_c)},
+        });
+        printf("Created matmul pipeline for config: k=%d, n=%d, transpose_a=%d, sum_c=%d\n", config.k, config.n, config.transpose_a, config.sum_c);
+        matmul_configs[key] = pipeline;
+        return pipeline;
+    }
+
     void initialize() {
         pipelines = std::make_unique<Pipelines>();
-        pipelines->matmul = evk::CreatePipeline({
-            .name = "matmul",
-            .CS = evk::loadSpirvFile("shaders/bin/matmul.comp.spv"),
-        });
         pipelines->matmul_bwd = evk::CreatePipeline({
             .name = "matmul_bwd",
             .CS = evk::loadSpirvFile("shaders/bin/matmul.comp.spv"),
@@ -345,11 +386,19 @@ namespace evk::ai {
     }
     void shutdown() {
         pipelines.reset();
+        matmul_configs.clear();
     }
 
     // C = A * B
     // (...B, M, N) = (...B, M, K) * (...B, K, N)
     void matmul(Tensor& a, Tensor& b, Tensor& c) {
+        const uint32_t TILE = 80u;
+        assert(a.shape[-2] % TILE == 0);
+        assert(a.shape[-1] % TILE == 0);
+        assert(b.shape[-2] % TILE == 0);
+        assert(b.shape[-1] % TILE == 0);
+        assert(c.shape[-2] % TILE == 0);
+        assert(c.shape[-1] % TILE == 0);
         assert(a.shape.rank() >= 2);
         assert(b.shape.rank() >= 2);
         assert(c.shape.rank() >= 2);
@@ -361,39 +410,20 @@ namespace evk::ai {
         if (a.shape.rank() >= 3) batch = a.shape.batch_size(2);
 
         // infer matrix dims: A is M x K, B is K x N
-        uint32_t M = (a.shape.rank() >= 1) ? a.shape[0] : 1;
-        uint32_t K = (a.shape.rank() >= 2) ? a.shape[1] : 1;
-        uint32_t N = (b.shape.rank() >= 2) ? b.shape[1] : 1;
+        uint32_t M = a.shape[-2];
+        uint32_t K = a.shape[-1];
+        uint32_t N = b.shape[-1];
 
         evk::CmdPush(evk::Constant{
             a.buffer.GetReference(),
             b.buffer.GetReference(),
             c.buffer.GetReference(),
-            a.buffer.GetRID(),
-            b.buffer.GetRID(),
-            c.buffer.GetRID(),
-            batch,
-            M,
-            K,
-            N,
         });
 
-        constexpr bool USE_COOP = true;
-        if (USE_COOP) {
-            const uint32_t TILE = 64u;
-            uint32_t tilesCols = (N + TILE - 1) / TILE; // columns (N)
-            uint32_t tilesRows = (M + TILE - 1) / TILE; // rows (M)
-            // Map: X=tilesCols, Y=tilesRows, Z=batch
-            evk::CmdBind(pipelines->matmul_coop);
-            evk::CmdDispatch(tilesCols, tilesRows, batch);
-        } else {
-            const uint32_t TILE = 16u; // matches matmul.comp local size
-            uint32_t tilesCols = (N + TILE - 1) / TILE; // columns (N)
-            uint32_t tilesRows = (M + TILE - 1) / TILE; // rows (M)
-            // Map: X=tilesCols, Y=tilesRows, Z=batch
-            evk::CmdBind(pipelines->matmul);
-            evk::CmdDispatch(tilesCols, tilesRows, batch);
-        }
+        uint32_t tilesCols = N / TILE; // columns
+        uint32_t tilesRows = M / TILE; // rows
+        evk::CmdBind(get_matmul_pipeline(MatMulConfig{uint16_t(K), uint16_t(N), 0, 0}));
+        evk::CmdDispatch(tilesCols, tilesRows, batch);
     }
 
     // dL/dB = A^T * dL/dC
@@ -487,141 +517,108 @@ namespace evk::ai {
     }
 }
 
+struct Graph {
+    std::vector<std::unique_ptr<Tensor>> nodes;
 
-struct Layer {
-    // MLP
-    // Attention
+    Tensor& tensor(Shape shape, bool param = false) {
+        nodes.push_back(std::make_unique<Tensor>(shape));
+        Tensor& tensor = *nodes.back();
+        return tensor;
+    }
 
-    // Attn = CatHeads(softmax(Q * K^T) * V) * W0
-    std::unique_ptr<Tensor> q;
-    std::unique_ptr<Tensor> k;
-    std::unique_ptr<Tensor> v;
-    std::unique_ptr<Tensor> w0;
-
-    std::unique_ptr<Tensor> mlp_a;
-    std::unique_ptr<Tensor> mlp_b;
-
-    std::unique_ptr<Tensor> one;
-};
-
-struct Transformer {
-    std::unique_ptr<Tensor> input;
-    std::unique_ptr<Tensor> weights;
-    // std::vector<Layer> layers;
-    std::unique_ptr<Tensor> output;
-    std::unique_ptr<Tensor> output_grad;
-    // std::unique_ptr<Tensor> weights_grad;
-    uint32_t test_dim;
-
-    Transformer(uint32_t num_layers, uint32_t test_dim) {
-        this->test_dim = test_dim;
-        // for (uint32_t i = 0; i < num_layers; ++i) {
-        //     layers.push_back(Layer());
-        // }
-        weights = std::make_unique<Tensor>(Shape({test_dim, test_dim}));
-        input = std::make_unique<Tensor>(Shape({test_dim, test_dim}));
-        output = std::make_unique<Tensor>(Shape({test_dim, test_dim}));
-        output_grad = std::make_unique<Tensor>(Shape({test_dim, test_dim}));
-        // weights_grad = std::make_unique<Tensor>(Shape({2, 2}));
+    Tensor& matmul(Tensor& a, Tensor& b) {
+        nodes.push_back(std::make_unique<Tensor>(Shape({a.shape[0], b.shape[1]})));
+        Tensor& tensor = *nodes.back();
+        tensor.forward_fn = [this, &a, &b, &tensor]() {
+            evk::ai::matmul(a, b, tensor);
+        };
+        tensor.backward_fn = [this, &a, &b, &tensor]() {
+            evk::ai::matmul_bwd(a, tensor, b);
+        };
+        return tensor;
     }
 
     void forward() {
-        evk::CmdTimestamp("matmul", [&]() {
-            evk::ai::matmul(*input, *weights, *output);
-        });
-
-        // for (auto& layer : layers) {
-        // }
-        evk::Sync();
-        for(auto ts: evk::GetTimestamps()) {
-            printf("%s:%.3fms ", ts.name, float(ts.end - ts.start));
+        for(auto& node : nodes) {
+            if (node->forward_fn) {
+                node->forward_fn();
+            }
         }
     }
-
     void backward() {
-        std::vector<float16_t> target_output(test_dim * test_dim);
-        for (uint32_t i = 0; i < test_dim * test_dim; ++i) {
-            target_output[i] = float16_t(float(i));
+        for(auto& node : nodes) {
+            if (node->backward_fn) {
+               node->backward_fn();
+            }
         }
-        std::vector<float16_t>& output_cpu = output->cpu();
-        std::vector<float16_t>& output_grad_cpu = output_grad->cpu();
-        for (uint32_t i = 0; i < target_output.size(); ++i) {
-            float16_t target = (i % (test_dim+1) == 0)? float16_t(5.0f) : float16_t(0.0f);
-            output_grad_cpu[i] = float16_t((float(target_output[i]) - float(output_cpu[i]))*0.005f);
-        }
-        output_grad->set_cpu(output_grad_cpu);
-
-        evk::ai::matmul_bwd(*input, *output_grad, *weights);
-        // for (auto& layer : layers) {
-        // }
-        evk::Sync();
     }
 };
 
-
 void test_graph() {
-    Transformer transformer(1, 16*16*16);
-    transformer.input->identity();
-    transformer.weights->identity();
+    Graph graph;
 
-    transformer.input->print();
-    transformer.weights->print();
-    
-    for (uint32_t i = 0; i < 5; ++i) {
-        printf("[iteration %d] ", i);
-        transformer.forward();
-        transformer.backward();
-        // printf("Weights: ");
-        // transformer.weights->print();
-        printf("Output: ");
-        transformer.output->print();
-        // printf("Output grad: ");
-        // transformer.output_grad->print();
+    const uint32_t SIZE = 4000u;
+    Tensor& a = graph.tensor({SIZE, SIZE});
+    {
+        float16_t* a_cpu = a.cpu();
+        for(uint32_t i = 0; i < a.shape[0]; ++i) {
+            a_cpu[i] = float(2);
+        }
+        a.cpu_upload();
     }
-    
-    // printf("input.grad[0] = %f\n", transformer.input->grad[0]);
-    // printf("weights.grad[0] = %f\n", transformer.weights->grad[0]);
-    // printf("output.grad[0] = %f\n", transformer.output->grad[0]);
+    Tensor& b = graph.tensor({SIZE, SIZE});
+    {
+        float16_t* b_cpu = b.cpu();
+        for(uint32_t i = 0; i < b.shape[0]; ++i) {
+            b_cpu[i*b.shape[0]] = float(3);
+        }
+        b.cpu_upload();
+    }
+    Tensor& c = graph.matmul(a, b);
+    graph.forward();
+
+    a.print(16);
+    b.print(16);
+    c.print(16);
 }
 
 void test_matmul() {
-    const uint32_t size = 4096;
+    const uint32_t size = 4000;
     Tensor* a = new Tensor({size, size});
     Tensor* b = new Tensor({size, size});
     Tensor* c = new Tensor({size, size});
 
-    a->identity(float16_t(2.0f));
-    b->identity(float16_t(3.0f));
+    a->identity(2.0f);
+    b->identity(3.0f);
 
     // warm up
     for (uint32_t i = 0; i < 4; ++i) {
         evk::ai::matmul(*a, *b, *c);
     }
 
-    float avg_ms = 0.0f;
-    float total_count = 0.0f;
+    float min_ms = 1e9f;
     for(int it = 0; it < 16; ++it) {
-        for (uint32_t i = 0; i < 32; ++i) {
-            evk::CmdTimestamp("matmul", [&]() {
+        const uint32_t subIter = 32;
+        evk::CmdTimestamp("matmul", [&]() {
+            for (uint32_t i = 0; i < subIter; ++i) {
                 evk::ai::matmul(*a, *b, *c);
-            });
-        }
+            }
+        });
 
         evk::Sync();
         for(auto ts: evk::GetTimestamps()) {
-            avg_ms += float(ts.end - ts.start);
-            total_count += 1.0f;
+            min_ms = fminf(min_ms, float(ts.end - ts.start)/float(subIter));
         }
     }
-    avg_ms /= total_count;
-    float tflops = float(2.0f * size * size * size) / (avg_ms / 1000.0f) / 1e12f;
-    printf("matmul: %.3fms (%.3ftflops)\n", avg_ms, tflops);
+    float tflops = float(2.0f * size * size * size) / (min_ms / 1000.0f) / 1e12f;
+    printf("matmul: %.3fms (%.3ftflops)\n", min_ms, tflops);
 
     // a->print();
     // b->print();
     // c->print();
     bool c_correct = true;
-    float16_t* c_cpu = (float16_t*)c->cpu().data();
+    c->cpu_download();
+    float16_t* c_cpu = c->cpu();
     for(uint32_t i = 0; i < c->shape[0]; ++i) {
         int idx = i * (c->shape[0] + 1);
         if(c_cpu[idx].value != float16_t(6.0f).value) {
@@ -658,7 +655,7 @@ int main() {
 
     evk::ai::initialize();
 
-    // test_graph();
+    test_graph();
     test_matmul();
 
     evk::ai::shutdown();
