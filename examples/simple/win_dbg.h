@@ -60,7 +60,7 @@ LONG WINAPI CustomUnhandledExceptionFilter(EXCEPTION_POINTERS* pExceptionInfo) {
             // Only log file/line if the source file is inside the current project directory
             std::string fileName = lineInfo.FileName ? lineInfo.FileName : std::string();
             std::string fileLower = toLower(fileName);
-            if (fileLower.find("vctools", 0) == -1 && pSymbol->Name) {
+            if (fileLower.find("program files", 0) == -1 && pSymbol->Name) {
                 std::cerr << "-> " << pSymbol->Name << "() [" << lineInfo.FileName << ":" << std::dec << (lineInfo.LineNumber) << "]" << std::endl;
             }
         }
