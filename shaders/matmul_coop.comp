@@ -7,6 +7,8 @@ CONSTANT(0) uint K = 0;
 CONSTANT(1) uint N = 0;
 CONSTANT(2) uint TRANSPOSE_A = 0;
 CONSTANT(3) uint SUM_C = 0;
+CONSTANT(4) uint TILE_M = 0;
+CONSTANT(5) uint TILE_N = 0;
 
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_shader_16bit_storage : enable
@@ -21,13 +23,11 @@ PUSH(
     BufferFp16 inputA;
     BufferFp16 inputB;
     BufferFp16 inputC;
-    uint K_;
-    uint N_;
 )
 
 #define TILE_K 16
-#define TILE_M 80
-#define TILE_N 80
+// #define TILE_M 80
+// #define TILE_N 80
 #define SUB_TILE 16
 
 const uint C_ROWS = TILE_M / SUB_TILE;

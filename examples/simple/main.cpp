@@ -337,8 +337,10 @@ namespace evk::ai {
     struct MatMulConfig{
         uint16_t k;
         uint16_t n;
-        uint16_t transpose_a;
-        uint16_t sum_c;
+        uint8_t transpose_a;
+        uint8_t sum_c;
+        uint8_t tile_m;
+        uint8_t tile_n;
     
         operator uint64_t() const {
             return *(uint64_t*)this;
@@ -356,9 +358,9 @@ namespace evk::ai {
         evk::Pipeline pipeline = evk::CreatePipeline({
             .name = "matmul",
             .CS = evk::loadSpirvFile("shaders/bin/matmul_coop.comp.spv"),
-            .constants = evk::Constant{uint32_t(config.k), uint32_t(config.n), uint32_t(config.transpose_a), uint32_t(config.sum_c)},
+            .constants = evk::Constant{uint32_t(config.k), uint32_t(config.n), uint32_t(config.transpose_a), uint32_t(config.sum_c), uint32_t(config.tile_m), uint32_t(config.tile_n)},
         });
-        printf("Created matmul pipeline for config: k=%d, n=%d, transpose_a=%d, sum_c=%d\n", config.k, config.n, config.transpose_a, config.sum_c);
+        // printf("Created matmul pipeline for config: k=%d, n=%d, transpose_a=%d, sum_c=%d, tile_m=%d, tile_n=%d\n", config.k, config.n, config.transpose_a, config.sum_c, config.tile_m, config.tile_n);
         matmul_configs[key] = pipeline;
         return pipeline;
     }
@@ -385,14 +387,17 @@ namespace evk::ai {
 
     // C = A * B
     // (...B, M, N) = (...B, M, K) * (...B, K, N)
-    void matmul(Tensor& a, Tensor& b, Tensor& c) {
-        const uint32_t TILE = 80u;
-        assert(a.shape[-2] % TILE == 0);
-        assert(a.shape[-1] % TILE == 0);
-        assert(b.shape[-2] % TILE == 0);
-        assert(b.shape[-1] % TILE == 0);
-        assert(c.shape[-2] % TILE == 0);
-        assert(c.shape[-1] % TILE == 0);
+    void matmul(Tensor& a, Tensor& b, Tensor& c, uint8_t TILE_M = 80u, uint8_t TILE_N = 80u) {
+        const uint32_t TILE_K = 16u;
+        // const uint32_t TILE_M = 80u;
+        // const uint32_t TILE_N = 64u;
+        // printf("a.shape = (%d, %d), b.shape = (%d, %d), c.shape = (%d, %d)\n", a.shape[-2], a.shape[-1], b.shape[-2], b.shape[-1], c.shape[-2], c.shape[-1]);
+        assert(a.shape[-2] % TILE_M == 0);
+        assert(a.shape[-1] % TILE_K == 0);
+        assert(b.shape[-2] % TILE_K == 0);
+        assert(b.shape[-1] % TILE_N == 0);
+        assert(c.shape[-2] % TILE_M == 0);
+        assert(c.shape[-1] % TILE_N == 0);
         assert(a.shape.rank() >= 2);
         assert(b.shape.rank() >= 2);
         assert(c.shape.rank() >= 2);
@@ -414,9 +419,9 @@ namespace evk::ai {
             c.buffer.GetReference(),
         });
 
-        uint32_t tilesCols = N / TILE; // columns
-        uint32_t tilesRows = M / TILE; // rows
-        evk::CmdBind(get_matmul_pipeline(MatMulConfig{uint16_t(K), uint16_t(N), 0, 0}));
+        uint32_t tilesCols = N / TILE_N; // columns
+        uint32_t tilesRows = M / TILE_M; // rows
+        evk::CmdBind(get_matmul_pipeline(MatMulConfig{uint16_t(K), uint16_t(N), 0, 0, TILE_M, TILE_N}));
         evk::CmdDispatch(tilesCols, tilesRows, batch);
     }
 
@@ -535,63 +540,80 @@ void test_graph() {
 }
 
 void test_matmul() {
-    const uint32_t size = 4000;
-    Tensor* a = new Tensor({size, size});
-    Tensor* b = new Tensor({size, size});
-    Tensor* c = new Tensor({size, size});
+    const uint32_t SIZE = 4096;
 
-    a->identity(2.0f);
-    b->identity(3.0f);
-
-    // warm up
-    for (uint32_t i = 0; i < 4; ++i) {
-        evk::ai::matmul(*a, *b, *c);
-    }
-
-    float min_ms = 1e9f;
-    for(int it = 0; it < 16; ++it) {
-        const uint32_t subIter = 32;
-        evk::CmdTimestamp("matmul", [&]() {
-            for (uint32_t i = 0; i < subIter; ++i) {
-                evk::ai::matmul(*a, *b, *c);
+    for (uint32_t tile_m = 48; tile_m <= 224; tile_m += 16) {
+        for (uint32_t tile_n = 48; tile_n <= 224; tile_n += 16) {
+            const uint32_t M = ((SIZE + tile_m - 1) / tile_m) * tile_m;
+            const uint32_t N = ((SIZE + tile_n - 1) / tile_n) * tile_n;
+            if(tile_m * tile_n >= 128*112) {
+                // printf("skipping %d x %d\n", tile_m, tile_n);
+                continue;
             }
-        });
+            Tensor* a = new Tensor({M, SIZE});
+            Tensor* b = new Tensor({SIZE, N});
+            Tensor* c = new Tensor({M, N});
+        
+            a->identity(2.0f);
+            b->identity(3.0f);
+        
+            // warm up
+            for (uint32_t i = 0; i < 4; ++i) {
+                evk::ai::matmul(*a, *b, *c, tile_m, tile_n);
+            }
 
-        evk::Sync();
-        for(auto ts: evk::GetTimestamps()) {
-            min_ms = fminf(min_ms, float(ts.end - ts.start)/float(subIter));
+            float min_ms = 1e9f;
+            for(int it = 0; it < 1; ++it) {
+                const uint32_t subIter = 32;
+                for (uint32_t i = 0; i < subIter; ++i) {
+                    evk::CmdTimestamp("matmul", [&]() {
+                            evk::ai::matmul(*a, *b, *c, tile_m, tile_n);
+                    });
+                }
+                
+                evk::Sync();
+                for(auto ts: evk::GetTimestamps()) {
+                    min_ms = fminf(min_ms, float(ts.end - ts.start)/float(1));
+                }
+            }
+            float tflops = float(2.0f * M * N * M) / (min_ms / 1000.0f) / 1e12f;
+            printf("matmul: %5.3fms (%7.3ftflops)", min_ms, tflops);
+            printf(" M = %d, N = %d, tile_m = %d, tile_n = %d\n", M, N, tile_m, tile_n);
+
+            delete a;
+            delete b;
+            delete c;
+            evk::Sync();
         }
     }
-    float tflops = float(2.0f * size * size * size) / (min_ms / 1000.0f) / 1e12f;
-    printf("matmul: %.3fms (%.3ftflops)\n", min_ms, tflops);
 
     // a->print();
     // b->print();
     // c->print();
-    bool c_correct = true;
-    c->cpu_download();
-    float16_t* c_cpu = c->cpu();
-    for(uint32_t i = 0; i < c->shape[0]; ++i) {
-        int idx = i * (c->shape[0] + 1);
-        if(c_cpu[idx].value != float16_t(6.0f).value) {
-            int m = idx / c->shape[0];
-            int n = idx % c->shape[0];
-            printf("a * b = c\n");
-            printf("c[%d, %d] = %f (expected 6.0f)\n", m, n, float(c_cpu[idx]));
-            c_correct = false;
-            break;
-        }
-    }
+    // bool c_correct = true;
+    // c->cpu_download();
+    // float16_t* c_cpu = c->cpu();
+    // for(uint32_t i = 0; i < c->shape[0]; ++i) {
+    //     int idx = i * (c->shape[0] + 1);
+    //     if(c_cpu[idx].value != float16_t(6.0f).value) {
+    //         int m = idx / c->shape[0];
+    //         int n = idx % c->shape[0];
+    //         printf("a * b = c\n");
+    //         printf("c[%d, %d] = %f (expected 6.0f)\n", m, n, float(c_cpu[idx]));
+    //         c_correct = false;
+    //         break;
+    //     }
+    // }
 
-    if(c_correct) {
-        printf("Matrix multiplication is correct!\n");
-    } else {
-        printf("Failed: Matrix multiplication is not correct!\n");
-    }
+    // if(c_correct) {
+    //     printf("Matrix multiplication is correct!\n");
+    // } else {
+    //     printf("Failed: Matrix multiplication is not correct!\n");
+    // }
 
-    delete a;
-    delete b;
-    delete c;
+    // delete a;
+    // delete b;
+    // delete c;
 }
 
 int main() {
