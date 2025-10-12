@@ -1,0 +1,51 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// MSE Loss compute shader
+// Calculates mean squared error: (1/N) * Σ(predicted - target)²
+
+// Technique:
+// Sequencial reduction (to avoid reduction buffer)
+// Not very optimized for now
+
+// Later idea is to use uvec4 loads
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 predictedBuffer;
+    BufferFp16 targetBuffer;
+    BufferFp16 resultBuffer;
+    uint totalElements;
+)
+
+COMPUTE(32, 1, 1)
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint workgroupIndex = gl_WorkGroupID.x;
+
+    float local_sum = 0.0;
+    for (uint chunk = 0; chunk < totalElements; chunk += 32) {
+        uint id = chunk + lid;
+        // Load data and compute squared difference
+        if (id < totalElements) {
+            float predicted = predictedBuffer.x[id];
+            float target = targetBuffer.x[id];
+            float diff = predicted - target;
+            diff = diff * diff; // squared differenc
+            local_sum += diff;
+        }
+    }
+
+    float result = subgroupAdd(local_sum);
+
+    // Store result
+    if (lid == 0) {
+        resultBuffer.x[0] = float16_t(result/float(totalElements));
+    }
+}
