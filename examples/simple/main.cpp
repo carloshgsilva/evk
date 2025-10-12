@@ -29,6 +29,17 @@ struct float16_t {
         return float16_to_float(value);
     }
 
+    // Arithmetic operators
+    float16_t& operator+=(const float16_t& other) {
+        *this = float16_t(float(*this) + float(other));
+        return *this;
+    }
+
+    float16_t& operator/=(const float16_t& other) {
+        *this = float16_t(float(*this) / float(other));
+        return *this;
+    }
+
     // Static conversion functions
     static uint16_t float_to_float16(float f) {
         uint32_t bits = *reinterpret_cast<uint32_t*>(&f);
@@ -328,9 +339,9 @@ struct Tensor {
 // it's not an auto-grad framework, but it has backward of the functions
 namespace evk::ai {
     struct Pipelines {
-        evk::Pipeline matmul_coop;
         evk::Pipeline flash_attn;
         evk::Pipeline flash_attn_bwd;
+        evk::Pipeline mse_loss;
     };
     std::unique_ptr<Pipelines> pipelines;
 
@@ -367,10 +378,6 @@ namespace evk::ai {
 
     void initialize() {
         pipelines = std::make_unique<Pipelines>();
-        pipelines->matmul_coop = evk::CreatePipeline({
-            .name = "matmul_coop",
-            .CS = evk::loadSpirvFile("shaders/bin/matmul_coop.comp.spv"),
-        });
         pipelines->flash_attn = evk::CreatePipeline({
             .name = "flash_attention",
             .CS = evk::loadSpirvFile("shaders/bin/flash_attention.comp.spv"),
@@ -378,6 +385,10 @@ namespace evk::ai {
         pipelines->flash_attn_bwd = evk::CreatePipeline({
             .name = "flash_attention_bwd",
             .CS = evk::loadSpirvFile("shaders/bin/flash_attention_bwd.comp.spv"),
+        });
+        pipelines->mse_loss = evk::CreatePipeline({
+            .name = "mse_loss",
+            .CS = evk::loadSpirvFile("shaders/bin/mse_loss.comp.spv"),
         });
     }
     void shutdown() {
@@ -470,12 +481,38 @@ namespace evk::ai {
     }
 
     void flash_attention_bwd(Tensor& q, Tensor& k, Tensor& v, Tensor& o, Tensor& dO, Tensor& dQ, Tensor& dK, Tensor& dV, uint32_t heads = 0) {
-        
+
+    }
+
+    // MSE Loss: (1/N) * Σ(predicted - target)²
+    // Returns a scalar tensor containing the mean squared error
+    void mse_loss(Tensor& predicted, Tensor& target, Tensor& result) {
+        assert(predicted.shape.rank() == target.shape.rank());
+        assert(result.shape.rank() == 1);
+        for (uint32_t i = 0; i < predicted.shape.rank(); ++i) {
+            assert(predicted.shape[i] == target.shape[i]);
+        }
+
+        uint32_t totalElements = predicted.shape.count();
+
+        // First pass: compute partial sums with GPU shader
+        evk::CmdBind(pipelines->mse_loss);
+        evk::CmdPush(evk::Constant{
+            predicted.buffer.GetReference(),
+            target.buffer.GetReference(),
+            result.buffer.GetReference(),
+            totalElements,
+        });
+
+        evk::CmdDispatch(1, 1, 1);
     }
 }
 
 struct Graph {
     std::vector<std::unique_ptr<Tensor>> nodes;
+
+    // Some operations need a reusable temp/scratch buffer
+    std::unique_ptr<Tensor> scratch;
 
     Tensor& tensor(Shape shape, bool param = false) {
         nodes.push_back(std::make_unique<Tensor>(shape));
@@ -511,7 +548,10 @@ struct Graph {
     }
 };
 
+#define TEST(expr) if(!(expr)) { printf("Test failed: " #expr " [%s:%d]\n", __FILE__, __LINE__); exit(1); }
+
 void test_graph() {
+    printf("test_graph()\n");
     Graph graph;
 
     const uint32_t SIZE = 4000u;
@@ -540,6 +580,7 @@ void test_graph() {
 }
 
 void test_matmul() {
+    printf("test_matmul()\n");
     const uint32_t SIZE = 4096;
 
     for (uint32_t tile_m = 48; tile_m <= 224; tile_m += 16) {
@@ -616,6 +657,43 @@ void test_matmul() {
     // delete c;
 }
 
+void test_mse_loss() {
+    printf("test_mse_loss()");
+    // Test 1: Simple 1D tensors
+    Tensor predicted({3});
+    Tensor target({3});
+    Tensor mse_result({1});
+
+    // Fill with known values
+    float16_t* pred_cpu = predicted.cpu();
+    float16_t* target_cpu = target.cpu();
+
+    pred_cpu[0] = float16_t(1.0f);
+    pred_cpu[1] = float16_t(2.0f);
+    pred_cpu[2] = float16_t(3.0f);
+
+    target_cpu[0] = float16_t(1.0f);
+    target_cpu[1] = float16_t(2.0f);
+    target_cpu[2] = float16_t(4.0f);  // Different from predicted
+
+    predicted.cpu_upload();
+    target.cpu_upload();
+
+    // Compute MSE loss
+    evk::ai::mse_loss(predicted, target, mse_result);
+
+    // Download result and verify
+    mse_result.cpu_download();
+    float16_t* mse_cpu = mse_result.cpu();
+
+    // Expected MSE
+    float expected_mse = 1.0f / 3.0f;
+    float actual_mse = float(mse_cpu[0]);
+    TEST(std::abs(actual_mse - expected_mse) < 1e-4f);
+
+    printf(" PASS\n");
+}
+
 int main() {
     set_unhandled_exception_filter();
 
@@ -629,8 +707,9 @@ int main() {
 
     evk::ai::initialize();
 
-    test_graph();
-    test_matmul();
+    // test_graph();
+    // test_matmul();
+    test_mse_loss();
 
     evk::ai::shutdown();
     evk::Shutdown();
