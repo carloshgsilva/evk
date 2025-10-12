@@ -5,10 +5,11 @@
 
 CONSTANT(0) uint K = 0;
 CONSTANT(1) uint N = 0;
-CONSTANT(2) uint TRANSPOSE_A = 0;
-CONSTANT(3) uint SUM_C = 0;
-CONSTANT(4) uint TILE_M = 0;
-CONSTANT(5) uint TILE_N = 0;
+CONSTANT(2) uint TILE_M = 0;
+CONSTANT(3) uint TILE_N = 0;
+CONSTANT(4) uint ACC_C = 0;
+CONSTANT(5) uint TRANSPOSE_A = 0;
+CONSTANT(6) uint TRANSPOSE_B = 0;
 
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_shader_16bit_storage : enable
@@ -26,8 +27,6 @@ PUSH(
 )
 
 #define TILE_K 16
-// #define TILE_M 80
-// #define TILE_N 80
 #define SUB_TILE 16
 
 const uint C_ROWS = TILE_M / SUB_TILE;
@@ -75,7 +74,15 @@ void main() {
         [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
             uint gi = TILE_M * tileID.y + SUB_TILE * i;
             uint gj = TILE_N * tileID.x + SUB_TILE * j;
-            coopMatStore(result[i][j], inputC.x, coordToOffset(gj, gi, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+
+            if (ACC_C == 0) {
+                coopMatStore(result[i][j], inputC.x, coordToOffset(gj, gi, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+            } else {
+                // coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> mat_c;
+                // coopMatLoad(mat_c, inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                // result[i][j] = result[i][j] + mat_c;
+                // coopMatStore(result[i][j], inputC.x, coordToOffset(gj, gi, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+            }
         }
     }
 }

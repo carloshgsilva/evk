@@ -194,6 +194,7 @@ struct Shape {
 struct Tensor {
     evk::Buffer buffer;
     evk::Buffer cpu_buffer;
+    std::unique_ptr<Tensor> grad_tensor;
     Shape shape;
 
     std::function<void()> forward_fn;
@@ -207,6 +208,15 @@ struct Tensor {
             .size = s,
             .usage = evk::BufferUsage::Storage,
         });
+    }
+
+    // get the grad tensor
+    // create it if it doesn't exist
+    Tensor& grad() {
+        if(!grad_tensor) {
+            grad_tensor = std::make_unique<Tensor>(shape);
+        }
+        return *grad_tensor;
     }
 
     // copies data from CPU to GPU
@@ -336,22 +346,23 @@ struct Tensor {
 };
 
 // pure fp16 and u16 tensors machine learning library
-// it's not an auto-grad framework, but it has backward of the functions
 namespace evk::ai {
     struct Pipelines {
         evk::Pipeline flash_attn;
         evk::Pipeline flash_attn_bwd;
         evk::Pipeline mse_loss;
+        evk::Pipeline sgd;
     };
     std::unique_ptr<Pipelines> pipelines;
 
     struct MatMulConfig{
         uint16_t k;
         uint16_t n;
-        uint8_t transpose_a;
-        uint8_t sum_c;
         uint8_t tile_m;
         uint8_t tile_n;
+        uint8_t acc_c;
+        uint8_t transpose_a: 1;
+        uint8_t transpose_b: 1;
     
         operator uint64_t() const {
             return *(uint64_t*)this;
@@ -369,7 +380,15 @@ namespace evk::ai {
         evk::Pipeline pipeline = evk::CreatePipeline({
             .name = "matmul",
             .CS = evk::loadSpirvFile("shaders/bin/matmul_coop.comp.spv"),
-            .constants = evk::Constant{uint32_t(config.k), uint32_t(config.n), uint32_t(config.transpose_a), uint32_t(config.sum_c), uint32_t(config.tile_m), uint32_t(config.tile_n)},
+            .constants = evk::Constant{
+                uint32_t(config.k),
+                uint32_t(config.n),
+                uint32_t(config.tile_m),
+                uint32_t(config.tile_n),
+                uint32_t(config.acc_c),
+                uint32_t(config.transpose_a),
+                uint32_t(config.transpose_b),
+            },
         });
         // printf("Created matmul pipeline for config: k=%d, n=%d, transpose_a=%d, sum_c=%d, tile_m=%d, tile_n=%d\n", config.k, config.n, config.transpose_a, config.sum_c, config.tile_m, config.tile_n);
         matmul_configs[key] = pipeline;
@@ -390,6 +409,10 @@ namespace evk::ai {
             .name = "mse_loss",
             .CS = evk::loadSpirvFile("shaders/bin/mse_loss.comp.spv"),
         });
+        pipelines->sgd = evk::CreatePipeline({
+            .name = "sgd",
+            .CS = evk::loadSpirvFile("shaders/bin/sgd.comp.spv"),
+        });
     }
     void shutdown() {
         pipelines.reset();
@@ -398,7 +421,7 @@ namespace evk::ai {
 
     // C = A * B
     // (...B, M, N) = (...B, M, K) * (...B, K, N)
-    void matmul(Tensor& a, Tensor& b, Tensor& c, uint8_t TILE_M = 80u, uint8_t TILE_N = 80u) {
+    void matmul(Tensor& a, Tensor& b, Tensor& c, bool transpose_a = false, bool transpose_b = false, bool acc_c = false, uint8_t TILE_M = 80u, uint8_t TILE_N = 80u) {
         const uint32_t TILE_K = 16u;
         // const uint32_t TILE_M = 80u;
         // const uint32_t TILE_N = 64u;
@@ -432,7 +455,15 @@ namespace evk::ai {
 
         uint32_t tilesCols = N / TILE_N; // columns
         uint32_t tilesRows = M / TILE_M; // rows
-        evk::CmdBind(get_matmul_pipeline(MatMulConfig{uint16_t(K), uint16_t(N), 0, 0, TILE_M, TILE_N}));
+        evk::CmdBind(get_matmul_pipeline(MatMulConfig{
+            .k = uint16_t(K),
+            .n = uint16_t(N),
+            .tile_m = TILE_M,
+            .tile_n = TILE_N,
+            .acc_c = acc_c,
+            .transpose_a = transpose_a,
+            .transpose_b = transpose_b,
+        }));
         evk::CmdDispatch(tilesCols, tilesRows, batch);
     }
 
@@ -484,9 +515,9 @@ namespace evk::ai {
 
     }
 
-    // MSE Loss: (1/N) * Σ(predicted - target)²
+    // MSE Loss: (1/N) * sum(predicted - target)^2
     // Returns a scalar tensor containing the mean squared error
-    void mse_loss(Tensor& predicted, Tensor& target, Tensor& result) {
+    void mse_loss(Tensor& predicted, Tensor& target, Tensor& predGrad, Tensor& result) {
         assert(predicted.shape.rank() == target.shape.rank());
         assert(result.shape.rank() == 1);
         for (uint32_t i = 0; i < predicted.shape.rank(); ++i) {
@@ -501,6 +532,27 @@ namespace evk::ai {
             predicted.buffer.GetReference(),
             target.buffer.GetReference(),
             result.buffer.GetReference(),
+            predGrad.buffer.GetReference(),
+            totalElements,
+        });
+
+        evk::CmdDispatch(1, 1, 1);
+    }
+
+    // SGD: param = param - learning_rate * gradient
+    void sgd(Tensor& param, Tensor& gradient, float learning_rate) {
+        assert(param.shape.rank() == gradient.shape.rank());
+        for (uint32_t i = 0; i < param.shape.rank(); ++i) {
+            assert(param.shape[i] == gradient.shape[i]);
+        }
+
+        uint32_t totalElements = param.shape.count();
+
+        evk::CmdBind(pipelines->sgd);
+        evk::CmdPush(evk::Constant{
+            param.buffer.GetReference(),
+            gradient.buffer.GetReference(),
+            learning_rate,
             totalElements,
         });
 
@@ -510,6 +562,7 @@ namespace evk::ai {
 
 struct Graph {
     std::vector<std::unique_ptr<Tensor>> nodes;
+    std::vector<Tensor*> params;
 
     // Some operations need a reusable temp/scratch buffer
     std::unique_ptr<Tensor> scratch;
@@ -517,6 +570,9 @@ struct Graph {
     Tensor& tensor(Shape shape, bool param = false) {
         nodes.push_back(std::make_unique<Tensor>(shape));
         Tensor& tensor = *nodes.back();
+        if(param) {
+            params.push_back(&tensor);
+        }
         return tensor;
     }
 
@@ -527,64 +583,58 @@ struct Graph {
             evk::ai::matmul(a, b, tensor);
         };
         tensor.backward_fn = [this, &a, &b, &tensor]() {
-            // TODO: matmul backward
+            evk::ai::matmul(a, b, a.grad(), false, true, true);
+            evk::ai::matmul(a, b, b.grad(), true, false, true);
         };
         return tensor;
     }
 
-    void forward() {
+    Tensor& mse_loss(Tensor& predicted, Tensor& target) {
+        nodes.push_back(std::make_unique<Tensor>(Shape({1})));
+        Tensor& tensor = *nodes.back();
+        tensor.forward_fn = [this, &predicted, &target, &tensor]() {
+            evk::ai::mse_loss(predicted, target, predicted.grad(), tensor);
+        };
+        // mse_loss don't need 'backward_fn' because it's fused with forward
+        return tensor;
+    }
+
+    // eval the graph
+    // if backward is true, also run the backward pass
+    void eval(bool backward = false) {
         for(auto& node : nodes) {
             if (node->forward_fn) {
                 node->forward_fn();
             }
         }
-    }
-    void backward() {
-        for(auto& node : nodes) {
-            if (node->backward_fn) {
-               node->backward_fn();
+        if (backward) {
+            for(int i = params.size() - 1; i >= 0; --i) {
+                auto& param = params[i];
+                if (param->backward_fn) {
+                    param->backward_fn();
+                }
             }
+        }
+    }
+
+    // apply the gradient update
+    void step(float lr = 0.001f) {
+        for(auto& param : params) {
+            assert(param->grad_tensor);
+            evk::ai::sgd(*param, param->grad(), lr);
         }
     }
 };
 
-#define TEST(expr) if(!(expr)) { printf("Test failed: " #expr " [%s:%d]\n", __FILE__, __LINE__); exit(1); }
 
-void test_graph() {
-    printf("test_graph()\n");
-    Graph graph;
-
-    const uint32_t SIZE = 4000u;
-    Tensor& a = graph.tensor({SIZE, SIZE});
-    {
-        float16_t* a_cpu = a.cpu();
-        for(uint32_t i = 0; i < a.shape[0]; ++i) {
-            a_cpu[i] = float(2);
-        }
-        a.cpu_upload();
-    }
-    Tensor& b = graph.tensor({SIZE, SIZE});
-    {
-        float16_t* b_cpu = b.cpu();
-        for(uint32_t i = 0; i < b.shape[0]; ++i) {
-            b_cpu[i*b.shape[0]] = float(3);
-        }
-        b.cpu_upload();
-    }
-    Tensor& c = graph.matmul(a, b);
-    graph.forward();
-
-    a.print(16);
-    b.print(16);
-    c.print(16);
-}
-
-void test_matmul() {
-    printf("test_matmul()\n");
-    const uint32_t SIZE = 4096;
-
+void benchmark_matmul() {
+    printf("benchmark_matmul()");
+    const uint32_t SIZE = 4096u;
     for (uint32_t tile_m = 48; tile_m <= 224; tile_m += 16) {
         for (uint32_t tile_n = 48; tile_n <= 224; tile_n += 16) {
+            if(tile_m != 96 || tile_n != 96) {
+                continue;
+            }
             const uint32_t M = ((SIZE + tile_m - 1) / tile_m) * tile_m;
             const uint32_t N = ((SIZE + tile_n - 1) / tile_n) * tile_n;
             if(tile_m * tile_n >= 128*112) {
@@ -600,15 +650,15 @@ void test_matmul() {
         
             // warm up
             for (uint32_t i = 0; i < 4; ++i) {
-                evk::ai::matmul(*a, *b, *c, tile_m, tile_n);
+                evk::ai::matmul(*a, *b, *c, false, false, false, tile_m, tile_n);
             }
 
             float min_ms = 1e9f;
             for(int it = 0; it < 1; ++it) {
-                const uint32_t subIter = 32;
+                const uint32_t subIter = 16;
                 for (uint32_t i = 0; i < subIter; ++i) {
                     evk::CmdTimestamp("matmul", [&]() {
-                            evk::ai::matmul(*a, *b, *c, tile_m, tile_n);
+                            evk::ai::matmul(*a, *b, *c, false, false, false, tile_m, tile_n);
                     });
                 }
                 
@@ -627,34 +677,64 @@ void test_matmul() {
             evk::Sync();
         }
     }
+}
 
-    // a->print();
-    // b->print();
-    // c->print();
-    // bool c_correct = true;
-    // c->cpu_download();
-    // float16_t* c_cpu = c->cpu();
-    // for(uint32_t i = 0; i < c->shape[0]; ++i) {
-    //     int idx = i * (c->shape[0] + 1);
-    //     if(c_cpu[idx].value != float16_t(6.0f).value) {
-    //         int m = idx / c->shape[0];
-    //         int n = idx % c->shape[0];
-    //         printf("a * b = c\n");
-    //         printf("c[%d, %d] = %f (expected 6.0f)\n", m, n, float(c_cpu[idx]));
-    //         c_correct = false;
-    //         break;
-    //     }
-    // }
+#define TEST(expr) if(!(expr)) { printf("Test failed: " #expr " [%s:%d]\n", __FILE__, __LINE__); exit(1); }
 
-    // if(c_correct) {
-    //     printf("Matrix multiplication is correct!\n");
-    // } else {
-    //     printf("Failed: Matrix multiplication is not correct!\n");
-    // }
+void test_graph_backward() {
+    printf("test_graph()\n");
+    Graph graph;
 
-    // delete a;
-    // delete b;
-    // delete c;
+    const uint32_t SIZE = 80u;
+    Tensor& target = graph.tensor({SIZE, SIZE}).identity(1.0f);
+    Tensor& a = graph.tensor({SIZE, SIZE}, true).identity(3.0f);
+    // Tensor& b = graph.tensor({SIZE, SIZE}).random();
+    // Tensor& c = graph.matmul(a, b);
+    Tensor& loss = graph.mse_loss(a, target);
+
+    for(int i = 0; i < 150; ++i) {
+        graph.eval(true);
+        graph.step(0.1f);
+        // a.grad().print();
+        // a.print();
+        loss.print();
+    }
+}
+
+void test_matmul() {
+    printf("test_matmul()");
+    const uint32_t SIZE = 4096;
+
+    {
+        const uint32_t SIZE = 4000u;
+        Tensor a = Tensor({SIZE, SIZE});
+        {
+            float16_t* a_cpu = a.cpu();
+            for(uint32_t i = 0; i < a.shape[0]; ++i) {
+                a_cpu[i] = float(2);
+            }
+            a.cpu_upload();
+        }
+        Tensor b = Tensor({SIZE, SIZE});
+        {
+            float16_t* b_cpu = b.cpu();
+            for(uint32_t i = 0; i < b.shape[0]; ++i) {
+                b_cpu[i*b.shape[0]] = float(3);
+            }
+            b.cpu_upload();
+        }
+        Tensor c = Tensor({SIZE, SIZE});
+        evk::ai::matmul(a, b, c);
+
+        a.print();
+        b.print();
+        c.print();
+
+        c.cpu_download();
+        TEST(c.cpu()[0] == float16_t(SIZE * 2 * 3));
+    }
+
+    printf(" PASS\n");
 }
 
 void test_mse_loss() {
@@ -663,6 +743,7 @@ void test_mse_loss() {
     Tensor predicted({3});
     Tensor target({3});
     Tensor mse_result({1});
+    Tensor grad({3});
 
     // Fill with known values
     float16_t* pred_cpu = predicted.cpu();
@@ -680,7 +761,7 @@ void test_mse_loss() {
     target.cpu_upload();
 
     // Compute MSE loss
-    evk::ai::mse_loss(predicted, target, mse_result);
+    evk::ai::mse_loss(predicted, target, grad, mse_result);
 
     // Download result and verify
     mse_result.cpu_download();
@@ -690,6 +771,12 @@ void test_mse_loss() {
     float expected_mse = 1.0f / 3.0f;
     float actual_mse = float(mse_cpu[0]);
     TEST(std::abs(actual_mse - expected_mse) < 1e-4f);
+
+    grad.cpu_download();
+    float16_t* grad_cpu = grad.cpu();
+    TEST(grad_cpu[0] == float16_t(0.0f));
+    TEST(grad_cpu[1] == float16_t(0.0f));
+    TEST(grad_cpu[2] == float16_t(1.0f));
 
     printf(" PASS\n");
 }
@@ -707,9 +794,11 @@ int main() {
 
     evk::ai::initialize();
 
-    // test_graph();
-    // test_matmul();
+    test_matmul();
     test_mse_loss();
+    test_graph_backward();
+
+    // benchmark_matmul();
 
     evk::ai::shutdown();
     evk::Shutdown();
