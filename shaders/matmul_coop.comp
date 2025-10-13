@@ -56,13 +56,13 @@ void main() {
         [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
             uint gi = TILE_M * tileID.y + SUB_TILE * i;
             uint gk = chunkK;
-            coopMatLoad(matA[i], inputA.x, coordToOffset(gi, gk, K, false), K, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matA[i], inputA.x, coordToOffset(gi, gk, K, TRANSPOSE_A != 0u), K, TRANSPOSE_A != 0u ? gl_CooperativeMatrixLayoutColumnMajor : gl_CooperativeMatrixLayoutRowMajor);
         }
         coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> matB;
         [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
             uint gj = TILE_N * tileID.x + SUB_TILE * j;
             uint gk = chunkK;
-            coopMatLoad(matB, inputB.x, coordToOffset(gk, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matB, inputB.x, coordToOffset(gk, gj, N, TRANSPOSE_B != 0u), N, TRANSPOSE_B != 0u ? gl_CooperativeMatrixLayoutColumnMajor : gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
                 result[i][j] = coopMatMulAdd(matA[i], matB, result[i][j]);
             }
@@ -75,13 +75,13 @@ void main() {
             uint gi = TILE_M * tileID.y + SUB_TILE * i;
             uint gj = TILE_N * tileID.x + SUB_TILE * j;
 
-            if (ACC_C == 0) {
-                coopMatStore(result[i][j], inputC.x, coordToOffset(gj, gi, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+            if (ACC_C == 0u) {
+                coopMatStore(result[i][j], inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
             } else {
-                // coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> mat_c;
-                // coopMatLoad(mat_c, inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
-                // result[i][j] = result[i][j] + mat_c;
-                // coopMatStore(result[i][j], inputC.x, coordToOffset(gj, gi, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> mat_c;
+                coopMatLoad(mat_c, inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                result[i][j] = result[i][j] + mat_c;
+                coopMatStore(result[i][j], inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
             }
         }
     }
