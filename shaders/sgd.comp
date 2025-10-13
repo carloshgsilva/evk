@@ -1,13 +1,13 @@
 #include "evk.frag"
 
+// SGD (Stochastic Gradient Descent) compute shader
+// Updates parameters: param = param - learning_rate * gradient
+
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_shader_16bit_storage : enable
 #extension GL_EXT_buffer_reference : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_EXT_control_flow_attributes : enable
-
-// SGD (Stochastic Gradient Descent) compute shader
-// Updates parameters: param = param - learning_rate * gradient
 
 layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 
@@ -19,20 +19,14 @@ PUSH(
 )
 
 
-COMPUTE(32, 1, 1)
+COMPUTE(256, 1, 1)
 void main() {
-    uint lid = gl_LocalInvocationID.x;
-    uint workgroupIndex = gl_WorkGroupID.x;
+    uint gid = gl_GlobalInvocationID.x;
 
-    // Process elements in chunks of 32 (workgroup size)
-    for (uint chunk = 0; chunk < totalElements; chunk += 32) {
-        uint id = chunk + lid;
-    
-        // Update parameter: param = param - learning_rate * gradient
-        if (id < totalElements) {
-            float param = float(paramBuffer.x[id]);
-            float gradient = float(gradientBuffer.x[id]);
-            paramBuffer.x[id] = float16_t(param - learningRate * gradient);
-        }
+    // Update parameter: param = param - learning_rate * gradient
+    if (gid < totalElements) {
+        float param = float(paramBuffer.x[gid]);
+        float gradient = float(gradientBuffer.x[gid]);
+        paramBuffer.x[gid] = float16_t(param - learningRate * gradient);
     }
 }

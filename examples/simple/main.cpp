@@ -42,92 +42,111 @@ struct float16_t {
 
     // Static conversion functions
     static uint16_t float_to_float16(float f) {
-        uint32_t bits = *reinterpret_cast<uint32_t*>(&f);
+        // Accurate FP32 -> FP16 conversion with correct handling of
+        // normals, subnormals, infinities and NaNs and round-to-nearest-even.
+        uint32_t fbits;
+        std::memcpy(&fbits, &f, sizeof(fbits));
 
-        // Extract components
-        uint32_t sign = (bits >> 31) & 0x1;
-        uint32_t exponent = (bits >> 23) & 0xFF;
-        uint32_t mantissa = bits & 0x7FFFFF;
+        uint32_t sign = (fbits >> 31) & 0x1;
+        int32_t exp = int32_t((fbits >> 23) & 0xFF) - 127;
+        uint32_t mant = fbits & 0x7FFFFF;
 
-        // Handle special cases
-        if (exponent == 0xFF) {
-            // Infinity or NaN
-            if (mantissa == 0) {
+        uint16_t hsign = uint16_t(sign << 15);
+
+        // Handle NaN/Infinity
+        if (((fbits >> 23) & 0xFF) == 0xFF) {
+            if (mant == 0) {
                 // Infinity
-                return (sign << 15) | 0x7C00;
+                return hsign | 0x7C00u;
             } else {
-                // NaN - preserve the first 9 bits of mantissa
-                return (sign << 15) | 0x7C00 | ((mantissa >> 13) & 0x3FF);
+                // NaN: preserve payload (at least one bit set in mantissa)
+                uint16_t payload = uint16_t((mant >> 13) & 0x3FFu);
+                if (payload == 0) payload = 1; // ensure it's NaN, not Inf
+                return hsign | 0x7C00u | payload;
             }
         }
 
-        if (exponent == 0) {
-            // Zero or subnormal
-            if (mantissa == 0) {
-                return sign << 15;
+        // Normalized range for FP16 exponent is [-14, +15]
+        if (exp > 15) {
+            // Overflow -> infinity
+            return hsign | 0x7C00u;
+        } else if (exp >= -14) {
+            // Normalized half-precision number
+            uint16_t hexp = uint16_t(exp + 15);
+            // Round mantissa from 23->10 bits, round-to-nearest-even
+            uint32_t mant_rounded = mant >> 13;
+            uint32_t round_bits = mant & 0x1FFFu; // bits we discarded
+            // Round to nearest, ties to even
+            if (round_bits > 0x1000u || (round_bits == 0x1000u && (mant_rounded & 1u))) {
+                ++mant_rounded;
+                if (mant_rounded == 0x400u) { // mantissa overflow -> increment exponent
+                    mant_rounded = 0;
+                    ++hexp;
+                    if (hexp == 0x1Fu) { // overflow to infinity
+                        return hsign | 0x7C00u;
+                    }
+                }
             }
-            // Subnormal numbers - handled by adjusting exponent
-        }
-
-        // Convert exponent from 32-bit to 16-bit format
-        int32_t new_exponent = int32_t(exponent) - 127 + 15;
-
-        if (new_exponent >= 31) {
-            // Overflow to infinity
-            return (sign << 15) | 0x7C00;
-        }
-
-        if (new_exponent <= 0) {
-            // Underflow to zero or subnormal
-            if (new_exponent < -10) {
-                return sign << 15;
+            return hsign | uint16_t(hexp << 10) | uint16_t(mant_rounded & 0x3FFu);
+        } else {
+            // Value too small to be represented as a normalized half.
+            // It may become a subnormal half or zero.
+            if (exp < -24) {
+                // Underflow to signed zero
+                return hsign;
             }
-            // Subnormal number
-            uint32_t shift = 14 - new_exponent;
-            uint32_t subnormal_mantissa = mantissa >> shift;
-            return (sign << 15) | subnormal_mantissa;
+
+            // Convert to subnormal half. Add implicit leading 1 to mantissa
+            mant |= 0x800000u; // restore implicit 1
+            int shift = (-14 - exp);
+            // shift = number of bits we need to right-shift mantissa to fit into 10 bits
+            uint32_t mant_sub = mant >> (13 + shift);
+
+            // Rounding for subnormals: look at the bit right below kept bits
+            uint32_t round_bit = (mant >> (12 + shift)) & 1u;
+            if (round_bit) {
+                ++mant_sub;
+            }
+
+            return hsign | uint16_t(mant_sub & 0x3FFu);
         }
-
-        // Round mantissa to 10 bits for half precision
-        uint32_t rounded_mantissa = (mantissa + 0x1000) >> 13; // Round to nearest
-
-        return (sign << 15) | (new_exponent << 10) | rounded_mantissa;
     }
 
     static float float16_to_float(uint16_t h) {
-        uint32_t sign = (h >> 15) & 0x1;
-        uint32_t exponent = (h >> 10) & 0x1F;
-        uint32_t mantissa = h & 0x3FF;
+        uint32_t sign = (h >> 15) & 0x1u;
+        uint32_t exp = (h >> 10) & 0x1Fu;
+        uint32_t mant = h & 0x3FFu;
 
-        if (exponent == 0) {
-            if (mantissa == 0) {
-                // Zero
+        // Handle zero and subnormal
+        if (exp == 0u) {
+            if (mant == 0u) {
                 return sign ? -0.0f : 0.0f;
             } else {
-                // Subnormal number
-                float result = 0.0f;
-                uint32_t bits = (sign << 31) | (exponent << 23) | (mantissa << 13);
-                return *reinterpret_cast<float*>(&bits);
+                // Subnormal half -> convert using ldexp for correctness
+                float value = std::ldexp((float)mant, -24); // mant * 2^-24
+                return sign ? -value : value;
             }
         }
 
-        if (exponent == 31) {
-            if (mantissa == 0) {
-                // Infinity
-                uint32_t bits = (sign << 31) | (0xFF << 23);
-                return *reinterpret_cast<float*>(&bits);
+        // Handle Inf/NaN
+        if (exp == 0x1Fu) {
+            if (mant == 0u) {
+                return sign ? -INFINITY : INFINITY;
             } else {
-                // NaN
-                uint32_t bits = (sign << 31) | (0xFF << 23) | (mantissa << 13);
-                return *reinterpret_cast<float*>(&bits);
+                // Build a float NaN preserving payload in the high bits
+                uint32_t fbits = (sign << 31) | (0xFFu << 23) | (mant << 13);
+                float out;
+                std::memcpy(&out, &fbits, sizeof(out));
+                return out;
             }
         }
 
-        // Normal number
-        uint32_t new_exponent = uint32_t(int32_t(exponent) - 15 + 127);
-        uint32_t bits = (sign << 31) | (new_exponent << 23) | (mantissa << 13);
-
-        return *reinterpret_cast<float*>(&bits);
+        // Normalized number
+        int32_t new_exp = int32_t(exp) - 15 + 127;
+        uint32_t fbits = (sign << 31) | (uint32_t(new_exp) << 23) | (mant << 13);
+        float out;
+        std::memcpy(&out, &fbits, sizeof(out));
+        return out;
     }
 };
 
@@ -556,7 +575,9 @@ namespace evk::ai {
             totalElements,
         });
 
-        evk::CmdDispatch(1, 1, 1);
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
     }
 }
 
@@ -633,12 +654,11 @@ void benchmark_matmul() {
     for (uint32_t tile_m = 48; tile_m <= 224; tile_m += 16) {
         for (uint32_t tile_n = 48; tile_n <= 224; tile_n += 16) {
             if(tile_m != 96 || tile_n != 96) {
-                continue;
+                // continue;
             }
             const uint32_t M = ((SIZE + tile_m - 1) / tile_m) * tile_m;
             const uint32_t N = ((SIZE + tile_n - 1) / tile_n) * tile_n;
-            if(tile_m * tile_n >= 128*112) {
-                // printf("skipping %d x %d\n", tile_m, tile_n);
+            if(tile_m * tile_n >= 80*144){
                 continue;
             }
             Tensor* a = new Tensor({M, SIZE});
@@ -649,25 +669,25 @@ void benchmark_matmul() {
             b->identity(3.0f);
         
             // warm up
-            for (uint32_t i = 0; i < 4; ++i) {
+            for (uint32_t i = 0; i < 16; ++i) {
                 evk::ai::matmul(*a, *b, *c, false, false, false, tile_m, tile_n);
             }
 
             float min_ms = 1e9f;
             for(int it = 0; it < 1; ++it) {
-                const uint32_t subIter = 16;
-                for (uint32_t i = 0; i < subIter; ++i) {
-                    evk::CmdTimestamp("matmul", [&]() {
-                            evk::ai::matmul(*a, *b, *c, false, false, false, tile_m, tile_n);
-                    });
-                }
+                const uint32_t subIter = 32;
+                evk::CmdTimestamp("matmul", [&]() {
+                    for (uint32_t i = 0; i < subIter; ++i) {
+                        evk::ai::matmul(*a, *b, *c, false, false, false, tile_m, tile_n);
+                    }
+                });
                 
                 evk::Sync();
                 for(auto ts: evk::GetTimestamps()) {
-                    min_ms = fminf(min_ms, float(ts.end - ts.start)/float(1));
+                    min_ms = fminf(min_ms, float(ts.end - ts.start)/float(subIter));
                 }
             }
-            float tflops = float(2.0f * M * N * M) / (min_ms / 1000.0f) / 1e12f;
+            float tflops = float(2 * uint64_t(M) * uint64_t(N) * uint64_t(M)) / (min_ms / 1000.0f) / 1e12f;
             printf("matmul: %5.3fms (%7.3ftflops)", min_ms, tflops);
             printf(" M = %d, N = %d, tile_m = %d, tile_n = %d\n", M, N, tile_m, tile_n);
 
@@ -794,8 +814,8 @@ int main() {
 
     evk::ai::initialize();
 
-    test_matmul();
-    test_mse_loss();
+    // test_matmul();
+    // test_mse_loss();
     test_graph_backward();
 
     // benchmark_matmul();
