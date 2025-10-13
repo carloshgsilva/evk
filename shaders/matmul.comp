@@ -1,105 +1,88 @@
 #include "evk.frag"
 
-CONSTANT(0) uint TRANSPOSE_A = 0;
-CONSTANT(1) uint SUM_C = 0;
+// Coopmat version of matmul.comp
+// Doesn't have bounds check, assumes 64 aligned dimensions
+
+CONSTANT(0) uint K = 0;
+CONSTANT(1) uint N = 0;
+CONSTANT(2) uint TILE_M = 0;
+CONSTANT(3) uint TILE_N = 0;
+CONSTANT(4) uint ACC_C = 0;
+CONSTANT(5) uint TRANSPOSE_A = 0;
+CONSTANT(6) uint TRANSPOSE_B = 0;
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 
 PUSH(
-    int aBufferRID;
-    int bBufferRID;
-    int cBufferRID;
-    uint B; // B = batch size (optional, set to 1 if unused)
-    uint M; // M = rows of A / output rows
-    uint K; // K = shared dimension (columns of A / rows of B)
-    uint N; // N = columns of B / output columns
+    BufferFp16 inputA;
+    BufferFp16 inputB;
+    BufferFp16 inputC;
 )
 
-BINDING_BUFFER_RW(float_buffer,
-    float at[];
-)
+#define TILE_K 16
+#define SUB_TILE 16
 
-// TILED MATMUL
-// Expects buffers packed in row-major:
-// A: B x M x K at binding aBufferRID
-// B: B x K x N at binding bBufferRID
-// C: B x M x N at binding cBufferRID
+const uint C_ROWS = TILE_M / SUB_TILE;
+const uint C_COLS = TILE_N / SUB_TILE;
+coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> result[C_ROWS][C_COLS];
 
-// Tune tile size for target GPU. Keep local_size_x * local_size_y <= 1024 generally.
-#define TILE 16
-// shared memory tiles must be declared at global scope
-shared float Asub[TILE][TILE];
-shared float Bsub[TILE][TILE];
+uint coordToOffset(uint i, uint j, uint stride, bool colMajor) {
+    return colMajor ? (stride * j + i) : (stride * i + j);
+}
 
-COMPUTE(TILE, TILE, 1)
+COMPUTE(32, 1, 1)
 void main() {
-    // global indices
-    uvec2 gid = uvec2(gl_GlobalInvocationID.xy);
-    uint row = gid.y; // y is row (M)
-    uint col = gid.x; // x is col (N)
-    // batch index (z dimension)
-    uint batchIdx = gl_GlobalInvocationID.z;
-    // compute per-batch base offsets (assumes host arranges buffers per-batch contiguously)
-    uint aBase = batchIdx * (M * K);
-    uint bBase = batchIdx * (K * N);
-    uint cBase = batchIdx * (M * N);
+    uvec2 tileID = uvec2(gl_WorkGroupID.xy);
 
-    // Shared memory tiles for A and B (declared at global scope)
-    float acc = 0.0;
-
-    // Loop over tiles of K dimension
-    for (uint t = 0; t < (K + TILE - 1) / TILE; ++t) {
-        // Each invocation loads one element of A and one of B into shared memory if within bounds
-        uint aRow = row;
-        uint aCol = t * TILE + gl_LocalInvocationID.x;
-        uint bRow = t * TILE + gl_LocalInvocationID.y;
-        uint bCol = col;
-
-        // compute flat indices for buffers: A is M x K row-major, B is K x N row-major
-        float aVal = 0.0;
-        float bVal = 0.0;
-        if (aRow < M && aCol < K) {
-            // compute index relative to per-batch A base
-            // respect TRANSPOSE_A specialization constant: when set, A is stored transposed (K x M)
-            uint aIndex;
-            if (TRANSPOSE_A == 0u) {
-                aIndex = aBase + aRow * K + aCol;
-            } else {
-                // stored as K x M row-major when transposed: index = aBase + col * M + row
-                aIndex = aBase + aCol * M + aRow;
-            }
-            aVal = float_buffer[aBufferRID].at[aIndex];
+    // Initialize result to zero
+    [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+            result[i][j] = coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
         }
-        if (bRow < K && bCol < N) {
-            // compute index relative to per-batch B base
-            uint bIndex = bBase + bRow * N + bCol;
-            bVal = float_buffer[bBufferRID].at[bIndex];
-        }
-
-        Asub[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = aVal;
-        Bsub[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = bVal;
-
-        // ensure tile loads complete
-        barrier();
-
-        // compute partial products
-        for (uint k = 0; k < TILE; ++k) {
-            uint globalK = t * TILE + k;
-            if (globalK < K) {
-                acc += Asub[gl_LocalInvocationID.y][k] * Bsub[k][gl_LocalInvocationID.x];
-            }
-        }
-
-        // wait for all threads before next tile
-        barrier();
     }
 
-    // Write output if within bounds
-    if (row < M && col < N) {
-        // write result to per-batch C base
-        uint outIndex = cBase + row * N + col;
-        if (SUM_C == 0u) {
-            float_buffer[cBufferRID].at[outIndex] = acc;
-        } else {
-            float_buffer[cBufferRID].at[outIndex] += acc;
+    // On each iteration, load a row of cooperative matrices from matrix A,
+    // load a column of cooperative matrices from matrix B, and multiply all
+    // pairs of those matrices.
+    for (uint chunkK = 0; chunkK < K; chunkK += TILE_K) {
+        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> matA[C_ROWS];
+        [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+            uint gi = TILE_M * tileID.y + SUB_TILE * i;
+            uint gk = chunkK;
+            coopMatLoad(matA[i], inputA.x, coordToOffset(gi, gk, K, TRANSPOSE_A != 0u), K, TRANSPOSE_A != 0u ? gl_CooperativeMatrixLayoutColumnMajor : gl_CooperativeMatrixLayoutRowMajor);
+        }
+        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> matB;
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+            uint gj = TILE_N * tileID.x + SUB_TILE * j;
+            uint gk = chunkK;
+            coopMatLoad(matB, inputB.x, coordToOffset(gk, gj, N, TRANSPOSE_B != 0u), N, TRANSPOSE_B != 0u ? gl_CooperativeMatrixLayoutColumnMajor : gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+                result[i][j] = coopMatMulAdd(matA[i], matB, result[i][j]);
+            }
+        }
+    }
+
+    // Store the result
+    [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+            uint gi = TILE_M * tileID.y + SUB_TILE * i;
+            uint gj = TILE_N * tileID.x + SUB_TILE * j;
+
+            if (ACC_C == 0u) {
+                coopMatStore(result[i][j], inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+            } else {
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> mat_c;
+                coopMatLoad(mat_c, inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                result[i][j] = result[i][j] + mat_c;
+                coopMatStore(result[i][j], inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+            }
         }
     }
 }
