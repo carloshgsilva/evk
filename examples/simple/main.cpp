@@ -278,6 +278,13 @@ struct Tensor {
         return *this;
     }
 
+    float16_t item() {
+        assert(shape.count() == 1);
+        cpu_download();
+        float16_t* data = cpu();
+        return data[0];
+    }
+
     void print(uint32_t max_elements = 8, uint32_t max_batch = 4) {
         // Print shape header
         printf("Tensor (");
@@ -399,7 +406,7 @@ namespace evk::ai {
         }
         evk::Pipeline pipeline = evk::CreatePipeline({
             .name = "matmul",
-            .CS = evk::loadSpirvFile("shaders/bin/matmul_coop.comp.spv"),
+            .CS = evk::loadSpirvFile("shaders/bin/matmul.comp.spv"),
             .constants = evk::Constant{
                 uint32_t(config.k),
                 uint32_t(config.n),
@@ -605,8 +612,8 @@ struct Graph {
             evk::ai::matmul(a, b, tensor);
         };
         tensor.backward_fn = [this, &a, &b, &tensor]() {
-            evk::ai::matmul(a, b, a.grad(), false, true, true);
-            evk::ai::matmul(a, b, b.grad(), true, false, true);
+            evk::ai::matmul(a, b, a.grad(), false, true, false);
+            evk::ai::matmul(a, b, b.grad(), true, false, false);
         };
         return tensor;
     }
@@ -711,16 +718,16 @@ void test_graph_backward() {
     const uint32_t SIZE = 80u;
     Tensor& target = graph.tensor({SIZE, SIZE}).identity(1.0f);
     Tensor& a = graph.tensor({SIZE, SIZE}, true).identity(3.0f);
-    Tensor& b = graph.tensor({SIZE, SIZE}).random();
+    Tensor& b = graph.tensor({SIZE, SIZE}).identity(4.0f);
     Tensor& c = graph.matmul(a, b);
     Tensor& loss = graph.mse_loss(c, target);
 
     for(int i = 0; i < 150; ++i) {
         graph.eval(true);
-        graph.step(0.001f);
+        graph.step(0.005f);
         // a.grad().print();
         // a.print();
-        loss.print();
+        printf("[%d] loss: %f\n", i, float(loss.item()));
     }
 }
 
