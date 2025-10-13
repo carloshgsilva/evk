@@ -7,7 +7,7 @@
 #extension GL_EXT_control_flow_attributes : enable
 
 // MSE Loss compute shader
-// Calculates mean squared error: (1/N) * sum(predicted - target)^2
+// Calculates mean squared error: (1/N) * sum(target - predicted)^2
 
 // Technique:
 // Sequencial reduction (to avoid reduction buffer)
@@ -28,7 +28,6 @@ PUSH(
 COMPUTE(32, 1, 1)
 void main() {
     uint lid = gl_LocalInvocationID.x;
-    uint workgroupIndex = gl_WorkGroupID.x;
 
     float local_sum = 0.0;
     for (uint chunk = 0; chunk < totalElements; chunk += 32) {
@@ -37,9 +36,8 @@ void main() {
         if (id < totalElements) {
             float predicted = float(predictedBuffer.x[id]);
             float target = float(targetBuffer.x[id]);
-            float diff = predicted - target;
-            diff = diff * diff; // squared differenc
-            local_sum += diff;
+            float diff = target - predicted;
+            local_sum += diff * diff;
             gradBuffer.x[id] = float16_t(diff);
         }
     }
