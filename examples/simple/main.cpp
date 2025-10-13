@@ -492,6 +492,7 @@ namespace evk::ai {
             .transpose_b = transpose_b,
         }));
         evk::CmdDispatch(tilesCols, tilesRows, batch);
+        evk::CmdBarrier();
     }
 
     // Fused Flash Attention forward (Multi-Query Attention)
@@ -564,6 +565,7 @@ namespace evk::ai {
         });
 
         evk::CmdDispatch(1, 1, 1);
+        evk::CmdBarrier();
     }
 
     // SGD: param = param - learning_rate * gradient
@@ -607,15 +609,15 @@ struct Graph {
 
     Tensor& matmul(Tensor& a, Tensor& b) {
         nodes.push_back(std::make_unique<Tensor>(Shape({a.shape[0], b.shape[1]})));
-        Tensor& tensor = *nodes.back();
-        tensor.forward_fn = [this, &a, &b, &tensor]() {
-            evk::ai::matmul(a, b, tensor);
+        Tensor& c = *nodes.back();
+        c.forward_fn = [this, &a, &b, &c]() {
+            evk::ai::matmul(a, b, c);
         };
-        tensor.backward_fn = [this, &a, &b, &tensor]() {
-            evk::ai::matmul(a, b, a.grad(), false, true, false);
-            evk::ai::matmul(a, b, b.grad(), true, false, false);
+        c.backward_fn = [this, &a, &b, &c]() {
+            evk::ai::matmul(c.grad(), b, a.grad(), false, true, false);
+            evk::ai::matmul(a, c.grad(), b.grad(), true, false, false);
         };
-        return tensor;
+        return c;
     }
 
     Tensor& mse_loss(Tensor& predicted, Tensor& target) {
@@ -652,7 +654,7 @@ struct Graph {
     void step(float lr = 0.001f) {
         for(auto& param : params) {
             assert(param->grad_tensor);
-            evk::ai::sgd(*param, param->grad(), lr);
+            evk::ai::sgd(*param, param->grad(), -lr);
         }
     }
 };
@@ -709,66 +711,47 @@ void benchmark_matmul() {
     }
 }
 
-#define TEST(expr) if(!(expr)) { printf("Test failed: " #expr " [%s:%d]\n", __FILE__, __LINE__); exit(1); }
-
-void test_graph_backward() {
-    printf("test_graph()\n");
-    Graph graph;
-
-    const uint32_t SIZE = 80u;
-    Tensor& target = graph.tensor({SIZE, SIZE}).identity(1.0f);
-    Tensor& a = graph.tensor({SIZE, SIZE}, true).identity(3.0f);
-    Tensor& b = graph.tensor({SIZE, SIZE}).identity(4.0f);
-    Tensor& c = graph.matmul(a, b);
-    Tensor& loss = graph.mse_loss(c, target);
-
-    for(int i = 0; i < 150; ++i) {
-        graph.eval(true);
-        graph.step(0.005f);
-        // a.grad().print();
-        // a.print();
-        printf("[%d] loss: %f\n", i, float(loss.item()));
-    }
-}
+#define TEST(expr) if((expr)) { printf(" TEST(" #expr ") [PASS]\n"); } else { printf(" TEST(" #expr ") [FAIL] [%s:%d]\n", __FILE__, __LINE__); exit(1); }
 
 void test_matmul() {
-    printf("test_matmul()");
-    const uint32_t SIZE = 4096;
+    printf("test_matmul()\n");
 
     {
-        const uint32_t SIZE = 4000u;
+        const uint32_t SIZE = 400u;
         Tensor a = Tensor({SIZE, SIZE});
-        {
-            float16_t* a_cpu = a.cpu();
-            for(uint32_t i = 0; i < a.shape[0]; ++i) {
-                a_cpu[i] = float(2);
-            }
-            a.cpu_upload();
-        }
         Tensor b = Tensor({SIZE, SIZE});
-        {
-            float16_t* b_cpu = b.cpu();
-            for(uint32_t i = 0; i < b.shape[0]; ++i) {
-                b_cpu[i*b.shape[0]] = float(3);
-            }
-            b.cpu_upload();
-        }
         Tensor c = Tensor({SIZE, SIZE});
+        a.identity(2.0f);
+        b.identity(2.0f);
         evk::ai::matmul(a, b, c);
 
-        a.print();
-        b.print();
-        c.print();
+        // a.print();
+        // b.print();
+        // c.print();
 
         c.cpu_download();
-        TEST(c.cpu()[0] == float16_t(SIZE * 2 * 3));
+        bool diagonal_test = true;
+        bool off_diagonal_test = true;
+        for(uint32_t i = 0; i < SIZE*SIZE; ++i) {
+            uint32_t r = i / SIZE;
+            uint32_t col = i % SIZE;
+            if (r == col) {
+                if(c.cpu()[i] != float16_t(4.0f)) {
+                    diagonal_test = false;
+                }
+            } else {
+                if(c.cpu()[i] != float16_t(0.0f)) {
+                    off_diagonal_test = false;
+                }
+            }
+        }
+        TEST(diagonal_test);
+        TEST(off_diagonal_test);
     }
-
-    printf(" PASS\n");
 }
 
 void test_mse_loss() {
-    printf("test_mse_loss()");
+    printf("test_mse_loss()\n");
     // Test 1: Simple 1D tensors
     Tensor predicted({3});
     Tensor target({3});
@@ -807,8 +790,32 @@ void test_mse_loss() {
     TEST(grad_cpu[0] == float16_t(0.0f));
     TEST(grad_cpu[1] == float16_t(0.0f));
     TEST(grad_cpu[2] == float16_t(1.0f));
+}
 
-    printf(" PASS\n");
+void test_graph_backward() {
+    printf("test_graph_backward() \n");
+    Graph graph;
+
+    const uint32_t SIZE = 80u;
+    Tensor& target = graph.tensor({SIZE, SIZE}).identity(3.0f);
+
+    Tensor& a = graph.tensor({SIZE, SIZE}, true).identity(1.0f);
+    Tensor& b = graph.tensor({SIZE, SIZE}).identity(1.0f);
+    Tensor& c = graph.matmul(a, b);
+    Tensor& loss = graph.mse_loss(c, target);
+
+    float last_loss = 1e9f;
+    bool loss_test = true;
+    for(int i = 0; i < 100; ++i) {
+        graph.eval(true);
+        graph.step(0.05f);
+        float loss_val = float(loss.item());
+        if(loss_val > last_loss) {
+            loss_test = false;
+        }
+        last_loss = loss_val;
+    }
+    TEST(loss_test);
 }
 
 int main() {
@@ -824,8 +831,8 @@ int main() {
 
     evk::ai::initialize();
 
-    // test_matmul();
-    // test_mse_loss();
+    test_matmul();
+    test_mse_loss();
     test_graph_backward();
 
     // benchmark_matmul();
