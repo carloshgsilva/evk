@@ -804,16 +804,6 @@ void test_mse_loss() {
     printf(" PASS\n");
 }
 
-#include <csignal>
-
-void signal_handler(int signal) {
-    if (signal == SIGABRT) {
-        std::cerr << "Caught SIGABRT, terminating gracefully...\n";
-        // Do custom cleanup here, but cannot safely "continue"
-        exit(EXIT_FAILURE); 
-    }
-}
-
 int main() {
     set_unhandled_exception_filter();
 
