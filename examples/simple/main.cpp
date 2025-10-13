@@ -1,11 +1,12 @@
 #include <iostream>
 #include <evk.h>
-#include <cassert>
 #include <cmath>
 #include <algorithm>
 #include <functional>
 
 #include "win_dbg.h"
+
+#define assert(expr) if(!(expr)) { printf("Assertion failed: " #expr "\n"); throw std::runtime_error("Assertion failed"); }
 
 struct float16_t {
     uint16_t value;
@@ -629,10 +630,12 @@ struct Graph {
             }
         }
         if (backward) {
-            for(int i = params.size() - 1; i >= 0; --i) {
-                auto& param = params[i];
-                if (param->backward_fn) {
-                    param->backward_fn();
+            // Run backward functions in reverse node order so intermediate
+            // operators (e.g. matmul) can populate grads for parameters.
+            for (int i = int(nodes.size()) - 1; i >= 0; --i) {
+                auto& node = nodes[i];
+                if (node->backward_fn) {
+                    node->backward_fn();
                 }
             }
         }
@@ -708,13 +711,13 @@ void test_graph_backward() {
     const uint32_t SIZE = 80u;
     Tensor& target = graph.tensor({SIZE, SIZE}).identity(1.0f);
     Tensor& a = graph.tensor({SIZE, SIZE}, true).identity(3.0f);
-    // Tensor& b = graph.tensor({SIZE, SIZE}).random();
-    // Tensor& c = graph.matmul(a, b);
-    Tensor& loss = graph.mse_loss(a, target);
+    Tensor& b = graph.tensor({SIZE, SIZE}).random();
+    Tensor& c = graph.matmul(a, b);
+    Tensor& loss = graph.mse_loss(c, target);
 
     for(int i = 0; i < 150; ++i) {
         graph.eval(true);
-        graph.step(0.1f);
+        graph.step(0.001f);
         // a.grad().print();
         // a.print();
         loss.print();
@@ -799,6 +802,16 @@ void test_mse_loss() {
     TEST(grad_cpu[2] == float16_t(1.0f));
 
     printf(" PASS\n");
+}
+
+#include <csignal>
+
+void signal_handler(int signal) {
+    if (signal == SIGABRT) {
+        std::cerr << "Caught SIGABRT, terminating gracefully...\n";
+        // Do custom cleanup here, but cannot safely "continue"
+        exit(EXIT_FAILURE); 
+    }
 }
 
 int main() {
