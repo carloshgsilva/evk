@@ -64,11 +64,16 @@ LONG WINAPI CustomUnhandledExceptionFilter(EXCEPTION_POINTERS* pExceptionInfo) {
                 std::cerr << "-> " << pSymbol->Name << "() [" << lineInfo.FileName << ":" << std::dec << (lineInfo.LineNumber) << "]" << std::endl;
             }
         }
+        // Stop at main (don't show internal init functions)
+        if (strcmp(pSymbol->Name, "main") == 0) {
+            break;
+        }
     }
 
     SymCleanup(hProcess);
 
-    return EXCEPTION_CONTINUE_SEARCH; // Pass to next handler
+    exit(1);
+    return EXCEPTION_NONCONTINUABLE_EXCEPTION; // Pass to next handler
 }
 
 void set_unhandled_exception_filter() {
