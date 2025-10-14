@@ -3,4 +3,5 @@ cmake --build build -- --quiet &&^
 glslc shaders/matmul.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/matmul.comp.spv &&^
 glslc shaders/mse_loss.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/mse_loss.comp.spv &&^
 glslc shaders/sgd.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/sgd.comp.spv &&^
+glslc shaders/add.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/add.comp.spv &&^
 build\evk_example.exe

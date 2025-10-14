@@ -379,6 +379,7 @@ namespace evk::ai {
         evk::Pipeline flash_attn_bwd;
         evk::Pipeline mse_loss;
         evk::Pipeline sgd;
+        evk::Pipeline add;
     };
     std::unique_ptr<Pipelines> pipelines;
 
@@ -440,6 +441,10 @@ namespace evk::ai {
             .name = "sgd",
             .CS = evk::loadSpirvFile("shaders/bin/sgd.comp.spv"),
         });
+        pipelines->add = evk::CreatePipeline({
+            .name = "add",
+            .CS = evk::loadSpirvFile("shaders/bin/add.comp.spv"),
+        });
     }
     void shutdown() {
         pipelines.reset();
@@ -450,9 +455,6 @@ namespace evk::ai {
     // (...B, M, N) = (...B, M, K) * (...B, K, N)
     void matmul(Tensor& a, Tensor& b, Tensor& c, bool transpose_a = false, bool transpose_b = false, bool acc_c = false, uint8_t TILE_M = 80u, uint8_t TILE_N = 80u) {
         const uint32_t TILE_K = 16u;
-        // const uint32_t TILE_M = 80u;
-        // const uint32_t TILE_N = 64u;
-        // printf("a.shape = (%d, %d), b.shape = (%d, %d), c.shape = (%d, %d)\n", a.shape[-2], a.shape[-1], b.shape[-2], b.shape[-1], c.shape[-2], c.shape[-1]);
         assert(a.shape[-2] % TILE_M == 0);
         assert(a.shape[-1] % TILE_K == 0);
         assert(b.shape[-2] % TILE_K == 0);
@@ -589,6 +591,31 @@ namespace evk::ai {
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         evk::CmdDispatch(groupsX, 1, 1);
     }
+
+    // Elementwise add: C = A + B
+    void add(Tensor& a, Tensor& b, Tensor& c) {
+        assert(a.shape.rank() == b.shape.rank());
+        assert(a.shape.rank() == c.shape.rank());
+        for (uint32_t i = 0; i < a.shape.rank(); ++i) {
+            assert(a.shape[i] == b.shape[i]);
+            assert(a.shape[i] == c.shape[i]);
+        }
+
+        uint32_t totalElements = a.shape.count();
+
+        // Use GPU shader pipeline to perform elementwise add
+        evk::CmdBind(pipelines->add);
+        evk::CmdPush(evk::Constant{
+            a.buffer.GetReference(),
+            b.buffer.GetReference(),
+            c.buffer.GetReference(),
+            totalElements,
+        });
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
+    }
 }
 
 struct Graph {
@@ -620,6 +647,25 @@ struct Graph {
         return c;
     }
 
+    Tensor& add(Tensor& a, Tensor& b) {
+        nodes.push_back(std::make_unique<Tensor>(a.shape));
+        Tensor& c = *nodes.back();
+
+        c.forward_fn = [this, &a, &b, &c]() {
+            evk::ai::add(a, b, c);
+        };
+
+        c.backward_fn = [this, &a, &b, &c]() {
+            evk::CmdCopy(c.grad().buffer, a.grad().buffer, a.grad().shape.count() * sizeof(float16_t));
+            evk::CmdCopy(c.grad().buffer, b.grad().buffer, b.grad().shape.count() * sizeof(float16_t));
+            // TODO: use add when summation grad is supported
+            // evk::ai::add(a.grad(), c.grad(), a.grad());
+            // evk::ai::add(b.grad(), c.grad(), b.grad());
+        };
+
+        return c;
+    }
+
     Tensor& mse_loss(Tensor& predicted, Tensor& target) {
         nodes.push_back(std::make_unique<Tensor>(Shape({1})));
         Tensor& tensor = *nodes.back();
@@ -639,6 +685,15 @@ struct Graph {
             }
         }
         if (backward) {
+            // Zero parameter grad tensors before running backward so parameter grads don't accumulate
+            for (auto& param : params) {
+                if (param->grad_tensor) {
+                    float16_t* gcpu = param->grad_tensor->cpu();
+                    memset(gcpu, 0, sizeof(float16_t) * param->grad_tensor->shape.count());
+                    param->grad_tensor->cpu_upload();
+                }
+            }
+
             // Run backward functions in reverse node order so intermediate
             // operators (e.g. matmul) can populate grads for parameters.
             for (int i = int(nodes.size()) - 1; i >= 0; --i) {
@@ -713,6 +768,30 @@ void benchmark_matmul() {
 
 #define TEST(expr) if((expr)) { printf(" TEST(" #expr ") [PASS]\n"); } else { printf(" TEST(" #expr ") [FAIL] [%s:%d]\n", __FILE__, __LINE__); exit(1); }
 
+void test_add() {
+    printf("test_add()\n");
+    Tensor a({4});
+    Tensor b({4});
+    Tensor out({4});
+
+    float16_t* ap = a.cpu();
+    float16_t* bp = b.cpu();
+    for (uint32_t i = 0; i < 4; ++i) {
+        ap[i] = float16_t(float(i));
+        bp[i] = float16_t(float(i * 2));
+    }
+    a.cpu_upload();
+    b.cpu_upload();
+
+    evk::ai::add(a, b, out);
+
+    out.cpu_download();
+    float16_t* outp = out.cpu();
+    for (uint32_t i = 0; i < 4; ++i) {
+        TEST(outp[i] == float16_t(float(i) + float(i * 2)));
+    }
+}
+
 void test_matmul() {
     printf("test_matmul()\n");
 
@@ -724,10 +803,6 @@ void test_matmul() {
         a.identity(2.0f);
         b.identity(2.0f);
         evk::ai::matmul(a, b, c);
-
-        // a.print();
-        // b.print();
-        // c.print();
 
         c.cpu_download();
         bool diagonal_test = true;
@@ -799,10 +874,12 @@ void test_graph_backward() {
     const uint32_t SIZE = 80u;
     Tensor& target = graph.tensor({SIZE, SIZE}).identity(3.0f);
 
-    Tensor& a = graph.tensor({SIZE, SIZE}, true).identity(1.0f);
-    Tensor& b = graph.tensor({SIZE, SIZE}).identity(1.0f);
-    Tensor& c = graph.matmul(a, b);
-    Tensor& loss = graph.mse_loss(c, target);
+    Tensor& x = graph.tensor({SIZE, SIZE}).identity(1.0f);
+    Tensor& w = graph.tensor({SIZE, SIZE}, true).identity(1.0f);
+    Tensor& b = graph.tensor({SIZE, SIZE}, true).identity(1.0f);
+    Tensor& mul = graph.matmul(w, x);
+    Tensor& y = graph.add(mul, b);
+    Tensor& loss = graph.mse_loss(y, target);
 
     float last_loss = 1e9f;
     bool loss_test = true;
@@ -831,6 +908,7 @@ int main() {
 
     evk::ai::initialize();
 
+    test_add();
     test_matmul();
     test_mse_loss();
     test_graph_backward();
