@@ -493,7 +493,6 @@ namespace evk::ai {
         uint32_t a_cols = transpose_a ? a.shape[-2] : a.shape[-1];
         uint32_t b_rows = transpose_b ? b.shape[-1] : b.shape[-2];
         uint32_t b_cols = transpose_b ? b.shape[-2] : b.shape[-1];
-        printf("a_rows = %d, a_cols = %d, b_rows = %d, b_cols = %d\n", a_rows, a_cols, b_rows, b_cols);
 
         // Inner dimension must match
         assert(a_cols == b_rows);
@@ -878,7 +877,7 @@ void benchmark_matmul() {
     for (uint32_t tile_m = 48; tile_m <= 224; tile_m += 16) {
         for (uint32_t tile_n = 48; tile_n <= 224; tile_n += 16) {
             if(tile_m != 96 || tile_n != 96) {
-                // continue;
+                continue;
             }
             const uint32_t M = ((SIZE + tile_m - 1) / tile_m) * tile_m;
             const uint32_t N = ((SIZE + tile_n - 1) / tile_n) * tile_n;
@@ -898,7 +897,7 @@ void benchmark_matmul() {
             }
 
             float min_ms = 1e9f;
-            for(int it = 0; it < 1; ++it) {
+            for(int it = 0; it < 512; ++it) {
                 const uint32_t subIter = 32;
                 evk::CmdTimestamp("matmul", [&]() {
                     for (uint32_t i = 0; i < subIter; ++i) {
@@ -1309,11 +1308,11 @@ int main() {
     evk::ai::initialize();
 
     // test_add();
-    // test_matmul();
+    test_matmul();
     // test_mse_loss();
     // test_flash_attention_forward_small();
     // test_flash_attention_backward_trivial();
-    test_flash_attention_forward_values();
+    // test_flash_attention_forward_values();
     // test_graph_backward();
 
     // benchmark_matmul();
