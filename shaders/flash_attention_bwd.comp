@@ -1,150 +1,355 @@
 #include "evk.frag"
 
-// Backward for fused attention (MQA), given upstream dO.
-// Computes gradients dQ, dK, dV with shared K/V across heads.
-// O = softmax(S) V, S = (Q K^T) * scale
-// dV = P^T dO, where P is softmax(S) row-wise
-// dS = (dP) hadamard Jacobian of softmax with P
-//    where dP = dO V^T
-// Efficient form: For each i: dS[i,j] = (dot(dO[i,:], V[j,:]) - sum_k P[i,k]*dot(dO[i,:],V[k,:])) * P[i,j]
-// Then dQ[i,:] += sum_j dS[i,j] * K[j,:] * scale
-// and dK[j,:] += sum_i dS[i,j] * Q[i,:] * scale
+// Backward for fused attention (MQA) using cooperative matrices (tensor cores).
+// Two modes:
+//  - mode 0: compute dQ per (B,H,iTile)
+//  - mode 1: compute dK and dV per (B,jTile) accumulating over all H and iTiles
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 
 PUSH(
-    int qBufferRID;
-    int kBufferRID;
-    int vBufferRID;
-    int oBufferRID;   // not strictly needed
-    int dOBufferRID;
-    int dQBufferRID;
-    int dKBufferRID;
-    int dVBufferRID;
+    BufferFp16 qBuf;
+    BufferFp16 kBuf;
+    BufferFp16 vBuf;
+    BufferFp16 oBuf;
+    BufferFp16 dOBuf;
+    BufferFp16 dQBuf;
+    BufferFp16 dKBuf;
+    BufferFp16 dVBuf;
+    BufferFp16 scratchBuf;
     uint B;
     uint H;
     uint N;
     uint D;
     float scale;
+    uint mode; // 0: dQ, 1: dK+dV
 )
 
-BINDING_BUFFER_RW(float_buffer,
-    float at[];
-)
+#define SUB_TILE 16u
+#define TILE_M 16u
+#define TILE_J 16u
 
-COMPUTE(1, 1, 1)
+COMPUTE(32, 1, 1)
 void main() {
-    // One (b,h,i) per invocation; accumulate dQ[i,:] and dV, and also accumulate dK across i.
-    uint i = gl_GlobalInvocationID.x; // query index
-    uint bh = gl_GlobalInvocationID.z; // combined batch-head index
-    if (i >= N) return;
-    if (bh >= B * H) return;
+    uint Dh = D / H;
+    if ((N % TILE_M) != 0u) return;
+    if ((N % TILE_J) != 0u) return;
+    if ((Dh % SUB_TILE) != 0u) return;
 
-    uint b = bh / H;
-    uint h = bh % H;
+    if (mode == 0u) {
+        // dQ pass: grid over (iTile, B*H)
+        uint tileRow = gl_WorkGroupID.y;
+        uint bh = gl_WorkGroupID.z;
+        uint b = bh / H;
+        uint h = bh % H;
+        if (b >= B) return;
 
-    uint headStride = N * D;
-    uint qhBase = (b * H + h) * headStride; // per-head base for Q/O/dO/dQ
-    uint kvBase = b * headStride;           // shared K/V/dK/dV base for this batch (H=1)
+        uint i0 = tileRow * TILE_M;
 
-    uint baseQ = qhBase;
-    uint baseK = kvBase;
-    uint baseV = kvBase;
-    uint baseO = qhBase;
+        uint baseQ_B = b * (N * D);
+        uint baseK_B = b * (N * Dh);
+        uint baseV_B = b * (N * Dh);
+        uint baseDO_B = b * (N * D);
+        uint baseDQ_B = b * (N * D);
 
-    uint baseDO = qhBase;
-    uint baseDQ = qhBase;
-    uint baseDK = kvBase;
-    uint baseDV = kvBase;
+        // Scratch addressing reuses forward layout: per (bh,tileRow)
+        uint tilesPerBH = N / TILE_M;
+        uint tileLinear = bh * tilesPerBH + tileRow;
+        uint otileCount = TILE_M * Dh;
+        uint ptileCount = TILE_M * TILE_J;
+        uint scratchPerTile = otileCount + ptileCount;
+        uint scratchBase = tileLinear * scratchPerTile;
+        uint pBase = scratchBase;                  // P or S temporary
+        uint mBase = scratchBase + ptileCount;     // another 16x16 tile buffer
 
-    // Reconstruct softmax probabilities P[i,j] with numerically-stable two-pass like forward
-    // Pass 1: compute m and denom for row i
-    float m = -3.402823466e+38; // -FLT_MAX
-    float denom = 0.0;
-    uint qRow = baseQ + i * D;
-    for (uint j = 0u; j < N; ++j) {
-        uint kRow = baseK + j * D;
-        float s = 0.0;
-        for (uint d = 0u; d < D; ++d) {
-            float qv = float_buffer[qBufferRID].at[qRow + d];
-            float kv = float_buffer[kBufferRID].at[kRow + d];
-            s += qv * kv;
+        // Running softmax stats per i-row
+        float mRow[TILE_M];
+        float lRow[TILE_M];
+        float tRow[TILE_M];
+        [[unroll]] for (uint r = 0u; r < TILE_M; ++r) { mRow[r] = -3.402823466e+38; lRow[r] = 0.0; tRow[r] = 0.0; }
+
+        // Pass A: compute m,l,t across all j tiles
+        for (uint j0 = 0u; j0 < N; j0 += TILE_J) {
+            // S = Q_tile(16xDh) * K_tile^T(Dh x 16)
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> sTile =
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+            for (uint k0 = 0u; k0 < Dh; k0 += SUB_TILE) {
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> qMat;
+                uint qOff = baseQ_B + i0 * D + h * Dh + k0;
+                coopMatLoad(qMat, qBuf.x, qOff, D, gl_CooperativeMatrixLayoutRowMajor);
+
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> kMat;
+                uint kOff = baseK_B + j0 * Dh + k0;
+                coopMatLoad(kMat, kBuf.x, kOff, Dh, gl_CooperativeMatrixLayoutColumnMajor);
+
+                sTile = coopMatMulAdd(qMat, kMat, sTile);
+            }
+            coopMatStore(sTile, scratchBuf.x, pBase, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
+
+            // M = dO_tile(16xDh) * V_tile^T(Dh x 16)
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> mTile =
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+            for (uint k0 = 0u; k0 < Dh; k0 += SUB_TILE) {
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> doMat;
+                uint doOff = baseDO_B + i0 * D + h * Dh + k0;
+                coopMatLoad(doMat, dOBuf.x, doOff, D, gl_CooperativeMatrixLayoutRowMajor);
+
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> vMat;
+                uint vOff = baseV_B + j0 * Dh + k0;
+                coopMatLoad(vMat, vBuf.x, vOff, Dh, gl_CooperativeMatrixLayoutColumnMajor);
+
+                mTile = coopMatMulAdd(doMat, vMat, mTile);
+            }
+            coopMatStore(mTile, scratchBuf.x, mBase, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
+
+            // Update m,l,t per row with online softmax
+            for (uint r = 0u; r < TILE_M; ++r) {
+                float m_new = mRow[r];
+                [[unroll]] for (uint c = 0u; c < TILE_J; ++c) {
+                    float s = float(scratchBuf.x[pBase + r * TILE_J + c]) * scale;
+                    m_new = max(m_new, s);
+                }
+                float ls = lRow[r] * exp(mRow[r] - m_new);
+                float ts = tRow[r] * exp(mRow[r] - m_new);
+                for (uint c = 0u; c < TILE_J; ++c) {
+                    float s = float(scratchBuf.x[pBase + r * TILE_J + c]) * scale;
+                    float w = exp(s - m_new);
+                    ls += w;
+                    float mv = float(scratchBuf.x[mBase + r * TILE_J + c]);
+                    ts += w * mv;
+                }
+                mRow[r] = m_new;
+                lRow[r] = ls;
+                tRow[r] = ts;
+            }
         }
-        s *= scale;
-        float m_new = max(m, s);
-        denom = denom * exp(m - m_new) + exp(s - m_new);
-        m = m_new;
+
+        // Pass B: accumulate dQ for kd blocks
+        for (uint kd0 = 0u; kd0 < Dh; kd0 += SUB_TILE) {
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> dQSub =
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+
+            for (uint j0 = 0u; j0 < N; j0 += TILE_J) {
+                // Recompute S and M tiles
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> sTile =
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+                for (uint k0 = 0u; k0 < Dh; k0 += SUB_TILE) {
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> qMat;
+                    uint qOff = baseQ_B + i0 * D + h * Dh + k0;
+                    coopMatLoad(qMat, qBuf.x, qOff, D, gl_CooperativeMatrixLayoutRowMajor);
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> kMat;
+                    uint kOff = baseK_B + j0 * Dh + k0;
+                    coopMatLoad(kMat, kBuf.x, kOff, Dh, gl_CooperativeMatrixLayoutColumnMajor);
+                    sTile = coopMatMulAdd(qMat, kMat, sTile);
+                }
+                coopMatStore(sTile, scratchBuf.x, pBase, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
+
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> mTile2 =
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+                for (uint k0 = 0u; k0 < Dh; k0 += SUB_TILE) {
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> doMat;
+                    uint doOff = baseDO_B + i0 * D + h * Dh + k0;
+                    coopMatLoad(doMat, dOBuf.x, doOff, D, gl_CooperativeMatrixLayoutRowMajor);
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> vMat;
+                    uint vOff = baseV_B + j0 * Dh + k0;
+                    coopMatLoad(vMat, vBuf.x, vOff, Dh, gl_CooperativeMatrixLayoutColumnMajor);
+                    mTile2 = coopMatMulAdd(doMat, vMat, mTile2);
+                }
+                coopMatStore(mTile2, scratchBuf.x, mBase, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
+
+                // Build alpha = (M - t) * P, with P = exp(s - m)/l, and include scale factor here
+                for (uint r = 0u; r < TILE_M; ++r) {
+                    float inv_l = 1.0 / max(lRow[r], 1e-20);
+                    float mr = mRow[r];
+                    float tr = tRow[r];
+                    for (uint c = 0u; c < TILE_J; ++c) {
+                        float s = float(scratchBuf.x[pBase + r * TILE_J + c]) * scale;
+                        float p = exp(s - mr) * inv_l;
+                        float mv = float(scratchBuf.x[mBase + r * TILE_J + c]);
+                        float alpha = (mv - tr) * p * scale; // include scale for dQ
+                        scratchBuf.x[mBase + r * TILE_J + c] = float16_t(alpha);
+                    }
+                }
+
+                // dQ_sub += alpha(16x16) * K_block(16x16)
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> aMat;
+                coopMatLoad(aMat, scratchBuf.x, mBase, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> kbMat;
+                uint kbOff = baseK_B + j0 * Dh + kd0;
+                coopMatLoad(kbMat, kBuf.x, kbOff, Dh, gl_CooperativeMatrixLayoutRowMajor);
+                dQSub = coopMatMulAdd(aMat, kbMat, dQSub);
+            }
+
+            // Store dQ_sub to dQ buffer (rows i0..i0+15, cols kd0..kd0+15 within head h)
+            uint dqOff = baseDQ_B + i0 * D + h * Dh + kd0;
+            coopMatStore(dQSub, dQBuf.x, dqOff, D, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        return;
     }
 
-    // Compute t = sum_k P[i,k]*dot(dO[i,:],V[k,:])
-    float t = 0.0;
-    for (uint kIdx = 0u; kIdx < N; ++kIdx) {
-        // compute exp(s_k - m)
-        uint kRow = baseK + kIdx * D;
-        float s = 0.0;
-        for (uint d = 0u; d < D; ++d) {
-            float qv = float_buffer[qBufferRID].at[qRow + d];
-            float kv = float_buffer[kBufferRID].at[kRow + d];
-            s += qv * kv;
-        }
-        s *= scale;
-        float w = exp(s - m);
-        float p = w / max(denom, 1e-20);
+    // mode 1: dK and dV pass: grid over (jTile, B). Loop over H and iTiles inside.
+    uint tileCol = gl_WorkGroupID.y;
+    uint b = gl_WorkGroupID.z;
+    if (b >= B) return;
+    uint j0 = tileCol * TILE_J;
 
-        // dot(dO[i,:], V[k,:])
-        float dot_dO_V = 0.0;
-        uint dORow = baseDO + i * D;
-        uint vRow = baseV + kIdx * D;
-        for (uint d = 0u; d < D; ++d) {
-            float dov = float_buffer[dOBufferRID].at[dORow + d];
-            float vv = float_buffer[vBufferRID].at[vRow + d];
-            dot_dO_V += dov * vv;
-        }
-        t += p * dot_dO_V;
-    }
+    uint baseQ_B = b * (N * D);
+    uint baseK_B = b * (N * Dh);
+    uint baseV_B = b * (N * Dh);
+    uint baseDO_B = b * (N * D);
+    uint baseDK_B = b * (N * Dh);
+    uint baseDV_B = b * (N * Dh);
 
-    // Accumulate dQ[i,:] and dV, and partial dK
-    // Initialize local accumulators for dQ[i,:]
-    float dQlocal = 0.0; // unused placeholder to ensure valid GLSL syntax in some drivers
-    for (uint d = 0u; d < D; ++d) {
-        float dQid = 0.0;
-        for (uint j = 0u; j < N; ++j) {
-            // P[i,j]
-            uint kRow = baseK + j * D;
-            float s = 0.0;
-            for (uint kd = 0u; kd < D; ++kd) {
-                float qv = float_buffer[qBufferRID].at[qRow + kd];
-                float kv = float_buffer[kBufferRID].at[kRow + kd];
-                s += qv * kv;
+    // Use scratch tile area indexed by (b, 0, tileRow) like forward, safe as each workgroup uses distinct tileCol for stores
+    uint tilesPerBH = N / TILE_M;
+
+    for (uint kd0 = 0u; kd0 < Dh; kd0 += SUB_TILE) {
+        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> dKSub =
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> dVSub =
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+
+        for (uint h = 0u; h < H; ++h) {
+            for (uint tileRow = 0u; tileRow < N / TILE_M; ++tileRow) {
+                uint i0 = tileRow * TILE_M;
+
+                // Scratch bases for this (b,h,tileRow)
+                uint bh = b * H + h;
+                uint tileLinear = bh * tilesPerBH + tileRow;
+                uint otileCount = TILE_M * Dh;
+                uint ptileCount = TILE_M * TILE_J;
+                uint scratchPerTile = otileCount + ptileCount;
+                uint scratchBase = tileLinear * scratchPerTile;
+                uint pBase = scratchBase;              // reuse for temporary S/P
+                uint aBase = scratchBase + ptileCount; // reuse for temporary M/alpha
+
+                // Pass A: compute m,l,t for this i tile
+                float mRow[TILE_M];
+                float lRow[TILE_M];
+                float tRow[TILE_M];
+                [[unroll]] for (uint r = 0u; r < TILE_M; ++r) { mRow[r] = -3.402823466e+38; lRow[r] = 0.0; tRow[r] = 0.0; }
+                for (uint jj = 0u; jj < N; jj += TILE_J) {
+                    // S tile
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> sTile =
+                        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+                    for (uint k0 = 0u; k0 < Dh; k0 += SUB_TILE) {
+                        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> qMat;
+                        uint qOff = baseQ_B + i0 * D + h * Dh + k0;
+                        coopMatLoad(qMat, qBuf.x, qOff, D, gl_CooperativeMatrixLayoutRowMajor);
+                        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> kMat;
+                        uint kOff = baseK_B + jj * Dh + k0;
+                        coopMatLoad(kMat, kBuf.x, kOff, Dh, gl_CooperativeMatrixLayoutColumnMajor);
+                        sTile = coopMatMulAdd(qMat, kMat, sTile);
+                    }
+                    coopMatStore(sTile, scratchBuf.x, pBase, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
+
+                    // M tile
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> mTile =
+                        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+                    for (uint k0 = 0u; k0 < Dh; k0 += SUB_TILE) {
+                        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> doMat;
+                        uint doOff = baseDO_B + i0 * D + h * Dh + k0;
+                        coopMatLoad(doMat, dOBuf.x, doOff, D, gl_CooperativeMatrixLayoutRowMajor);
+                        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> vMat;
+                        uint vOff = baseV_B + jj * Dh + k0;
+                        coopMatLoad(vMat, vBuf.x, vOff, Dh, gl_CooperativeMatrixLayoutColumnMajor);
+                        mTile = coopMatMulAdd(doMat, vMat, mTile);
+                    }
+                    coopMatStore(mTile, scratchBuf.x, aBase, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
+
+                    for (uint r = 0u; r < TILE_M; ++r) {
+                        float m_new = mRow[r];
+                        [[unroll]] for (uint c = 0u; c < TILE_J; ++c) {
+                            float s = float(scratchBuf.x[pBase + r * TILE_J + c]) * scale;
+                            m_new = max(m_new, s);
+                        }
+                        float ls = lRow[r] * exp(mRow[r] - m_new);
+                        float ts = tRow[r] * exp(mRow[r] - m_new);
+                        for (uint c = 0u; c < TILE_J; ++c) {
+                            float s = float(scratchBuf.x[pBase + r * TILE_J + c]) * scale;
+                            float w = exp(s - m_new);
+                            ls += w;
+                            float mv = float(scratchBuf.x[aBase + r * TILE_J + c]);
+                            ts += w * mv;
+                        }
+                        mRow[r] = m_new;
+                        lRow[r] = ls;
+                        tRow[r] = ts;
+                    }
+                }
+
+                // Compute only current j0 tile contributions
+                // Recompute S and M tiles for j0
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> sTile2 =
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+                for (uint k0 = 0u; k0 < Dh; k0 += SUB_TILE) {
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> qMat;
+                    uint qOff = baseQ_B + i0 * D + h * Dh + k0;
+                    coopMatLoad(qMat, qBuf.x, qOff, D, gl_CooperativeMatrixLayoutRowMajor);
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> kMat;
+                    uint kOff = baseK_B + j0 * Dh + k0;
+                    coopMatLoad(kMat, kBuf.x, kOff, Dh, gl_CooperativeMatrixLayoutColumnMajor);
+                    sTile2 = coopMatMulAdd(qMat, kMat, sTile2);
+                }
+                coopMatStore(sTile2, scratchBuf.x, pBase, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
+
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> mTile2 =
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+                for (uint k0 = 0u; k0 < Dh; k0 += SUB_TILE) {
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> doMat;
+                    uint doOff = baseDO_B + i0 * D + h * Dh + k0;
+                    coopMatLoad(doMat, dOBuf.x, doOff, D, gl_CooperativeMatrixLayoutRowMajor);
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> vMat;
+                    uint vOff = baseV_B + j0 * Dh + k0;
+                    coopMatLoad(vMat, vBuf.x, vOff, Dh, gl_CooperativeMatrixLayoutColumnMajor);
+                    mTile2 = coopMatMulAdd(doMat, vMat, mTile2);
+                }
+                coopMatStore(mTile2, scratchBuf.x, aBase, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
+
+                // Build Ptile in pBase and alpha in aBase (scaled for dK)
+                for (uint r = 0u; r < TILE_M; ++r) {
+                    float inv_l = 1.0 / max(lRow[r], 1e-20);
+                    float mr = mRow[r];
+                    float tr = tRow[r];
+                    for (uint c = 0u; c < TILE_J; ++c) {
+                        float s = float(scratchBuf.x[pBase + r * TILE_J + c]) * scale;
+                        float p = exp(s - mr) * inv_l;
+                        float mv = float(scratchBuf.x[aBase + r * TILE_J + c]);
+                        float alpha = (mv - tr) * p * scale; // include scale for dK
+                        scratchBuf.x[pBase + r * TILE_J + c] = float16_t(p);      // Ptile
+                        scratchBuf.x[aBase + r * TILE_J + c] = float16_t(alpha);  // alpha
+                    }
+                }
+
+                // dV_sub += P^T(16x16) * dO_tile(16x16)
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> pT;
+                coopMatLoad(pT, scratchBuf.x, pBase, TILE_M, gl_CooperativeMatrixLayoutColumnMajor);
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> doBlk;
+                uint doOffBlk = baseDO_B + i0 * D + h * Dh + kd0;
+                coopMatLoad(doBlk, dOBuf.x, doOffBlk, D, gl_CooperativeMatrixLayoutRowMajor);
+                dVSub = coopMatMulAdd(pT, doBlk, dVSub);
+
+                // dK_sub += alpha^T(16x16) * Q_tile(16x16)
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> aT;
+                coopMatLoad(aT, scratchBuf.x, aBase, TILE_M, gl_CooperativeMatrixLayoutColumnMajor);
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> qBlk;
+                uint qOffBlk = baseQ_B + i0 * D + h * Dh + kd0;
+                coopMatLoad(qBlk, qBuf.x, qOffBlk, D, gl_CooperativeMatrixLayoutRowMajor);
+                dKSub = coopMatMulAdd(aT, qBlk, dKSub);
             }
-            s *= scale;
-            float w = exp(s - m);
-            float p = w / max(denom, 1e-20);
-
-            // alpha = (dot(dO[i,:], V[j,:]) - t) * p
-            float dot_dO_V = 0.0;
-            uint dORow = baseDO + i * D;
-            uint vRow = baseV + j * D;
-            for (uint vd = 0u; vd < D; ++vd) {
-                float dov = float_buffer[dOBufferRID].at[dORow + vd];
-                float vv = float_buffer[vBufferRID].at[vRow + vd];
-                dot_dO_V += dov * vv;
-            }
-            float alpha = (dot_dO_V - t) * p;
-
-            // dQ[i,d] += alpha * K[j,d] * scale
-            float kdval = float_buffer[kBufferRID].at[kRow + d];
-            dQid += alpha * kdval * scale;
-
-            // dK[j,d] += alpha * Q[i,d] * scale  (accumulate atomically)
-            float qidval = float_buffer[qBufferRID].at[qRow + d];
-            atomicAdd(float_buffer[dKBufferRID].at[baseDK + j * D + d], alpha * qidval * scale);
-
-            // dV[j,d] += P[i,j] * dO[i,d] (accumulate atomically)
-            float dovd = float_buffer[dOBufferRID].at[dORow + d];
-            atomicAdd(float_buffer[dVBufferRID].at[baseDV + j * D + d], p * dovd);
         }
-        // write dQ[i,d]
-        float_buffer[dQBufferRID].at[baseDQ + i * D + d] += dQid;
+
+        // Store dV_sub and dK_sub for this (b, j0..j0+15, kd0..kd0+15)
+        uint dvOff = baseDV_B + j0 * Dh + kd0;
+        uint dkOff = baseDK_B + j0 * Dh + kd0;
+        coopMatStore(dVSub, dVBuf.x, dvOff, Dh, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(dKSub, dKBuf.x, dkOff, Dh, gl_CooperativeMatrixLayoutRowMajor);
     }
 }
-
-

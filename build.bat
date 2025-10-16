@@ -4,4 +4,8 @@ glslc shaders/matmul.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/matmul.
 glslc shaders/mse_loss.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/mse_loss.comp.spv &&^
 glslc shaders/sgd.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/sgd.comp.spv &&^
 glslc shaders/add.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/add.comp.spv &&^
+glslc shaders/transpose.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/transpose.comp.spv &&^
+glslc shaders/transpose_bwd.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/transpose_bwd.comp.spv &&^
+glslc shaders/flash_attention.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/flash_attention.comp.spv &&^
+glslc shaders/flash_attention_bwd.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/flash_attention_bwd.comp.spv &&^
 build\evk_example.exe

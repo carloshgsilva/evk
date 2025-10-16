@@ -1,7 +1,9 @@
 #include "evk.frag"
 
-// Backward transpose is identical to forward: transpose is its own inverse.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
 
+// Backward transpose is identical to forward.
 PUSH(
     int inRID;
     int outRID;
@@ -10,8 +12,8 @@ PUSH(
     uint dimJ;
 )
 
-BINDING_BUFFER_RW(float_buffer,
-    float at[];
+BINDING_BUFFER_RW(fp16_buffer,
+    float16_t at[];
 )
 
 COMPUTE(64, 1, 1)
@@ -31,10 +33,9 @@ void main() {
     uint c = elem % cols;
 
     uint inIdx = batchBase + r * cols + c;
-    float v = float_buffer[inRID].at[inIdx];
+    float v = float(fp16_buffer[inRID].at[inIdx]);
 
     uint outIdx = batchBase + c * rows + r;
-    float_buffer[outRID].at[outIdx] = v;
+    fp16_buffer[outRID].at[outIdx] = float16_t(v);
 }
-
 
