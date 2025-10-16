@@ -277,6 +277,14 @@ struct Tensor {
         cpu_upload();
         return *this;
     }
+    Tensor& fill(float16_t val = float16_t(0.0f)) {
+        float16_t* data = cpu();
+        for (uint32_t i = 0; i < shape.count(); ++i) {
+            data[i] = val;
+        }
+        cpu_upload();
+        return *this;
+    }
 
     float16_t item() {
         assert(shape.count() == 1);
@@ -380,20 +388,32 @@ namespace evk::ai {
         evk::Pipeline mse_loss;
         evk::Pipeline sgd;
         evk::Pipeline add;
+        evk::Buffer flash_scratch;
+        uint32_t flash_scratch_elems = 0;
     };
     std::unique_ptr<Pipelines> pipelines;
 
+    // Generic hash combine function for creating hash keys from multiple values
+    template<typename... Types>
+    static uint64_t hash_combine(Types... values) {
+        uint64_t hash = 14695981039346656037ULL; // FNV offset basis
+        ((hash ^= std::hash<Types>{}(values),
+          hash *= 1099511628211ULL), ...);
+        return hash;
+    }
+
     struct MatMulConfig{
+        uint16_t m;
         uint16_t k;
         uint16_t n;
         uint8_t tile_m;
         uint8_t tile_n;
         uint8_t acc_c;
-        uint8_t transpose_a: 1;
-        uint8_t transpose_b: 1;
-    
+        uint8_t transpose_a;
+        uint8_t transpose_b;
+
         operator uint64_t() const {
-            return *(uint64_t*)this;
+            return hash_combine(m, k, n, tile_m, tile_n, acc_c, transpose_a, transpose_b);
         }
     };
     
@@ -409,6 +429,7 @@ namespace evk::ai {
             .name = "matmul",
             .CS = evk::loadSpirvFile("shaders/bin/matmul.comp.spv"),
             .constants = evk::Constant{
+                uint32_t(config.m),
                 uint32_t(config.k),
                 uint32_t(config.n),
                 uint32_t(config.tile_m),
@@ -445,6 +466,8 @@ namespace evk::ai {
             .name = "add",
             .CS = evk::loadSpirvFile("shaders/bin/add.comp.spv"),
         });
+        pipelines->flash_scratch = {};
+        pipelines->flash_scratch_elems = 0;
     }
     void shutdown() {
         pipelines.reset();
@@ -455,26 +478,46 @@ namespace evk::ai {
     // (...B, M, N) = (...B, M, K) * (...B, K, N)
     void matmul(Tensor& a, Tensor& b, Tensor& c, bool transpose_a = false, bool transpose_b = false, bool acc_c = false, uint8_t TILE_M = 80u, uint8_t TILE_N = 80u) {
         const uint32_t TILE_K = 16u;
-        assert(a.shape[-2] % TILE_M == 0);
-        assert(a.shape[-1] % TILE_K == 0);
-        assert(b.shape[-2] % TILE_K == 0);
-        assert(b.shape[-1] % TILE_N == 0);
-        assert(c.shape[-2] % TILE_M == 0);
-        assert(c.shape[-1] % TILE_N == 0);
+
+        // Basic rank and batch compatibility
         assert(a.shape.rank() >= 2);
         assert(b.shape.rank() >= 2);
         assert(c.shape.rank() >= 2);
         assert(a.shape.batch_size(2) == b.shape.batch_size(2));
-        assert(a.shape[-1] == b.shape[-2]);
+        assert(a.shape.batch_size(2) == c.shape.batch_size(2));
 
-        // Determine batch size B. If tensor rank >= 3 use first dim as batch, otherwise 1.
+        // Logical matrix dimensions honoring transpose flags
+        // A logical dims: (M x K) if !transpose_a, else (K x M)
+        // B logical dims: (K x N) if !transpose_b, else (N x K)
+        uint32_t a_rows = transpose_a ? a.shape[-1] : a.shape[-2];
+        uint32_t a_cols = transpose_a ? a.shape[-2] : a.shape[-1];
+        uint32_t b_rows = transpose_b ? b.shape[-1] : b.shape[-2];
+        uint32_t b_cols = transpose_b ? b.shape[-2] : b.shape[-1];
+        printf("a_rows = %d, a_cols = %d, b_rows = %d, b_cols = %d\n", a_rows, a_cols, b_rows, b_cols);
+
+        // Inner dimension must match
+        assert(a_cols == b_rows);
+
+        // Output C must be (M x N) where M=a_rows, N=b_cols
+        assert(c.shape[-2] == a_rows);
+        assert(c.shape[-1] == b_cols);
+
+        // Determine batch size B. If tensor rank >= 3 use batch product, otherwise 1.
         uint32_t batch = 1;
         if (a.shape.rank() >= 3) batch = a.shape.batch_size(2);
 
-        // infer matrix dims: A is M x K, B is K x N
-        uint32_t M = a.shape[-2];
-        uint32_t K = a.shape[-1];
-        uint32_t N = b.shape[-1];
+        // Tile compatibility with physical tensor strides: we operate on the logical dims
+        uint32_t M = a_rows;
+        uint32_t K = a_cols;
+        uint32_t N = b_cols;
+
+        // Optional tile divisibility assertions (match shader tile assumptions)
+        assert(M % TILE_M == 0);
+        assert(K % TILE_K == 0);
+        assert(K % TILE_K == 0); // for B's K
+        assert(N % TILE_N == 0);
+        assert(c.shape[-2] % TILE_M == 0);
+        assert(c.shape[-1] % TILE_N == 0);
 
         evk::CmdPush(evk::Constant{
             a.buffer.GetReference(),
@@ -485,6 +528,7 @@ namespace evk::ai {
         uint32_t tilesCols = N / TILE_N; // columns
         uint32_t tilesRows = M / TILE_M; // rows
         evk::CmdBind(get_matmul_pipeline(MatMulConfig{
+            .m = uint16_t(M),
             .k = uint16_t(K),
             .n = uint16_t(N),
             .tile_m = TILE_M,
@@ -519,30 +563,143 @@ namespace evk::ai {
         assert(D % Dh == 0);
         uint32_t H = D / Dh;
 
-        const uint32_t TILE = 32u;
-        assert(D % TILE == 0); // D must be divisible by TILE
-        assert(N % TILE == 0); // N must be divisible by TILE
-
         float scale = 1.0f / std::sqrt(float(Dh));
+        // Allocate/resize scratch buffer for tiled coopmat kernel
+        // Elements per tile: Otile (16*Dh) + Ptile (16*16)
+        const uint32_t TILE_M = 16u;
+        const uint32_t TILE_J = 16u;
+        uint32_t tilesPerBH = (N + TILE_M - 1u) / TILE_M;
+        uint32_t perTileElems = TILE_M * Dh + TILE_M * TILE_J;
+        uint32_t totalElems = B * H * tilesPerBH * perTileElems;
+        if (!pipelines->flash_scratch || pipelines->flash_scratch_elems < totalElems) {
+            if (pipelines->flash_scratch) {
+                pipelines->flash_scratch = {};
+            }
+            pipelines->flash_scratch = evk::CreateBuffer({
+                .size = uint64_t(totalElems) * sizeof(float16_t),
+                .usage = evk::BufferUsage::Storage,
+            });
+            pipelines->flash_scratch_elems = totalElems;
+        }
 
         evk::CmdBind(pipelines->flash_attn);
         evk::CmdPush(evk::Constant{
-            q.buffer.GetRID(),
-            k.buffer.GetRID(),
-            v.buffer.GetRID(),
-            o.buffer.GetRID(),
+            q.buffer.GetReference(),
+            k.buffer.GetReference(),
+            v.buffer.GetReference(),
+            o.buffer.GetReference(),
+            pipelines->flash_scratch.GetReference(),
             B, H, N, D,
             scale
         });
 
-        uint32_t groupX = D / TILE; // parallel Q (H*Dh = D)
-        uint32_t groupY = 1u;       // sequence length N (loop inside kernel)
-        uint32_t groupZ = B;        // one invocation per (b)
+        // Dispatch over (tileRows, B*H)
+        uint32_t groupX = 1u;
+        uint32_t groupY = (N + TILE_M - 1u) / TILE_M;
+        uint32_t groupZ = B * H;
         evk::CmdDispatch(groupX, groupY, groupZ);
     }
 
     void flash_attention_bwd(Tensor& q, Tensor& k, Tensor& v, Tensor& o, Tensor& dO, Tensor& dQ, Tensor& dK, Tensor& dV, uint32_t heads = 0) {
+        assert(q.shape.rank() == 3);
+        assert(k.shape.rank() == 3);
+        assert(v.shape.rank() == 3);
+        assert(o.shape.rank() == 3);
+        assert(dO.shape.rank() == 3);
+        assert(dQ.shape.rank() == 3);
+        assert(dK.shape.rank() == 3);
+        assert(dV.shape.rank() == 3);
 
+        uint32_t B = q.shape[0];
+        uint32_t N = q.shape[1];
+        uint32_t D = q.shape[2];
+        uint32_t Dh = k.shape[2];
+        assert(k.shape[0] == B && k.shape[1] == N && v.shape[0] == B && v.shape[1] == N);
+        assert(o.shape[0] == B && o.shape[1] == N && o.shape[2] == D);
+        assert(dO.shape[0] == B && dO.shape[1] == N && dO.shape[2] == D);
+        assert(dQ.shape[0] == B && dQ.shape[1] == N && dQ.shape[2] == D);
+        assert(dK.shape[0] == B && dK.shape[1] == N && dK.shape[2] == Dh);
+        assert(dV.shape[0] == B && dV.shape[1] == N && dV.shape[2] == Dh);
+        assert(D % Dh == 0);
+        uint32_t H = D / Dh;
+        if (heads != 0) {
+            assert(heads == H);
+        }
+
+        float scale = 1.0f / std::sqrt(float(Dh));
+
+        // Zero-out dQ, dK, dV before writing (since shader writes absolute values, this is optional,
+        // but we keep it to avoid stale data if shapes shrink across runs)
+        {
+            float16_t* z;
+            z = dQ.cpu(); memset(z, 0, sizeof(float16_t) * dQ.shape.count()); dQ.cpu_upload();
+            z = dK.cpu(); memset(z, 0, sizeof(float16_t) * dK.shape.count()); dK.cpu_upload();
+            z = dV.cpu(); memset(z, 0, sizeof(float16_t) * dV.shape.count()); dV.cpu_upload();
+        }
+
+        // Pass 1: compute dQ (mode = 0). Grid over (iTiles=N/16, B*H)
+        evk::CmdBind(pipelines->flash_attn_bwd);
+        struct FlashBwdPush {
+            uint64_t qBuf;
+            uint64_t kBuf;
+            uint64_t vBuf;
+            uint64_t oBuf;
+            uint64_t dOBuf;
+            uint64_t dQBuf;
+            uint64_t dKBuf;
+            uint64_t dVBuf;
+            uint64_t scratchBuf;
+            uint32_t B;
+            uint32_t H;
+            uint32_t N;
+            uint32_t D;
+            float scale;
+            uint32_t mode;
+        } push0 = {
+            q.buffer.GetReference(),
+            k.buffer.GetReference(),
+            v.buffer.GetReference(),
+            o.buffer.GetReference(),
+            dO.buffer.GetReference(),
+            dQ.buffer.GetReference(),
+            dK.buffer.GetReference(),
+            dV.buffer.GetReference(),
+            pipelines->flash_scratch.GetReference(),
+            B, H, N, D,
+            scale,
+            0u,
+        };
+        evk::CmdPush(push0);
+        {
+            const uint32_t TILE_M = 16u;
+            uint32_t tilesI = (N + TILE_M - 1u) / TILE_M;
+            evk::CmdDispatch(1u, tilesI, B * H);
+        }
+        evk::CmdBarrier();
+
+        // Pass 2: compute dK and dV (mode = 1). Grid over (jTiles=N/16, B)
+        evk::CmdBind(pipelines->flash_attn_bwd);
+        FlashBwdPush push1 = {
+            q.buffer.GetReference(),
+            k.buffer.GetReference(),
+            v.buffer.GetReference(),
+            o.buffer.GetReference(),
+            dO.buffer.GetReference(),
+            dQ.buffer.GetReference(),
+            dK.buffer.GetReference(),
+            dV.buffer.GetReference(),
+            pipelines->flash_scratch.GetReference(),
+            B, H, N, D,
+            scale,
+            1u,
+        };
+        evk::CmdPush(push1);
+        {
+            const uint32_t TILE_J = 16u;
+            uint32_t tilesJ = (N + TILE_J - 1u) / TILE_J;
+            evk::CmdDispatch(1u, tilesJ, B);
+        }
+        evk::CmdBarrier();
     }
 
     // MSE Loss: (1/N) * sum(predicted - target)^2
@@ -867,6 +1024,243 @@ void test_mse_loss() {
     TEST(grad_cpu[2] == float16_t(1.0f));
 }
 
+void test_flash_attention_forward_small() {
+    printf("test_flash_attention_forward_small()\n");
+
+    const uint32_t B = 1u;
+    const uint32_t N = 16u; // multiples of 16 for coopmat tiles
+    const uint32_t Dh = 16u; // multiples of 16
+    const uint32_t H = 2u;
+    const uint32_t D = H * Dh;
+
+    Tensor q({B, N, D});
+    Tensor k({B, N, Dh});
+    Tensor v({B, N, Dh});
+    Tensor o({B, N, D});
+
+    // Fill Q with zeros (softmax should be uniform if K==0)
+    {
+        float16_t* qp = q.cpu();
+        for (uint32_t i = 0; i < q.shape.count(); ++i) qp[i] = float16_t(0.0f);
+        q.cpu_upload();
+    }
+    // Fill K with zeros so s=0 -> uniform softmax over j
+    {
+        float16_t* kp = k.cpu();
+        for (uint32_t i = 0; i < k.shape.count(); ++i) kp[i] = float16_t(0.0f);
+        k.cpu_upload();
+    }
+    // Fill V with simple pattern v[j,kd] = j + kd
+    {
+        float16_t* vp = v.cpu();
+        for (uint32_t j = 0; j < N; ++j) {
+            for (uint32_t kd = 0; kd < Dh; ++kd) {
+                vp[j * Dh + kd] = float16_t(float(j + kd));
+            }
+        }
+        v.cpu_upload();
+    }
+
+    evk::ai::flash_attention(q, k, v, o);
+    o.cpu_download();
+    float16_t* op = o.cpu();
+
+    // Expected: O[i, h, kd] = mean_j V[j, kd]
+    float expectedMean[16] = {};
+    for (uint32_t kd = 0; kd < Dh; ++kd) {
+        float sum = 0.0f;
+        for (uint32_t j = 0; j < N; ++j) sum += float(j + kd);
+        expectedMean[kd] = sum / float(N);
+    }
+
+    bool ok = true;
+    for (uint32_t i = 0; i < N; ++i) {
+        for (uint32_t h = 0; h < H; ++h) {
+            for (uint32_t kd = 0; kd < Dh; ++kd) {
+                uint32_t idx = (i * D) + (h * Dh) + kd;
+                float got = float(op[idx]);
+                float expv = expectedMean[kd];
+                if (std::abs(got - expv) > 1e-3f) {
+                    ok = false;
+                }
+            }
+        }
+    }
+    TEST(ok);
+}
+
+void test_flash_attention_backward_trivial() {
+    printf("test_flash_attention_backward_trivial()\n");
+
+    const uint32_t B = 1u;
+    const uint32_t N = 16u; // tile-aligned
+    const uint32_t Dh = 16u; // tile-aligned
+    const uint32_t H = 2u;
+    const uint32_t D = H * Dh;
+
+    Tensor q({B, N, D});
+    Tensor k({B, N, Dh});
+    Tensor v({B, N, Dh});
+    Tensor o({B, N, D});
+    Tensor dO({B, N, D});
+    Tensor dQ({B, N, D});
+    Tensor dK({B, N, Dh});
+    Tensor dV({B, N, Dh});
+
+    // Use values such that softmax uniform (K=0), V=0 -> simplifies expectations
+    {
+        float16_t* qp = q.cpu();
+        for (uint32_t i = 0; i < q.shape.count(); ++i) qp[i] = float16_t(0.0f);
+        q.cpu_upload();
+        float16_t* kp = k.cpu();
+        for (uint32_t i = 0; i < k.shape.count(); ++i) kp[i] = float16_t(0.0f);
+        k.cpu_upload();
+        float16_t* vp = v.cpu();
+        for (uint32_t i = 0; i < v.shape.count(); ++i) vp[i] = float16_t(0.0f);
+        v.cpu_upload();
+    }
+
+    // dO pattern: d for each channel
+    {
+        float16_t* dop = dO.cpu();
+        for (uint32_t d = 0; d < D; ++d) dop[d] = float16_t(float(d + 1));
+        dO.cpu_upload();
+    }
+
+    evk::ai::flash_attention_bwd(q, k, v, o, dO, dQ, dK, dV);
+
+    dQ.cpu_download();
+    dK.cpu_download();
+    dV.cpu_download();
+
+    // With K=0 and V=0, softmax is uniform; dQ and dK should be ~0, dV equals row-wise mean of dO per kd across i=0..N-1
+    bool ok_dQ = true, ok_dK = true, ok_dV = true;
+    for (uint32_t i = 0; i < N; ++i) {
+        for (uint32_t d = 0; d < D; ++d) {
+            if (std::abs(float(dQ.cpu()[i*D + d])) > 1e-2f) ok_dQ = false;
+        }
+    }
+    for (uint32_t j = 0; j < N; ++j) {
+        for (uint32_t kd = 0; kd < Dh; ++kd) {
+            if (std::abs(float(dK.cpu()[j*Dh + kd])) > 1e-2f) ok_dK = false;
+        }
+    }
+    for (uint32_t j = 0; j < N; ++j) {
+        for (uint32_t kd = 0; kd < Dh; ++kd) {
+            float mean = 0.0f;
+            for (uint32_t i = 0; i < N; ++i) {
+                for (uint32_t h = 0; h < H; ++h) mean += float(dO.cpu()[i*D + h*Dh + kd]);
+            }
+            mean /= float(N);
+            float got = float(dV.cpu()[j*Dh + kd]);
+            if (std::abs(got - mean) > 5e-2f) ok_dV = false;
+        }
+    }
+    TEST(ok_dQ);
+    TEST(ok_dK);
+    TEST(ok_dV);
+}
+
+void test_flash_attention_forward_values() {
+    printf("test_flash_attention_forward_values() \n");
+    // Validate forward FlashAttention against a hand-computed case.
+    // Setup: B=1, H=1, N=16, Dh=16. K is identity so s(i,j)=Q[i,j].
+    // V[j,kd] = j + kd so O[i,kd] = sum_j softmax(scale*Q[i,j]) * (j + kd)
+    //                                          = (sum_j p_j * j) + kd
+    const uint32_t B = 1u;
+    const uint32_t N = 1024u*16u;
+    const uint32_t Dh = 64u;
+    const uint32_t H = 1u;
+    const uint32_t D = H * Dh;
+
+    Tensor q({B, N, D});
+    Tensor k({B, N, Dh});
+    Tensor v({B, N, Dh});
+    Tensor o({B, N, D});
+    Tensor o_mat({B, N, N});
+    printf("o_out.address: %p\n", o.buffer.GetReference());
+    printf("N_size: %.2f MB\n", float(N*N*sizeof(float16_t)) / 1024.0f / 1024.0f);
+
+    // Q[i,j] = j for all i
+    {
+        float16_t* qp = q.cpu();
+        for (uint32_t i = 0; i < N; ++i) {
+            for (uint32_t kd = 0; kd < D; ++kd) {
+                qp[i * D + kd] = float16_t(float(kd));
+            }
+        }
+        q.cpu_upload();
+    }
+
+    // K[j,kd] = 1 if kd==j else 0
+    {
+        float16_t* kp = k.cpu();
+        for (uint32_t j = 0; j < N; ++j) {
+            for (uint32_t kd = 0; kd < Dh; ++kd) {
+                kp[j * Dh + kd] = float16_t(kd == j ? 1.0f : 0.0f);
+            }
+        }
+        k.cpu_upload();
+    }
+
+    // V[j,kd] = j + kd
+    {
+        float16_t* vp = v.cpu();
+        for (uint32_t j = 0; j < N; ++j) {
+            for (uint32_t kd = 0; kd < Dh; ++kd) {
+                vp[j * Dh + kd] = float16_t(float(j + kd));
+            }
+        }
+        v.cpu_upload();
+    }
+
+    q.fill(float16_t(1.0f));
+    k.fill(float16_t(1.0f));
+    v.fill(float16_t(1.0f));
+    // o_mat.fill(float16_t(0.0f));
+
+    // Run forward
+    evk::CmdTimestamp("flash_attention", [&]() {
+        evk::ai::flash_attention(q, k, v, o);
+    });
+    evk::CmdTimestamp("matmul", [&]() {
+        evk::ai::matmul(q, k, o_mat, false, true, false, 64, 64);
+    });
+    o_mat.print();
+    o.cpu_download();
+    for(auto& ts : evk::GetTimestamps()) {
+        printf("timestamp: %s, %f\n", ts.name, float(ts.end - ts.start));
+    }
+
+    // Expected: p_j = softmax(scale * j), scale = 1/sqrt(Dh)
+    const float scale = 1.0f / std::sqrt(float(Dh));
+    float logits[16];
+    for (uint32_t j = 0; j < N; ++j) logits[j] = scale * float(j);
+    // stable softmax
+    float m = logits[0];
+    for (uint32_t j = 1; j < N; ++j) m = (std::max)(m, logits[j]);
+    float denom = 0.0f;
+    for (uint32_t j = 0; j < N; ++j) denom += std::exp(logits[j] - m);
+    float pj[16];
+    for (uint32_t j = 0; j < N; ++j) pj[j] = std::exp(logits[j] - m) / (denom > 0 ? denom : 1.0f);
+    float expectedWeightedJ = 0.0f;
+    for (uint32_t j = 0; j < N; ++j) expectedWeightedJ += pj[j] * float(j);
+
+    // Compare
+    bool ok = true;
+    float16_t* op = o.cpu();
+    for (uint32_t i = 0; i < N; ++i) {
+        for (uint32_t kd = 0; kd < Dh; ++kd) {
+            float expected = expectedWeightedJ + float(kd);
+            float got = float(op[i * D + kd]);
+            if (std::abs(got - expected) > 5e-2f) {
+                ok = false;
+            }
+        }
+    }
+    TEST(ok);
+}
+
 void test_graph_backward() {
     printf("test_graph_backward() \n");
     Graph graph;
@@ -895,6 +1289,12 @@ void test_graph_backward() {
     TEST(loss_test);
 }
 
+void test_attn_graph() {
+    printf("test_attn_graph() \n");
+    Graph graph;
+    
+}
+
 int main() {
     set_unhandled_exception_filter();
 
@@ -908,10 +1308,13 @@ int main() {
 
     evk::ai::initialize();
 
-    test_add();
-    test_matmul();
-    test_mse_loss();
-    test_graph_backward();
+    // test_add();
+    // test_matmul();
+    // test_mse_loss();
+    // test_flash_attention_forward_small();
+    // test_flash_attention_backward_trivial();
+    test_flash_attention_forward_values();
+    // test_graph_backward();
 
     // benchmark_matmul();
 
