@@ -569,11 +569,11 @@ namespace evk::ai {
 
         float scale = 1.0f / std::sqrt(float(Dh));
         // Allocate/resize scratch buffer for tiled coopmat kernel
-        // Elements per tile: Otile (16*Dh) + Ptile (16*16)
+        // Elements per tile: only Ptile (16*16)
         const uint32_t TILE_M = 16u;
         const uint32_t TILE_J = 16u;
         uint32_t tilesPerBH = (N + TILE_M - 1u) / TILE_M;
-        uint32_t perTileElems = TILE_M * Dh + TILE_M * TILE_J;
+        uint32_t perTileElems = TILE_M * TILE_J;
         uint32_t totalElems = B * H * tilesPerBH * perTileElems;
         if (!pipelines->flash_scratch || pipelines->flash_scratch_elems < totalElems) {
             if (pipelines->flash_scratch) {
@@ -602,6 +602,7 @@ namespace evk::ai {
         uint32_t groupY = (N + TILE_M - 1u) / TILE_M;
         uint32_t groupZ = B * H;
         evk::CmdDispatch(groupX, groupY, groupZ);
+        evk::CmdBarrier();
     }
 
     void flash_attention_bwd(Tensor& q, Tensor& k, Tensor& v, Tensor& o, Tensor& dO, Tensor& dQ, Tensor& dK, Tensor& dV, uint32_t heads = 0) {
@@ -1050,73 +1051,8 @@ void test_mse_loss() {
     TEST(grad_cpu[2] == float16_t(1.0f));
 }
 
-void test_flash_attention_forward_small() {
-    printf("test_flash_attention_forward_small()\n");
-
-    const uint32_t B = 1u;
-    const uint32_t N = 16u; // multiples of 16 for coopmat tiles
-    const uint32_t Dh = 16u; // multiples of 16
-    const uint32_t H = 2u;
-    const uint32_t D = H * Dh;
-
-    Tensor q({B, N, D});
-    Tensor k({B, N, Dh});
-    Tensor v({B, N, Dh});
-    Tensor o({B, N, D});
-
-    // Fill Q with zeros (softmax should be uniform if K==0)
-    {
-        float16_t* qp = q.cpu();
-        for (uint32_t i = 0; i < q.shape.count(); ++i) qp[i] = float16_t(0.0f);
-        q.cpu_upload();
-    }
-    // Fill K with zeros so s=0 -> uniform softmax over j
-    {
-        float16_t* kp = k.cpu();
-        for (uint32_t i = 0; i < k.shape.count(); ++i) kp[i] = float16_t(0.0f);
-        k.cpu_upload();
-    }
-    // Fill V with simple pattern v[j,kd] = j + kd
-    {
-        float16_t* vp = v.cpu();
-        for (uint32_t j = 0; j < N; ++j) {
-            for (uint32_t kd = 0; kd < Dh; ++kd) {
-                vp[j * Dh + kd] = float16_t(float(j + kd));
-            }
-        }
-        v.cpu_upload();
-    }
-
-    evk::ai::flash_attention(q, k, v, o);
-    o.cpu_download();
-    float16_t* op = o.cpu();
-
-    // Expected: O[i, h, kd] = mean_j V[j, kd]
-    float expectedMean[16] = {};
-    for (uint32_t kd = 0; kd < Dh; ++kd) {
-        float sum = 0.0f;
-        for (uint32_t j = 0; j < N; ++j) sum += float(j + kd);
-        expectedMean[kd] = sum / float(N);
-    }
-
-    bool ok = true;
-    for (uint32_t i = 0; i < N; ++i) {
-        for (uint32_t h = 0; h < H; ++h) {
-            for (uint32_t kd = 0; kd < Dh; ++kd) {
-                uint32_t idx = (i * D) + (h * Dh) + kd;
-                float got = float(op[idx]);
-                float expv = expectedMean[kd];
-                if (std::abs(got - expv) > 1e-3f) {
-                    ok = false;
-                }
-            }
-        }
-    }
-    TEST(ok);
-}
-
-void test_flash_attention_backward_trivial() {
-    printf("test_flash_attention_backward_trivial()\n");
+void test_flash_attention_backward() {
+    printf("test_flash_attention_backward()\n");
 
     const uint32_t B = 1u;
     const uint32_t N = 16u; // tile-aligned
@@ -1188,109 +1124,85 @@ void test_flash_attention_backward_trivial() {
 }
 
 void test_flash_attention_cmp_softmax() {
-    printf("test_flash_attention_forward_values() \n");
-    // Validate forward FlashAttention against a hand-computed case.
-    // Setup: B=1, H=1, N=16, Dh=16. K is identity so s(i,j)=Q[i,j].
-    // V[j,kd] = j + kd so O[i,kd] = sum_j softmax(scale*Q[i,j]) * (j + kd)
-    //                                          = (sum_j p_j * j) + kd
+    printf("test_flash_attention_cmp_softmax()\n");
     const uint32_t B = 1u;
-    const uint32_t N = 1024u*16u;
-    const uint32_t Dh = 64u;
+    const uint32_t N = 256u;   // tile aligned
+    const uint32_t Dh = 64u;  // tile aligned
     const uint32_t H = 1u;
     const uint32_t D = H * Dh;
 
     Tensor q({B, N, D});
     Tensor k({B, N, Dh});
     Tensor v({B, N, Dh});
-    Tensor o({B, N, D});
-    Tensor o_mat({B, N, N});
-    printf("o_out.address: %p\n", o.buffer.GetReference());
-    printf("N_size: %.2f MB\n", float(N*N*sizeof(float16_t)) / 1024.0f / 1024.0f);
+    Tensor o_flash({B, N, D});
 
-    // Q[i,j] = j for all i
+    Tensor q_scaled({B, N, D});
+    Tensor s({B, N, N});
+    Tensor p({B, N, N});
+    Tensor o_base({B, N, D});
+
     {
         float16_t* qp = q.cpu();
+        float16_t* kp = k.cpu();
+        float16_t* vp = v.cpu();
         for (uint32_t i = 0; i < N; ++i) {
-            for (uint32_t kd = 0; kd < D; ++kd) {
-                qp[i * D + kd] = float16_t(float(kd));
+            for (uint32_t d = 0; d < D; ++d) {
+                qp[i * D + d] = float16_t(float((i + d) % 13) / 13.0f);
+            }
+        }
+        for (uint32_t j = 0; j < N; ++j) {
+            for (uint32_t kd = 0; kd < Dh; ++kd) {
+                kp[j * Dh + kd] = float16_t(float((j * 7 + kd) % 11) / 11.0f);
+                vp[j * Dh + kd] = float16_t(float((j + 3 * kd) % 17) / 17.0f);
             }
         }
         q.cpu_upload();
-    }
-
-    // K[j,kd] = 1 if kd==j else 0
-    {
-        float16_t* kp = k.cpu();
-        for (uint32_t j = 0; j < N; ++j) {
-            for (uint32_t kd = 0; kd < Dh; ++kd) {
-                kp[j * Dh + kd] = float16_t(kd == j ? 1.0f : 0.0f);
-            }
-        }
         k.cpu_upload();
-    }
-
-    // V[j,kd] = j + kd
-    {
-        float16_t* vp = v.cpu();
-        for (uint32_t j = 0; j < N; ++j) {
-            for (uint32_t kd = 0; kd < Dh; ++kd) {
-                vp[j * Dh + kd] = float16_t(float(j + kd));
-            }
-        }
         v.cpu_upload();
     }
 
-    q.fill(float16_t(1.0f));
-    k.fill(float16_t(1.0f));
-    v.fill(float16_t(1.0f));
-    // o_mat.fill(float16_t(0.0f));
-
-    // Run forward
-    const int ITERS = 8;
-    evk::CmdTimestamp("flash_attention", [&]() {
-        for(int it = 0; it < ITERS; ++it) {
-            evk::ai::flash_attention(q, k, v, o);
+    {
+        float scale = 1.0f / std::sqrt(float(Dh));
+        float16_t* qsp = q_scaled.cpu();
+        float16_t* qp = q.cpu();
+        for (uint32_t idx = 0; idx < q.shape.count(); ++idx) {
+            qsp[idx] = float16_t(float(qp[idx]) * scale);
         }
-    });
-    evk::CmdTimestamp("matmul", [&]() {
-        for(int it = 0; it < ITERS; ++it) {
-            evk::ai::matmul(q, k, o_mat, false, true, false, 64, 64);
-        }
-    });
-    o_mat.print();
-    o.cpu_download();
-
-    for(auto& ts : evk::GetTimestamps()) {
-        printf("timestamp: %s, %f\n", ts.name, float(ts.end - ts.start)/float(ITERS));
+        q_scaled.cpu_upload();
     }
 
-    // Expected: p_j = softmax(scale * j), scale = 1/sqrt(Dh)
-    const float scale = 1.0f / std::sqrt(float(Dh));
-    float logits[16];
-    for (uint32_t j = 0; j < N; ++j) logits[j] = scale * float(j);
-    // stable softmax
-    float m = logits[0];
-    for (uint32_t j = 1; j < N; ++j) m = (std::max)(m, logits[j]);
-    float denom = 0.0f;
-    for (uint32_t j = 0; j < N; ++j) denom += std::exp(logits[j] - m);
-    float pj[16];
-    for (uint32_t j = 0; j < N; ++j) pj[j] = std::exp(logits[j] - m) / (denom > 0 ? denom : 1.0f);
-    float expectedWeightedJ = 0.0f;
-    for (uint32_t j = 0; j < N; ++j) expectedWeightedJ += pj[j] * float(j);
-
-    // Compare
-    bool ok = true;
-    float16_t* op = o.cpu();
-    for (uint32_t i = 0; i < N; ++i) {
-        for (uint32_t kd = 0; kd < Dh; ++kd) {
-            float expected = expectedWeightedJ + float(kd);
-            float got = float(op[i * D + kd]);
-            if (std::abs(got - expected) > 5e-2f) {
-                ok = false;
+    for(int n = 0; n < 4; ++n) {
+        const int ITERS = 8;
+        evk::CmdTimestamp("flash_attention", [&]() {
+            for(int it = 0; it < ITERS; ++it) {
+                evk::ai::flash_attention(q, k, v, o_flash);
             }
+        });
+
+        evk::CmdTimestamp("attention", [&]() {
+            for(int it = 0; it < ITERS; ++it) {
+                evk::ai::matmul(q_scaled, k, s, false, true, false, 64, 64);   // S = (Q/√Dh) * K^T
+                evk::ai::softmax(s, p);                                        // P = softmax(S) over last dim
+                evk::ai::matmul(p, v, o_base, false, false, false, 64, 64);    // O = P * V
+            }
+        });
+
+        o_flash.cpu_download();
+        o_base.cpu_download();
+
+        for(auto& ts : evk::GetTimestamps()) {
+            printf("%s: %.4fms\n", ts.name, float(ts.end - ts.start)/float(ITERS));
         }
+
+        bool ok = true;
+        float16_t* ofp = o_flash.cpu();
+        float16_t* obp = o_base.cpu();
+        for (uint32_t i = 0; i < N * D; ++i) {
+            float diff = std::abs(float(ofp[i]) - float(obp[i]));
+            if (diff > 5e-2f) { ok = false; printf("diff[%u]: %f\n", i, diff); break; }
+        }
+        TEST(ok);
     }
-    TEST(ok);
 }
 
 void test_graph_backward() {
@@ -1383,10 +1295,9 @@ int main() {
     // test_add();
     // test_matmul();
     // test_mse_loss();
-    // test_flash_attention_forward_small();
-    // test_flash_attention_backward_trivial();
-    // test_flash_attention_forward_values();
-    test_softmax();
+    // test_flash_attention_backward();
+    test_flash_attention_cmp_softmax();
+    // test_softmax();
     // test_graph_backward();
 
     // benchmark_matmul();

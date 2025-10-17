@@ -1,8 +1,8 @@
 #include "evk.frag"
 
 // Flash Attention v2 forward (MQA) using cooperative matrices (tensor cores).
-// Tiled algorithm over (i,j) with online softmax per row using a small scratch tile.
-// Tiles size should match the QKV size.
+// Tiled algorithm over (i,j) with online softmax per row. Accumulation goes
+// directly into the output buffer, and scratch is used only for the 16x16 P tile.
 // Layout (row-major):
 // Q,O: (B, N, D) with D = H * Dh (heads concatenated)
 // K,V: (B, N, Dh)
@@ -21,7 +21,7 @@ PUSH(
     BufferFp16 kBuf;
     BufferFp16 vBuf;
     BufferFp16 oBuf;
-    BufferFp16 scratchBuf; // per (b,h,iTile) scratch: [Otile(16*Dh) | Ptile(16*16)] in fp16
+    BufferFp16 scratchBuf; // per (b,h,iTile) scratch: [Ptile(16*16)] in fp16
     uint B;
     uint H;
     uint N;
@@ -55,27 +55,17 @@ void main() {
 
     uint i0 = tileRow * TILE_M;
 
-    // Scratch layout per tile: first Otile (TILE_M x Dh), then Ptile (TILE_M x TILE_J)
-    uint tilesPerBH = N / TILE_M;
+    // Scratch layout per tile: only Ptile (TILE_M x TILE_J)
+    uint tilesPerBH = (N + TILE_M - 1u) / TILE_M;
     uint tileLinear = (bh * tilesPerBH) + tileRow;
-    uint otileCount = TILE_M * Dh;            // fp16 elements
     uint ptileCount = TILE_M * TILE_J;        // fp16 elements
-    uint scratchPerTile = otileCount + ptileCount;
-    uint scratchBase = tileLinear * scratchPerTile;
-    uint otileBase = scratchBase;             // [TILE_M x Dh], row-major, stride Dh
-    uint ptileBase = scratchBase + otileCount;// [TILE_M x TILE_J], row-major, stride TILE_J
+    uint scratchBase = tileLinear * ptileCount;
+    uint ptileBase = scratchBase;             // [TILE_M x TILE_J], row-major, stride TILE_J
 
     // Initialize softmax running stats
     float m[TILE_M];
     float l[TILE_M];
     [[unroll]] for (uint r = 0u; r < TILE_M; ++r) { m[r] = -3.402823466e+38; l[r] = 0.0; }
-
-    // Initialize Otile to zeros
-    for (uint kd = 0u; kd < Dh; ++kd) {
-        for (uint r = 0u; r < TILE_M; ++r) {
-            scratchBuf.x[otileBase + r * Dh + kd] = float16_t(0.0);
-        }
-    }
 
     // Loop over key tiles j0
     for (uint j0 = 0u; j0 < N; j0 += TILE_J) {
@@ -98,8 +88,8 @@ void main() {
         // Store S_block into Ptile scratch temporarily
         // Stride for Ptile rows is TILE_J half-elements
         coopMatStore(sTile, scratchBuf.x, ptileBase, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
-
-        // Row-wise online softmax update, write normalized Ptile back into same Ptile region
+        // Row-wise online softmax update, write normalized Ptile back into same Ptile region.
+        // Also scale the existing output rows in-place by old_scale.
         for (uint r = 0u; r < TILE_M; ++r) {
             // Compute new max
             float m_new = m[r];
@@ -116,11 +106,16 @@ void main() {
                 scratchBuf.x[ptileBase + r * TILE_J + c] = float16_t(w);
             }
 
-            // Scale previous Otile row by old_scale = (l_old * exp(m_old - m_new)) / l_new
+            // Scale previous O row by old_scale = (l_old * exp(m_old - m_new)) / l_new
             float old_scale = (l[r] <= 0.0) ? 0.0 : ((l[r] * exp(m[r] - m_new)) / max(l_new, 1e-20));
-            for (uint kd = 0u; kd < Dh; ++kd) {
-                float prev = float(scratchBuf.x[otileBase + r * Dh + kd]);
-                scratchBuf.x[otileBase + r * Dh + kd] = float16_t(prev * old_scale);
+            uint i = i0 + r;
+            if (i < N) {
+                uint oRowHead = baseO_B + i * D + h * Dh;
+                // Apply scaling by loading 16x16 block as accumulator, multiply elementwise after store
+                // but here we do scalar loop to avoid extra scratch
+                for (uint kd = 0u; kd < Dh; ++kd) {
+                    oBuf.x[oRowHead + kd] = float16_t(float(oBuf.x[oRowHead + kd]) * old_scale);
+                }
             }
             // Normalize Ptile row by l_new
             float inv_l = 1.0 / max(l_new, 1e-20);
@@ -132,7 +127,7 @@ void main() {
             l[r] = l_new;
         }
 
-        // Accumulate Otile += Ptile(16x16) * Vtile(16xDh)
+        // Accumulate O_tile += Ptile(16x16) * Vtile(16xDh) directly into oBuf
         for (uint kd0 = 0u; kd0 < Dh; kd0 += SUB_TILE) {
             coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> pMat;
             coopMatLoad(pMat, scratchBuf.x, ptileBase, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
@@ -141,23 +136,13 @@ void main() {
             uint vOff = baseV_B + (j0 * Dh) + kd0; // top-left (j0,kd0)
             coopMatLoad(vMat, vBuf.x, vOff, Dh, gl_CooperativeMatrixLayoutRowMajor);
 
-            // Load current Otile sub-block as accumulator
+            // Load current O sub-block (16x16) as accumulator
             coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> oSub;
-            uint oSubOff = otileBase + kd0; // row 0, col kd0
-            coopMatLoad(oSub, scratchBuf.x, oSubOff, Dh, gl_CooperativeMatrixLayoutRowMajor);
+            uint oSubOff = baseO_B + (i0 * D) + (h * Dh) + kd0; // row i0, col kd0 within head slice
+            coopMatLoad(oSub, oBuf.x, oSubOff, D, gl_CooperativeMatrixLayoutRowMajor);
 
             oSub = coopMatMulAdd(pMat, vMat, oSub);
-            coopMatStore(oSub, scratchBuf.x, oSubOff, Dh, gl_CooperativeMatrixLayoutRowMajor);
-        }
-    }
-
-    // Write Otile to output O
-    for (uint r = 0u; r < TILE_M; ++r) {
-        uint i = i0 + r;
-        if (i >= N) break;
-        uint oRowHead = baseO_B + i * D + h * Dh;
-        for (uint kd = 0u; kd < Dh; ++kd) {
-            oBuf.x[oRowHead + kd] = scratchBuf.x[otileBase + r * Dh + kd];
+            coopMatStore(oSub, oBuf.x, oSubOff, D, gl_CooperativeMatrixLayoutRowMajor);
         }
     }
 }
