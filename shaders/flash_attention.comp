@@ -38,10 +38,10 @@ const uint C_ROWS = TILE_M / SUB_TILE; // 1
 const uint C_COLS = TILE_J / SUB_TILE; // 1
 
 // Shared tiles to reduce global memory traffic
-shared float16_t Psh[TILE_M * TILE_J]; // 16x16 probabilities tile
-shared float16_t Dsh[TILE_M * TILE_M]; // 16x16 diagonal scaling matrix per row
-// Keep per-kd output sub-tiles in shared memory across j-tiles to avoid
-// reading/writing global O every iteration. Supports Dh up to 16*16 = 256.
+shared float16_t Psh[TILE_M * TILE_J]; // 16x16 unnormalized weights tile: exp(s - m_new)
+shared float16_t Dsh[TILE_M * TILE_M]; // reused only at the very end for final diagonal scale
+// Keep per-kd output sub-tiles in shared memory across j-tiles; we store a rescaled
+// accumulator y such that ˜O = sr[row] * y. At the end we convert to normalized O.
 const uint MAX_KD_TILES = 16u; // max Dh blocks (Dh <= 256)
 shared float16_t Osh[MAX_KD_TILES * TILE_M * TILE_M];
 
@@ -64,7 +64,7 @@ void main() {
 
     uint i0 = tileRow * TILE_M;
 
-    // Initialize softmax running stats
+    // Initialize online softmax stats
     float m[TILE_M];
     float l[TILE_M];
     [[unroll]] for (uint r = 0u; r < TILE_M; ++r) { m[r] = -3.402823466e+38; l[r] = 0.0; }
@@ -106,39 +106,31 @@ void main() {
         // Store S_block into shared P tile (row-major, stride TILE_J)
         coopMatStore(sTile, Psh, 0u, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
 
-        // Row-wise online softmax and scaling prep in parallel across subgroup lanes
+        // Row-wise online softmax stats update and alpha (previous-scale) prep in parallel across lanes
         if (lane < TILE_M) {
             // Compute new max for this row
             float m_new = m[lane];
             [[unroll]] for (uint c = 0u; c < TILE_J; ++c) {
-            float s = float(Psh[lane * TILE_J + c]) * SCALE;
+                float s = float(Psh[lane * TILE_J + c]) * SCALE;
                 m_new = max(m_new, s);
             }
-            // Compute new denom and overwrite Ptile row with exp(s - m_new)
+            // Compute new denom and overwrite Ptile row with unnormalized exp(s - m_new)
             float l_new = l[lane] * exp(m[lane] - m_new);
             [[unroll]] for (uint c = 0u; c < TILE_J; ++c) {
-            float s = float(Psh[lane * TILE_J + c]) * SCALE;
+                float s = float(Psh[lane * TILE_J + c]) * SCALE;
                 float w = exp(s - m_new);
                 l_new += w;
                 Psh[lane * TILE_J + c] = float16_t(w);
             }
-
-            // Compute old_scale and write diagonal
-            float old_scale = (l[lane] <= 0.0) ? 0.0 : ((l[lane] * exp(m[lane] - m_new)) / max(l_new, 1e-20));
-            Dsh[lane * TILE_M + lane] = float16_t(old_scale);
-
-            // Row normalization
-            float inv_l = 1.0 / max(l_new, 1e-20);
-            [[unroll]] for (uint c = 0u; c < TILE_J; ++c) {
-                float w = float(Psh[lane * TILE_J + c]);
-                Psh[lane * TILE_J + c] = float16_t(w * inv_l);
-            }
+            // Prepare Dsh diagonal scaling with alpha = exp(m_old - m_new) to scale previous accumulator
+            float alpha = exp(m[lane] - m_new);
+            [[unroll]] for (uint c = 0u; c < TILE_M; ++c) { if (c == lane) Dsh[lane * TILE_M + c] = float16_t(alpha); }
             m[lane] = m_new;
             l[lane] = l_new;
         }
         barrier();
 
-        // Fused: For each kd tile, scale O by Dsh and add P*V
+        // For each kd tile, accumulate y = alpha*y + P*V (P is unnormalized weights)
         coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> pMat;
         coopMatLoad(pMat, Psh, 0u, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
         coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> dMat;
@@ -150,26 +142,40 @@ void main() {
             uint vOff = baseV_B + (j0 * Dh) + kd0; // top-left (j0,kd0)
             coopMatLoad(vMat, vBuf.x, vOff, Dh, gl_CooperativeMatrixLayoutRowMajor);
 
-            // Load current O accumulator from shared memory
+            // Load current y accumulator and apply y = alpha*y + P*V
             uint oShOff = kdIdx * (TILE_M * TILE_M);
-            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> oAccB;
-            coopMatLoad(oAccB, Osh, oShOff, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
-
-            // tmp = Dsh * oAcc; then oAcc = tmp + P * V
-            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> tmpAcc =
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> yPrev;
+            coopMatLoad(yPrev, Osh, oShOff, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> yNew =
                 coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
-            tmpAcc = coopMatMulAdd(dMat, oAccB, tmpAcc);
-            tmpAcc = coopMatMulAdd(pMat, vMat, tmpAcc);
-            coopMatStore(tmpAcc, Osh, oShOff, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
+            yNew = coopMatMulAdd(dMat, yPrev, yNew);
+            yNew = coopMatMulAdd(pMat, vMat, yNew);
+            coopMatStore(yNew, Osh, oShOff, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
         }
     }
 
-    // After processing all j tiles, write final O from shared accumulators to global
+    // After processing all j tiles, write final O from shared accumulators to global.
+    // Build Dsh as diag(gamma) where gamma[row] = 1 / l[row], and apply once.
+    if (lane < TILE_M) {
+        [[unroll]] for (uint c = 0u; c < TILE_M; ++c) {
+            Dsh[lane * TILE_M + c] = float16_t(0.0);
+        }
+        float gamma = (l[lane] > 0.0) ? (1.0 / l[lane]) : 0.0;
+        Dsh[lane * TILE_M + lane] = float16_t(gamma);
+    }
+    barrier();
+
+    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> dFinal;
+    coopMatLoad(dFinal, Dsh, 0u, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
     for (uint kd0 = 0u, kdIdx = 0u; kd0 < Dh; kd0 += SUB_TILE, ++kdIdx) {
         uint oShOff = kdIdx * (TILE_M * TILE_M);
-        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> oAccFinal;
-        coopMatLoad(oAccFinal, Osh, oShOff, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
+        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> yMat;
+        coopMatLoad(yMat, Osh, oShOff, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
+        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> oAccFinal =
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+        oAccFinal = coopMatMulAdd(dFinal, yMat, oAccFinal);
         uint oSubOff = baseO_B + (i0 * D) + (h * Dh) + kd0;
         coopMatStore(oAccFinal, oBuf.x, oSubOff, D, gl_CooperativeMatrixLayoutRowMajor);
     }
 }
+
