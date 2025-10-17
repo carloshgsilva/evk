@@ -2,6 +2,7 @@
 
 // Flash Attention v2 forward (MQA) using cooperative matrices (tensor cores).
 // Tiled algorithm over (i,j) with online softmax per row using a small scratch tile.
+// Tiles size should match the QKV size.
 // Layout (row-major):
 // Q,O: (B, N, D) with D = H * Dh (heads concatenated)
 // K,V: (B, N, Dh)

@@ -1,0 +1,53 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 inputBuffer;
+    BufferFp16 outputBuffer;
+    uint lastDim;        // length along the last dimension
+    uint outerCount;     // number of rows = totalElements / lastDim
+)
+
+// One workgroup per row, single subgroup (size 32)
+COMPUTE(32, 1, 1)
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= outerCount) return;
+
+    uint lid = gl_LocalInvocationID.x; // 0..31
+    uint rowStart = row * lastDim;
+
+    // 1) Row-wise max for numerical stability
+    float localMax = -3.402823466e+38; // -FLT_MAX
+    for (uint j = lid; j < lastDim; j += 32) {
+        float v = float(inputBuffer.x[rowStart + j]);
+        localMax = max(localMax, v);
+    }
+    float rowMax = subgroupMax(localMax);
+
+    // 2) Compute exp(x - rowMax), accumulate sum, store temporaries in output
+    float localSum = 0.0;
+    for (uint j = lid; j < lastDim; j += 32) {
+        float ex = exp(float(inputBuffer.x[rowStart + j]) - rowMax);
+        outputBuffer.x[rowStart + j] = float16_t(ex);
+        localSum += ex;
+    }
+    float denom = subgroupAdd(localSum);
+    float invDen = 1.0 / max(denom, 1e-20);
+
+    // 3) Normalize
+    for (uint j = lid; j < lastDim; j += 32) {
+        float ex = float(outputBuffer.x[rowStart + j]);
+        outputBuffer.x[rowStart + j] = float16_t(ex * invDen);
+    }
+}
+
+
