@@ -388,6 +388,7 @@ namespace evk::ai {
         evk::Pipeline mse_loss;
         evk::Pipeline sgd;
         evk::Pipeline add;
+        evk::Pipeline softmax;
         evk::Buffer flash_scratch;
         uint32_t flash_scratch_elems = 0;
     };
@@ -465,6 +466,10 @@ namespace evk::ai {
         pipelines->add = evk::CreatePipeline({
             .name = "add",
             .CS = evk::loadSpirvFile("shaders/bin/add.comp.spv"),
+        });
+        pipelines->softmax = evk::CreatePipeline({
+            .name = "softmax",
+            .CS = evk::loadSpirvFile("shaders/bin/softmax.comp.spv"),
         });
         pipelines->flash_scratch = {};
         pipelines->flash_scratch_elems = 0;
@@ -770,6 +775,28 @@ namespace evk::ai {
         const uint32_t WORKGROUP_SIZE = 256u;
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
+    }
+
+    // Softmax along last dimension
+    // out has the same shape as in
+    void softmax(Tensor& in, Tensor& out) {
+        assert(in.shape.rank() == out.shape.rank());
+        for (uint32_t i = 0; i < in.shape.rank(); ++i) {
+            assert(in.shape[i] == out.shape[i]);
+        }
+
+        uint32_t lastDim = in.shape[-1];
+        uint32_t outerCount = in.shape.count() / lastDim;
+
+        evk::CmdBind(pipelines->softmax);
+        evk::CmdPush(evk::Constant{
+            in.buffer.GetReference(),
+            out.buffer.GetReference(),
+            lastDim,
+            outerCount,
+        });
+        evk::CmdDispatch(outerCount, 1, 1);
         evk::CmdBarrier();
     }
 }
@@ -1160,7 +1187,7 @@ void test_flash_attention_backward_trivial() {
     TEST(ok_dV);
 }
 
-void test_flash_attention_forward_values() {
+void test_flash_attention_cmp_softmax() {
     printf("test_flash_attention_forward_values() \n");
     // Validate forward FlashAttention against a hand-computed case.
     // Setup: B=1, H=1, N=16, Dh=16. K is identity so s(i,j)=Q[i,j].
@@ -1219,16 +1246,22 @@ void test_flash_attention_forward_values() {
     // o_mat.fill(float16_t(0.0f));
 
     // Run forward
+    const int ITERS = 8;
     evk::CmdTimestamp("flash_attention", [&]() {
-        evk::ai::flash_attention(q, k, v, o);
+        for(int it = 0; it < ITERS; ++it) {
+            evk::ai::flash_attention(q, k, v, o);
+        }
     });
     evk::CmdTimestamp("matmul", [&]() {
-        evk::ai::matmul(q, k, o_mat, false, true, false, 64, 64);
+        for(int it = 0; it < ITERS; ++it) {
+            evk::ai::matmul(q, k, o_mat, false, true, false, 64, 64);
+        }
     });
     o_mat.print();
     o.cpu_download();
+
     for(auto& ts : evk::GetTimestamps()) {
-        printf("timestamp: %s, %f\n", ts.name, float(ts.end - ts.start));
+        printf("timestamp: %s, %f\n", ts.name, float(ts.end - ts.start)/float(ITERS));
     }
 
     // Expected: p_j = softmax(scale * j), scale = 1/sqrt(Dh)
@@ -1294,6 +1327,46 @@ void test_attn_graph() {
     
 }
 
+void test_softmax() {
+    printf("test_softmax()\n");
+    // Shape (B, N, Dlast) -> softmax over Dlast
+    const uint32_t B = 2;
+    const uint32_t N = 3;
+    const uint32_t Dlast = 5;
+    Tensor in({B, N, Dlast});
+    Tensor out({B, N, Dlast});
+
+    // Fill deterministic values per row to validate probabilities sum to 1
+    float16_t* ip = in.cpu();
+    for (uint32_t b = 0; b < B; ++b) {
+        for (uint32_t n = 0; n < N; ++n) {
+            for (uint32_t d = 0; d < Dlast; ++d) {
+                uint32_t idx = b * (N * Dlast) + n * Dlast + d;
+                ip[idx] = float16_t(float(d - 2)); // centered range [-2..2]
+            }
+        }
+    }
+    in.cpu_upload();
+
+    evk::ai::softmax(in, out);
+    out.cpu_download();
+    float16_t* op = out.cpu();
+
+    // Check each row sums to ~1
+    bool ok = true;
+    for (uint32_t b = 0; b < B; ++b) {
+        for (uint32_t n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            for (uint32_t d = 0; d < Dlast; ++d) {
+                uint32_t idx = b * (N * Dlast) + n * Dlast + d;
+                sum += float(op[idx]);
+            }
+            if (std::abs(sum - 1.0f) > 5e-3f) ok = false;
+        }
+    }
+    TEST(ok);
+}
+
 int main() {
     set_unhandled_exception_filter();
 
@@ -1308,11 +1381,12 @@ int main() {
     evk::ai::initialize();
 
     // test_add();
-    test_matmul();
+    // test_matmul();
     // test_mse_loss();
     // test_flash_attention_forward_small();
     // test_flash_attention_backward_trivial();
     // test_flash_attention_forward_values();
+    test_softmax();
     // test_graph_backward();
 
     // benchmark_matmul();
