@@ -1159,7 +1159,7 @@ void test_flash_attention_backward() {
 void test_flash_attention_cmp_softmax() {
     printf("test_flash_attention_cmp_softmax()\n");
     const uint32_t B = 1u;
-    const uint32_t N = 512u;   // tile aligned
+    const uint32_t N = 1024u;   // tile aligned
     const uint32_t Dh = 64u;  // tile aligned
     const uint32_t H = 1u;
     const uint32_t D = H * Dh;
