@@ -14,6 +14,12 @@
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_buffer_reference : enable
 
+CONSTANT(0) uint B = 0u;
+CONSTANT(1) uint H = 0u;
+CONSTANT(2) uint N = 0u;
+CONSTANT(3) uint D = 0u;
+CONSTANT(4) float SCALE = 0.0;
+
 layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 
 PUSH(
@@ -22,11 +28,6 @@ PUSH(
     BufferFp16 vBuf;
     BufferFp16 oBuf;
     BufferFp16 scratchBuf; // per (b,h,iTile) scratch: [Ptile(16*16)] in fp16
-    uint B;
-    uint H;
-    uint N;
-    uint D;
-    float scale; // 1/sqrt(Dh)
 )
 
 #define SUB_TILE 16u
@@ -110,13 +111,13 @@ void main() {
             // Compute new max for this row
             float m_new = m[lane];
             [[unroll]] for (uint c = 0u; c < TILE_J; ++c) {
-                float s = float(Psh[lane * TILE_J + c]) * scale;
+            float s = float(Psh[lane * TILE_J + c]) * SCALE;
                 m_new = max(m_new, s);
             }
             // Compute new denom and overwrite Ptile row with exp(s - m_new)
             float l_new = l[lane] * exp(m[lane] - m_new);
             [[unroll]] for (uint c = 0u; c < TILE_J; ++c) {
-                float s = float(Psh[lane * TILE_J + c]) * scale;
+            float s = float(Psh[lane * TILE_J + c]) * SCALE;
                 float w = exp(s - m_new);
                 l_new += w;
                 Psh[lane * TILE_J + c] = float16_t(w);

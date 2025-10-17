@@ -445,6 +445,40 @@ namespace evk::ai {
         return pipeline;
     }
 
+    struct FlashConfig{
+        uint32_t B;
+        uint32_t H;
+        uint32_t N;
+        uint32_t D;
+        float scale;
+
+        operator uint64_t() const {
+            return hash_combine(B, H, N, D, scale);
+        }
+    };
+    std::unordered_map<uint64_t, evk::Pipeline> flash_configs;
+
+    evk::Pipeline get_flash_pipeline(const FlashConfig& config) {
+        uint64_t key = config;
+        auto it = flash_configs.find(key);
+        if (it != flash_configs.end()) {
+            return it->second;
+        }
+        evk::Pipeline pipeline = evk::CreatePipeline({
+            .name = "flash_attention",
+            .CS = evk::loadSpirvFile("shaders/bin/flash_attention.comp.spv"),
+            .constants = evk::Constant{
+                uint32_t(config.B),
+                uint32_t(config.H),
+                uint32_t(config.N),
+                uint32_t(config.D),
+                float(config.scale),
+            },
+        });
+        flash_configs[key] = pipeline;
+        return pipeline;
+    }
+
     void initialize() {
         pipelines = std::make_unique<Pipelines>();
         pipelines->flash_attn = evk::CreatePipeline({
@@ -477,6 +511,7 @@ namespace evk::ai {
     void shutdown() {
         pipelines.reset();
         matmul_configs.clear();
+        flash_configs.clear();
     }
 
     // C = A * B
@@ -586,15 +621,13 @@ namespace evk::ai {
             pipelines->flash_scratch_elems = totalElems;
         }
 
-        evk::CmdBind(pipelines->flash_attn);
+        evk::CmdBind(get_flash_pipeline(FlashConfig{B, H, N, D, scale}));
         evk::CmdPush(evk::Constant{
             q.buffer.GetReference(),
             k.buffer.GetReference(),
             v.buffer.GetReference(),
             o.buffer.GetReference(),
             pipelines->flash_scratch.GetReference(),
-            B, H, N, D,
-            scale
         });
 
         // Dispatch over (tileRows, B*H)
