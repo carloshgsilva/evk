@@ -828,7 +828,25 @@ namespace evk {
             physicalDevices.resize(physicalDeviceCount);
             CHECK_VK(vkEnumeratePhysicalDevices(S.instance, &physicalDeviceCount, physicalDevices.data()));
             EVK_ASSERT(physicalDeviceCount > 0, "could not find physical device!");
-            S.physicalDevice = physicalDevices[0];
+
+            // Select the best physical device
+            S.physicalDevice = VK_NULL_HANDLE;
+            for (auto& device : physicalDevices) {
+                VkPhysicalDeviceProperties deviceProperties;
+                vkGetPhysicalDeviceProperties(device, &deviceProperties);
+
+                // Prioritize discrete GPUs
+                if (deviceProperties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+                    S.physicalDevice = device;
+                    break;
+                }
+
+                // If no discrete GPU is found, use the first device
+                if (S.physicalDevice == VK_NULL_HANDLE) {
+                    S.physicalDevice = device;
+                }
+            }
+            EVK_ASSERT(S.physicalDevice != VK_NULL_HANDLE, "No suitable physical device found!");
 
             // PhysicalDevice properties
             VkPhysicalDeviceProperties props = {};
