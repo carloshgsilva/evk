@@ -1159,7 +1159,7 @@ void test_flash_attention_backward() {
 void test_flash_attention_cmp_softmax() {
     printf("test_flash_attention_cmp_softmax()\n");
     const uint32_t B = 1u;
-    const uint32_t N = 1024u;   // tile aligned
+    const uint32_t N = 1024u*16u;   // tile aligned
     const uint32_t Dh = 64u;  // tile aligned
     const uint32_t H = 1u;
     const uint32_t D = H * Dh;
@@ -1204,27 +1204,33 @@ void test_flash_attention_cmp_softmax() {
         q_scaled.cpu_upload();
     }
 
-    for(int n = 0; n < 4; ++n) {
-        const int ITERS = 8;
-        evk::CmdTimestamp("flash_attention", [&]() {
-            for(int it = 0; it < ITERS; ++it) {
+    float flash_time = 1e9f;
+    float attention_time = 1e9f;
+    for(int n = 0; n < 1; ++n) {
+        const int ITERS = 16;
+        for(int it = 0; it < ITERS; ++it) {
+            evk::CmdTimestamp("flash_attention", [&]() {
                 evk::ai::flash_attention(q, k, v, o_flash);
-            }
-        });
+            });
+        }
 
-        evk::CmdTimestamp("attention", [&]() {
-            for(int it = 0; it < ITERS; ++it) {
+        for(int it = 0; it < ITERS; ++it) {
+            evk::CmdTimestamp("attention", [&]() {
                 evk::ai::matmul(q_scaled, k, s, false, true, false, 64, 64);   // S = (Q/√Dh) * K^T
                 evk::ai::softmax(s, p);                                        // P = softmax(S) over last dim
                 evk::ai::matmul(p, v, o_base, false, false, false, 64, 64);    // O = P * V
-            }
-        });
+            });
+        }
 
         o_flash.cpu_download();
         o_base.cpu_download();
 
         for(auto& ts : evk::GetTimestamps()) {
-            printf("%s: %.4fms\n", ts.name, float(ts.end - ts.start)/float(ITERS));
+            if (strcmp(ts.name, "flash_attention") == 0) {
+                flash_time = fmin(flash_time, float(ts.end - ts.start)/float(ITERS));
+            } else if (strcmp(ts.name, "attention") == 0) {
+                attention_time = fmin(attention_time, float(ts.end - ts.start)/float(ITERS));
+            }
         }
 
         bool ok = true;
@@ -1236,6 +1242,7 @@ void test_flash_attention_cmp_softmax() {
         }
         TEST(ok);
     }
+    printf("  flash_attention: %.3fms\n  attention: %.3fms\n", flash_time, attention_time);
 }
 
 void test_graph_backward() {
