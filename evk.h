@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <string>
+#include <cstdint>
 
 namespace evk {
     constexpr int MAX_VERTEX_BINDING_COUNT = 4;
