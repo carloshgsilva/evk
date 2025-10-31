@@ -370,9 +370,9 @@ namespace evk {
     void CmdCopy(void* src, Buffer& dst, uint64_t size, uint64_t dstOffset = 0);
 
     // Binds a vertex buffer
-    void CmdVertex(Buffer& buffer, uint64_t offset = 0);
+    void CmdVertex(const Buffer& buffer, uint64_t offset = 0);
     // Binds a index buffer
-    void CmdIndex(Buffer& buffer, bool useHalf = false, uint64_t offset = 0);
+    void CmdIndex(const Buffer& buffer, bool useHalf = false, uint64_t offset = 0);
 
     void CmdBeginRender(Image* attachments, ClearValue* clearValues, int attachmentCount);
     void CmdEndRender();

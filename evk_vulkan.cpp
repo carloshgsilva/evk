@@ -1664,11 +1664,11 @@ namespace evk {
         }
     }
 
-    void CmdVertex(Buffer& buffer, uint64_t offset) {
+    void CmdVertex(const Buffer& buffer, uint64_t offset) {
         VkDeviceSize rawOffset = offset;
         vkCmdBindVertexBuffers(GetFrame().cmd, 0, 1, &ToInternal(buffer).buffer, &rawOffset);
     }
-    void CmdIndex(Buffer& buffer, bool useHalf, uint64_t offset) {
+    void CmdIndex(const Buffer& buffer, bool useHalf, uint64_t offset) {
         VkDeviceSize rawOffset = offset;
         vkCmdBindIndexBuffer(GetFrame().cmd, ToInternal(buffer).buffer, rawOffset, useHalf ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     }
