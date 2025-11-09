@@ -1213,51 +1213,12 @@ namespace evk {
 
         res->desc.name = "Swapchain color image";
         res->desc.format = Format::BGRA8Unorm;
-        res->desc.usage = ImageUsage::Attachment | ImageUsage::Storage | ImageUsage::Sampled;
+        res->desc.usage = ImageUsage::Attachment;
         res->desc.extent = {width, height};
         res->desc.filter = Filter::Linear;
         res->image = image;
 
         InitializeImageView(res);
-
-        // Alloc descriptor index
-        {
-            res->resourceid = S.imageSlots.alloc();
-
-            // Bind for Sampler
-            if ((int)res->desc.usage & (int)ImageUsage::Sampled) {
-                VkDescriptorImageInfo info = {};
-                info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                info.imageView = res->view;
-                info.sampler = res->sampler;
-
-                VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                write.pImageInfo = &info;
-                write.descriptorCount = 1;
-                write.dstSet = S.descriptorSet;
-                write.dstBinding = BINDING_SAMPLER;
-                write.dstArrayElement = res->resourceid;
-                vkUpdateDescriptorSets(S.device, 1, &write, 0, nullptr);
-            }
-
-            // Bind for Storage
-            if ((int)res->desc.usage & (int)ImageUsage::Storage) {
-                VkDescriptorImageInfo info = {};
-                info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-                info.imageView = res->view;
-                info.sampler = res->sampler;
-
-                VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                write.pImageInfo = &info;
-                write.descriptorCount = 1;
-                write.dstSet = S.descriptorSet;
-                write.dstBinding = BINDING_IMAGE;
-                write.dstArrayElement = res->resourceid;
-                vkUpdateDescriptorSets(S.device, 1, &write, 0, nullptr);
-            }
-        }
 
         return Image(res);
     }
@@ -1312,7 +1273,7 @@ namespace evk {
             .imageColorSpace = colorSpace,
             .imageExtent = extent,
             .imageArrayLayers = 1,
-            .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+            .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
             .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
             .preTransform = transform,
             .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
@@ -1761,16 +1722,6 @@ namespace evk {
         EVK_ASSERT(GetFrame().insideRenderPass == true, "no render pass bound!");
         GetFrame().insideRenderPass = false;
         vkCmdEndRendering(GetFrame().cmd);
-    }
-    evk::Image CmdGetPresentImage() {
-        auto& F = GetFrame();
-        EVK_ASSERT(!F.doingPresent, "CmdGetPresentImage have already been called this frame.");
-        F.doingPresent = true;
-
-        auto& S = GetState();
-        S.swapchainSemaphoreIndex = (S.swapchainSemaphoreIndex + 1) % S.frames.size();
-        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, 0, S.frames[S.swapchainSemaphoreIndex].imageReadySemaphore, 0, &S.swapchainIndex);
-        return S.frames[S.swapchainIndex].image;
     }
     void CmdBeginPresent(ClearValue clearValue) {
         auto& F = GetFrame();

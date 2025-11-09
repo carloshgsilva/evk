@@ -376,7 +376,6 @@ namespace evk {
 
     void CmdBeginRender(Image* attachments, ClearValue* clearValues, int attachmentCount);
     void CmdEndRender();
-    Image CmdGetPresentImage();
     void CmdBeginPresent(ClearValue clearValue = ClearValue(ClearColor{0.0f, 0.0f, 0.0f, 1.0f}));
     void CmdEndPresent();
     void CmdViewport(float x, float y, float w, float h, float minDepth = 0.0f, float maxDepth = 1.0f);
