@@ -1542,11 +1542,11 @@ namespace evk {
 
         vkCmdCopyImage(GetFrame().cmd, ToInternal(src).image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }
-    void CmdCopy(Buffer& src, Image& dst, uint32_t mip, uint32_t layer) {
+    void CmdCopy(Buffer& src, Image& dst, uint32_t mip, uint32_t layer, uint64_t srcOffset) {
         auto extent = GetDesc(dst).extent;
 
         VkBufferImageCopy copy = {};
-        copy.bufferOffset = 0;
+        copy.bufferOffset = srcOffset;
         copy.bufferRowLength = 0;
         copy.bufferImageHeight = 0;
         copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;

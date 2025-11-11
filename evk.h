@@ -358,7 +358,7 @@ namespace evk {
     // Copy a Image to another Image of the same size
     void CmdCopy(Image& src, Image& dst, uint32_t srcMip = 0, uint32_t srcLayer = 0, uint32_t dstMip = 0, uint32_t dstLayer = 0, uint32_t layerCount = 1);
     // Copy a Buffer to a Image
-    void CmdCopy(Buffer& src, Image& dst, uint32_t mip = 0, uint32_t layer = 0);
+    void CmdCopy(Buffer& src, Image& dst, uint32_t mip = 0, uint32_t layer = 0, uint64_t srcOffset = 0);
     // Copy regions from a Buffer to a Image
     void CmdCopy(Buffer& src, Image& dst, const std::vector<ImageRegion>& regions);
     // Copy regions of a Buffer to Buffer
