@@ -131,6 +131,8 @@ namespace evk {
         PFN_vkCmdBeginDebugUtilsLabelEXT vkCmdBeginDebugUtilsLabelEXT;
         PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT;
         PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT;
+
+        std::vector<VkSemaphore> presentSemaphores;
     };
     State& GetState();
     FrameData& GetFrame();

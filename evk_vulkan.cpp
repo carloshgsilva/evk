@@ -662,7 +662,7 @@ namespace evk {
         submit.waitSemaphoreCount = F.doingPresent ? 1 : 0;
         submit.pWaitSemaphores = F.doingPresent ? &S.frames[S.swapchainSemaphoreIndex].imageReadySemaphore : nullptr;
         submit.signalSemaphoreCount = F.doingPresent ? 1 : 0;
-        submit.pSignalSemaphores = F.doingPresent ? &F.cmdDoneSemaphore : nullptr;
+        submit.pSignalSemaphores = F.doingPresent ? &S.presentSemaphores[S.swapchainIndex] : nullptr;
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &F.cmd;
         submit.pWaitDstStageMask = &dstStage;
@@ -671,7 +671,7 @@ namespace evk {
         if (F.doingPresent) {
             VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
             present.waitSemaphoreCount = 1;
-            present.pWaitSemaphores = &F.cmdDoneSemaphore;
+            present.pWaitSemaphores = &S.presentSemaphores[S.swapchainIndex];
             present.swapchainCount = 1;
             present.pSwapchains = &S.swapchain;
             present.pImageIndices = &S.swapchainIndex;
@@ -1189,6 +1189,11 @@ namespace evk {
         _WaitFrameCompletion();
         _ReleaseResources();
 
+        for (auto sem : S.presentSemaphores) {
+            vkDestroySemaphore(S.device, sem, nullptr);
+        }
+        S.presentSemaphores.clear();
+
         S.frames.clear();
 
         vmaDestroyAllocator(GetState().allocator);
@@ -1293,6 +1298,18 @@ namespace evk {
         for (int i = 0; i < frameCount; i++) {
             FrameData& d = S.frames[i];
             d.image = CreateImageForSwapchain(images[i], extent.width, extent.height);
+        }
+
+        for (auto sem : S.presentSemaphores) {
+            vkDestroySemaphore(S.device, sem, nullptr);
+        }
+        S.presentSemaphores.clear();
+        S.presentSemaphores.resize(imageCount);
+        {
+            VkSemaphoreCreateInfo semaphoreci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+            for (uint32_t i = 0; i < imageCount; i++) {
+                CHECK_VK(vkCreateSemaphore(S.device, &semaphoreci, nullptr, &S.presentSemaphores[i]));
+            }
         }
 
         vkDestroySwapchainKHR(S.device, oldSwapchain, nullptr);
@@ -1730,7 +1747,13 @@ namespace evk {
 
         auto& S = GetState();
         S.swapchainSemaphoreIndex = (S.swapchainSemaphoreIndex + 1) % S.frames.size();
-        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, 0, S.frames[S.swapchainSemaphoreIndex].imageReadySemaphore, 0, &S.swapchainIndex);
+        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, std::numeric_limits<uint64_t>().max(), S.frames[S.swapchainSemaphoreIndex].imageReadySemaphore, 0, &S.swapchainIndex);
+        if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+            F.doingPresent = false;
+            S.frame = (int)S.frames.size() - 1;
+            RecreateSwapchain();
+            return;
+        }
         CmdBarrier(S.frames[S.swapchainIndex].image, ImageLayout::Undefined, ImageLayout::Attachment);
 
         ClearValue clears[] = {clearValue};
