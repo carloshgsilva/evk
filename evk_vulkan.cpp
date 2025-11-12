@@ -50,7 +50,7 @@ namespace evk {
     int _GetFormatByName(const char* name) {
         constexpr size_t COUNT = sizeof(FORMAT_VK) / sizeof(FormatConversion);
         for (int i = 0; i < COUNT; i++) {
-            if (!std::strcmp(name, FORMAT_VK[i].name)) {
+            if (!strcmp(name, FORMAT_VK[i].name)) {
                 return i;
             }
         }
@@ -573,7 +573,7 @@ namespace evk {
         createInfo.pNext = &renderingCreateInfo;
 
         VkPipeline pipeline = VK_NULL_HANDLE;
-        vkCreateGraphicsPipelines(GetState().device, VK_NULL_HANDLE, 1, &createInfo, nullptr, &pipeline);
+        CHECK_VK(vkCreateGraphicsPipelines(GetState().device, VK_NULL_HANDLE, 1, &createInfo, nullptr, &pipeline));
 
         return pipeline;
     }
@@ -936,7 +936,7 @@ namespace evk {
 
             auto isExtensionSupported = [&](const char* name) {
                 for (const auto& e : supportedExtensions) {
-                    if (std::strcmp(e.extensionName, name) == 0) return true;
+                    if (strcmp(e.extensionName, name) == 0) return true;
                 }
                 return false;
             };
@@ -1043,7 +1043,7 @@ namespace evk {
             for (auto& ext1 : deviceExtensions) {
                 bool found = false;
                 for (auto& ext2 : supportedExtensions) {
-                    if (!std::strcmp(ext1, ext2.extensionName)) {
+                    if (strcmp(ext1, ext2.extensionName) == 0) {
                         found = true;
                         break;
                     }
@@ -1806,7 +1806,7 @@ namespace evk {
             VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, .baseMipLevel = 0, .levelCount = desc.mipCount, .baseArrayLayer = 0, .layerCount = desc.layerCount};
             vkCmdClearDepthStencilImage(GetFrame().cmd, ToInternal(image).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &vkValue, 1, &range);
         } else {
-            VkClearColorValue vkValue = {.uint32 = {value.color.uint32[0], value.color.uint32[1], value.color.uint32[3], value.color.uint32[4]}};
+            VkClearColorValue vkValue = {.uint32 = {value.color.uint32[0], value.color.uint32[1], value.color.uint32[2], value.color.uint32[3]}};
             VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = desc.mipCount, .baseArrayLayer = 0, .layerCount = desc.layerCount};
             vkCmdClearColorImage(GetFrame().cmd, ToInternal(image).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &vkValue, 1, &range);
         }
@@ -1840,7 +1840,7 @@ namespace evk {
         if(GetState().vkCmdBeginDebugUtilsLabelEXT) {
             GetState().vkCmdBeginDebugUtilsLabelEXT(GetFrame().cmd, &label);
         }
-        int id = GetFrame().AllocTimestap(name);
+        int id = GetFrame().AllocTimestamp(name);
         vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, id * 2);
         return id;
     }
