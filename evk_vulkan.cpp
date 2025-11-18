@@ -467,6 +467,7 @@ namespace evk {
         viewportInfo.pViewports = &viewport;
         viewportInfo.scissorCount = 1;
         viewportInfo.pScissors = &scissor;
+       
 
         VkPipelineRasterizationStateCreateInfo rasterizationInfo = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         rasterizationInfo.polygonMode = desc.wireframe ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
@@ -1529,9 +1530,9 @@ namespace evk {
         VkMemoryBarrier2 barrier = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
             .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
             .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
         };
         VkDependencyInfo dependency = {
             .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
