@@ -441,6 +441,7 @@ namespace evk {
         viewportInfo.pViewports = &viewport;
         viewportInfo.scissorCount = 1;
         viewportInfo.pScissors = &scissor;
+       
 
         VkPipelineRasterizationStateCreateInfo rasterizationInfo = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         rasterizationInfo.polygonMode = desc.wireframe ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
@@ -1422,9 +1423,9 @@ namespace evk {
         VkMemoryBarrier2 barrier = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
             .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
             .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
         };
         VkDependencyInfo dependency = {
             .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
@@ -1887,11 +1888,6 @@ namespace evk {
             .memoryType = MemoryType::CPU_TO_GPU,
         });
 
-        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-        vkCmdPipelineBarrier(GetFrame().cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
-
         VkAccelerationStructureGeometryInstancesDataKHR instancesVk = {
             .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,
             .data = {ToInternal(res->instancesBuffer).deviceAddress},
@@ -1969,7 +1965,7 @@ namespace evk {
 
         Buffer scratchBuffer = CreateBuffer({
             .name = "BLAS Build Scratch Buffer",
-            .size = scratchSize,
+            .size = scratchSize + 256,
             .usage = BufferUsage::Storage,
             .memoryType = MemoryType::GPU,
         });
@@ -1982,14 +1978,10 @@ namespace evk {
             Internal_BLAS& blas = ToInternal(blasRes);
             batchSize += blas.sizeInfo.accelerationStructureSize;
 
-            EVK_ASSERT(update == false && blas.buildInfo.dstAccelerationStructure == VK_NULL_HANDLE, "BLAS is already built, did you meant to build with update == true?");
-
-            blas.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-            blas.buildInfo.scratchData = {ToInternal(scratchBuffer).deviceAddress};
+            blas.buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
             blas.buildInfo.dstAccelerationStructure = blas.accel;
-            if (update) {
-                blas.buildInfo.srcAccelerationStructure = blas.accel;
-            }
+            blas.buildInfo.srcAccelerationStructure = VK_NULL_HANDLE;
+            blas.buildInfo.scratchData.deviceAddress = (ToInternal(scratchBuffer).deviceAddress + 255) & ~(255ULL);
 
             buildInfos.push_back(blas.buildInfo);
             buildRanges.push_back(blas.ranges.data());
@@ -1999,7 +1991,7 @@ namespace evk {
             VkMemoryBarrier barrier{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
-                .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
             };
             vkCmdPipelineBarrier(GetFrame().cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
@@ -2030,7 +2022,7 @@ namespace evk {
         Internal_TLAS& res = ToInternal(tlas);
 
         EVK_ASSERT(tlas, "Invalid TLAS.");
-        EVK_ASSERT(blasInstances.size() < res.instances.size(), "TLAS has been created with max of %llu BLAS count but now is being built with %llu BLAS count!",
+        EVK_ASSERT(blasInstances.size() <= res.instances.size(), "TLAS has been created with max of %llu BLAS count but now is being built with %llu BLAS count!",
                     res.instances.size(), blasInstances.size());
 
         for (int i = 0; i < blasInstances.size(); i++) {
@@ -2065,25 +2057,35 @@ namespace evk {
 
         Buffer scratchBuffer = CreateBuffer({
             .name = "TLAS Scratch",
-            .size = res.sizeInfo.buildScratchSize,
+            .size = res.sizeInfo.buildScratchSize + 256,
             .usage = BufferUsage::Storage,
             .memoryType = MemoryType::GPU,
         });
 
         // Update build information
         res.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-        res.buildInfo.srcAccelerationStructure = res.accel;
         res.buildInfo.dstAccelerationStructure = res.accel;
-        res.buildInfo.scratchData.deviceAddress = ToInternal(scratchBuffer).deviceAddress;
+
+        if (update) {
+            EVK_ASSERT((res.buildInfo.flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0,
+                       "CmdBuildTLAS called with update=true but TLAS was not created with allowUpdate=true");
+            res.buildInfo.srcAccelerationStructure = res.accel;
+        } else {
+            // For full rebuilds the source must be null to avoid undefined
+            // behaviour on some drivers when rebuilding every frame.
+            res.buildInfo.srcAccelerationStructure = VK_NULL_HANDLE;
+        }
+
+        res.buildInfo.scratchData.deviceAddress = (ToInternal(scratchBuffer).deviceAddress + 255) & ~(255ULL);
 
         // Build Offsets info: n instances
         VkAccelerationStructureBuildRangeInfoKHR buildOffsetInfo{static_cast<uint32_t>(blasInstances.size()), 0, 0, 0};
         const VkAccelerationStructureBuildRangeInfoKHR* pBuildOffsetInfo = &buildOffsetInfo;
 
         VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-        vkCmdPipelineBarrier(GetFrame().cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        vkCmdPipelineBarrier(GetFrame().cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
         // Build the TLAS
         S.vkCmdBuildAccelerationStructuresKHR(GetFrame().cmd, 1, &res.buildInfo, &pBuildOffsetInfo);
     }
