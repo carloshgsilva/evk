@@ -1144,6 +1144,7 @@ namespace evk {
         {
             for (auto& f : S.frames) {
                 f.image.release();
+                f.stagingBuffer.release();
             }
         }
 
