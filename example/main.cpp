@@ -557,6 +557,179 @@ void test_adam_vs_sgd() {
     TEST(adam_final_loss < 0.1f);
 }
 
+void test_adam_batched_matmul() {
+    printf("test_adam_batched_matmul()\n");
+    
+    // Learn W such that X @ W ≈ target for batched data
+    // 
+    // Task: Learn to produce IDENTITY matrices from batched inputs
+    // - Input X: (B, M, K) - each batch has identity matrix (1s on diagonal)
+    // - Weight W: (K, N) to learn, starts with random values
+    // - Target: (B, M, N) - each batch should be scaled identity (2s on diagonal)
+    //
+    // X @ W for identity X gives W itself. So W should learn to be 2*I.
+    // This tests that Adam can learn a specific weight matrix using batched inputs.
+    
+    const uint32_t B = 4;   // batch size  
+    const uint32_t M = 16;  // rows (tile aligned)
+    const uint32_t K = 16;  // inner dim (tile aligned) 
+    const uint32_t N = 16;  // cols (tile aligned)
+    
+    Tensor x({B, M, K});     // batched input - identity matrices
+    Tensor w({K, N});        // weight to learn (broadcast across batches)
+    Tensor y({B, M, N});     // output
+    Tensor target({B, M, N}); // target pattern - scaled identity matrices
+    Tensor loss_tensor({1});
+    Tensor y_grad({B, M, N});
+    Tensor w_grad({K, N});
+    
+    evk::ai::AdamState adam_state;
+    
+    // Initialize X with identity matrices for each batch
+    {
+        float16_t* xp = x.cpu();
+        for (uint32_t b = 0; b < B; ++b) {
+            for (uint32_t m = 0; m < M; ++m) {
+                for (uint32_t k = 0; k < K; ++k) {
+                    uint32_t idx = b * M * K + m * K + k;
+                    xp[idx] = float16_t((m == k) ? 1.0f : 0.0f);
+                }
+            }
+        }
+        x.cpu_upload();
+    }
+    
+    // Target: identity matrices scaled by 2 (so W should learn to be 2*I)
+    {
+        float16_t* tp = target.cpu();
+        for (uint32_t b = 0; b < B; ++b) {
+            for (uint32_t m = 0; m < M; ++m) {
+                for (uint32_t n = 0; n < N; ++n) {
+                    uint32_t idx = b * M * N + m * N + n;
+                    tp[idx] = float16_t((m == n) ? 2.0f : 0.0f);
+                }
+            }
+        }
+        target.cpu_upload();
+    }
+    
+    // Initialize W with small random values
+    {
+        float16_t* wp = w.cpu();
+        for (uint32_t i = 0; i < K * N; ++i) {
+            wp[i] = float16_t(0.5f * float(rand()) / float(RAND_MAX));
+        }
+        w.cpu_upload();
+    }
+    
+    float initial_loss = 0.0f;
+    float final_loss = 0.0f;
+    
+    const int STEPS = 150;
+    const float lr = -0.02f;  // Negative because mse_loss gradient convention
+    
+    for (int step = 0; step < STEPS; ++step) {
+        // Forward: y = x @ w (batched matmul with broadcast)
+        evk::ai::matmul(x, w, y, false, false, false, 16, 16);
+        
+        // Compute MSE loss and gradient
+        evk::ai::mse_loss(y, target, y_grad, loss_tensor);
+        
+        // Backward: dW = X^T @ dY (accumulated across batches)
+        // First batch: initialize w_grad
+        {
+            Tensor x_b({M, K});
+            Tensor y_grad_b({M, N});
+            
+            x.cpu_download();
+            y_grad.cpu_download();
+            float16_t* xp = x.cpu();
+            float16_t* ygp = y_grad.cpu();
+            float16_t* xbp = x_b.cpu();
+            float16_t* ygbp = y_grad_b.cpu();
+            
+            for (uint32_t i = 0; i < M * K; ++i) xbp[i] = xp[i];
+            for (uint32_t i = 0; i < M * N; ++i) ygbp[i] = ygp[i];
+            x_b.cpu_upload();
+            y_grad_b.cpu_upload();
+            
+            evk::ai::matmul(x_b, y_grad_b, w_grad, true, false, false, 16, 16);
+        }
+        
+        // Remaining batches: accumulate into w_grad
+        for (uint32_t b = 1; b < B; ++b) {
+            Tensor x_b({M, K});
+            Tensor y_grad_b({M, N});
+            
+            float16_t* xp = x.cpu();
+            float16_t* ygp = y_grad.cpu();
+            float16_t* xbp = x_b.cpu();
+            float16_t* ygbp = y_grad_b.cpu();
+            
+            for (uint32_t i = 0; i < M * K; ++i) xbp[i] = xp[b * M * K + i];
+            for (uint32_t i = 0; i < M * N; ++i) ygbp[i] = ygp[b * M * N + i];
+            x_b.cpu_upload();
+            y_grad_b.cpu_upload();
+            
+            evk::ai::matmul(x_b, y_grad_b, w_grad, true, false, true, 16, 16);
+        }
+        
+        // Adam update
+        evk::ai::adam(w, w_grad, adam_state, lr);
+        evk::Sync();
+        
+        loss_tensor.cpu_download();
+        float loss_val = float(loss_tensor.cpu()[0]);
+        
+        if (step == 0) initial_loss = loss_val;
+        if (step == STEPS - 1) final_loss = loss_val;
+        
+        if (step % 30 == 0 || step == STEPS - 1) {
+            printf("  step %3d: loss = %.6f\n", step, loss_val);
+        }
+    }
+    
+    printf("\n  Initial loss: %.6f\n", initial_loss);
+    printf("  Final loss:   %.6f\n", final_loss);
+    
+    // Visualize final output vs target (batch 0, first 6x6)
+    printf("\n  Output (batch 0)         Target (2*Identity)\n");
+    y.cpu_download();
+    float16_t* yp = y.cpu();
+    float16_t* tp = target.cpu();
+    for (uint32_t m = 0; m < 6; ++m) {
+        printf("  ");
+        for (uint32_t n = 0; n < 6; ++n) {
+            float v = float(yp[m * N + n]);
+            printf("%4.1f ", v);
+        }
+        printf("   |   ");
+        for (uint32_t n = 0; n < 6; ++n) {
+            float v = float(tp[m * N + n]);
+            printf("%4.1f ", v);
+        }
+        printf("\n");
+    }
+    
+    // Visualize learned W (should be close to 2*Identity)
+    printf("\n  Learned W (first 6x6, should be ~2*I):\n");
+    w.cpu_download();
+    float16_t* wp = w.cpu();
+    for (uint32_t k = 0; k < 6; ++k) {
+        printf("  ");
+        for (uint32_t n = 0; n < 6; ++n) {
+            float v = float(wp[k * N + n]);
+            printf("%4.1f ", v);
+        }
+        printf("\n");
+    }
+    
+    // Test: loss should decrease significantly
+    TEST(final_loss < initial_loss * 0.01f);
+    // Test: final loss should be very low
+    TEST(final_loss < 0.001f);
+}
+
 int main() {
     set_unhandled_exception_filter();
 
@@ -582,6 +755,7 @@ int main() {
     test_adam();
     test_adam_convergence();
     test_adam_vs_sgd();
+    test_adam_batched_matmul();
 
     // benchmark_matmul();
 
