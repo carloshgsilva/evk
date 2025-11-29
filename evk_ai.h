@@ -288,6 +288,21 @@ struct Tensor {
         return *this;
     }
 
+    // Initialize with scaled Gaussian random values (for weight initialization)
+    // Uses Box-Muller transform for Gaussian distribution
+    Tensor& random_init(float scale = 0.1f) {
+        float16_t* data = cpu();
+        for (uint32_t i = 0; i < shape.count(); ++i) {
+            // Box-Muller transform for Gaussian
+            float u1 = float(rand() + 1) / float(RAND_MAX + 1);
+            float u2 = float(rand()) / float(RAND_MAX);
+            float z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265f * u2);
+            data[i] = float16_t(z * scale);
+        }
+        cpu_upload();
+        return *this;
+    }
+
     float16_t item() {
         assert(shape.count() == 1);
         cpu_download();
@@ -439,6 +454,30 @@ namespace evk::ai {
 
     // ReLU backward: grad_in = grad_out * (in > 0 ? 1 : 0)
     void relu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in);
+
+    // Cross entropy loss for classification
+    // logits: (B*N, V) unnormalized log probabilities
+    // targets: (B*N) target class indices stored as uint16
+    // grad: (B*N, V) gradient output (softmax - one_hot)
+    // result: scalar loss value
+    void cross_entropy_loss(Tensor& logits, Tensor& targets, Tensor& grad, Tensor& result);
+
+    // Embedding lookup: out[i] = embeddings[indices[i]]
+    // embeddings: (vocab_size, embed_dim)
+    // indices: (B, N) indices stored as uint16
+    // out: (B, N, embed_dim)
+    void embed(Tensor& embeddings, Tensor& indices, Tensor& out);
+
+    // Embedding backward: accumulates gradients into embedding table
+    // grad_out: (B, N, embed_dim) gradient from downstream
+    // indices: (B, N) same indices used in forward
+    // grad_embeddings: (vocab_size, embed_dim) gradient accumulator
+    void embed_backward(Tensor& grad_out, Tensor& indices, Tensor& grad_embeddings);
+
+    // Apply causal mask to attention scores (set future positions to -inf)
+    // scores: (B, N, N) attention scores where scores[b, i, j] is query i attending to key j
+    // For causal: j > i should be masked (set to -inf)
+    void apply_causal_mask(Tensor& scores);
 }
 
 struct Graph {
@@ -458,15 +497,34 @@ struct Graph {
         return tensor;
     }
 
+    // Matrix multiplication with automatic shape inference
+    // Supports 2D (M,K) @ (K,N) -> (M,N)
+    // Supports 3D (B,M,K) @ (K,N) -> (B,M,N) with broadcast
     Tensor& matmul(Tensor& a, Tensor& b, uint8_t tile_m = 16, uint8_t tile_n = 16) {
-        nodes.push_back(std::make_unique<Tensor>(Shape({a.shape[0], b.shape[1]})));
+        Shape out_shape;
+        if (a.shape.rank() == 2 && b.shape.rank() == 2) {
+            out_shape = Shape({a.shape[0], b.shape[1]});
+        } else if (a.shape.rank() == 3 && b.shape.rank() == 2) {
+            out_shape = Shape({a.shape[0], a.shape[1], b.shape[1]});
+        } else if (a.shape.rank() == 2 && b.shape.rank() == 3) {
+            out_shape = Shape({b.shape[0], a.shape[0], b.shape[2]});
+        } else if (a.shape.rank() == 3 && b.shape.rank() == 3) {
+            out_shape = Shape({a.shape[0], a.shape[1], b.shape[2]});
+        } else {
+            assert(false && "Unsupported matmul shapes");
+        }
+        
+        nodes.push_back(std::make_unique<Tensor>(out_shape));
         Tensor& c = *nodes.back();
         c.forward_fn = [&a, &b, &c, tile_m, tile_n]() {
             evk::ai::matmul(a, b, c, false, false, false, tile_m, tile_n);
         };
         c.backward_fn = [&a, &b, &c, tile_m, tile_n]() {
-            evk::ai::matmul(c.grad(), b, a.grad(), false, true, false, tile_m, tile_n);
-            evk::ai::matmul(a, c.grad(), b.grad(), true, false, false, tile_m, tile_n);
+            // grad_a = grad_c @ b^T (accumulate for params, set for intermediates)
+            // grad_b = a^T @ grad_c (accumulate for params)
+            // Using acc_c=true assumes grads are zero-initialized in eval()
+            evk::ai::matmul(c.grad(), b, a.grad(), false, true, true, tile_m, tile_n);
+            evk::ai::matmul(a, c.grad(), b.grad(), true, false, true, tile_m, tile_n);
         };
         return c;
     }
@@ -512,6 +570,272 @@ struct Graph {
         return out;
     }
 
+    // Add positional embeddings: out = input + pos_emb (broadcast across batch)
+    // input: (B*N, embed_dim) - flattened input
+    // pos_emb: (N, embed_dim) - positional embeddings (learnable parameter)
+    // batch_size: number of batches in input
+    // seq_len: sequence length (N)
+    // Returns: (B*N, embed_dim) input with position encodings added
+    Tensor& add_position_embedding(Tensor& input, Tensor& pos_emb, uint32_t batch_size, uint32_t seq_len) {
+        uint32_t embed_dim = pos_emb.shape[1];
+        assert(input.shape[0] == batch_size * seq_len);
+        assert(input.shape[1] == embed_dim);
+        assert(pos_emb.shape[0] == seq_len);
+        
+        nodes.push_back(std::make_unique<Tensor>(input.shape));
+        Tensor& out = *nodes.back();
+        
+        out.forward_fn = [&input, &pos_emb, &out, batch_size, seq_len, embed_dim]() {
+            input.cpu_download();
+            pos_emb.cpu_download();
+            float16_t* inp = input.cpu();
+            float16_t* pos = pos_emb.cpu();
+            float16_t* outp = out.cpu();
+            
+            for (uint32_t b = 0; b < batch_size; ++b) {
+                for (uint32_t t = 0; t < seq_len; ++t) {
+                    for (uint32_t d = 0; d < embed_dim; ++d) {
+                        uint32_t idx = b * seq_len * embed_dim + t * embed_dim + d;
+                        outp[idx] = float16_t(float(inp[idx]) + float(pos[t * embed_dim + d]));
+                    }
+                }
+            }
+            out.cpu_upload();
+        };
+        
+        out.backward_fn = [&input, &pos_emb, &out, batch_size, seq_len, embed_dim]() {
+            out.grad().cpu_download();
+            input.grad().cpu_download();
+            pos_emb.grad().cpu_download();
+            
+            float16_t* grad_out = out.grad().cpu();
+            float16_t* grad_inp = input.grad().cpu();
+            float16_t* grad_pos = pos_emb.grad().cpu();
+            
+            // Gradient flows to both input and pos_emb
+            for (uint32_t b = 0; b < batch_size; ++b) {
+                for (uint32_t t = 0; t < seq_len; ++t) {
+                    for (uint32_t d = 0; d < embed_dim; ++d) {
+                        uint32_t idx = b * seq_len * embed_dim + t * embed_dim + d;
+                        float g = float(grad_out[idx]);
+                        grad_inp[idx] = float16_t(float(grad_inp[idx]) + g);
+                        grad_pos[t * embed_dim + d] = float16_t(float(grad_pos[t * embed_dim + d]) + g);
+                    }
+                }
+            }
+            input.grad().cpu_upload();
+            pos_emb.grad().cpu_upload();
+        };
+        
+        return out;
+    }
+
+    // Embedding lookup: out = embeddings[indices]
+    // embeddings: (vocab_size, embed_dim) - learnable parameter
+    // indices: (B, N) or (B*N) - token indices as uint16 (filled by user each batch)
+    // Returns: (B*N, embed_dim) flattened embedded tokens
+    Tensor& embed(Tensor& embeddings, Tensor& indices) {
+        uint32_t num_indices = indices.shape.count();
+        uint32_t embed_dim = embeddings.shape[1];
+        
+        nodes.push_back(std::make_unique<Tensor>(Shape({num_indices, embed_dim})));
+        Tensor& out = *nodes.back();
+        
+        out.forward_fn = [&embeddings, &indices, &out]() {
+            uint32_t embed_dim = embeddings.shape[1];
+            uint32_t num_indices = indices.shape.count();
+            
+            embeddings.cpu_download();
+            indices.cpu_download();
+            
+            float16_t* emb = embeddings.cpu();
+            uint16_t* idx = (uint16_t*)indices.cpu();
+            float16_t* outp = out.cpu();
+            
+            for (uint32_t i = 0; i < num_indices; ++i) {
+                uint32_t token_idx = idx[i];
+                for (uint32_t d = 0; d < embed_dim; ++d) {
+                    outp[i * embed_dim + d] = emb[token_idx * embed_dim + d];
+                }
+            }
+            out.cpu_upload();
+        };
+        
+        out.backward_fn = [&embeddings, &indices, &out]() {
+            uint32_t embed_dim = embeddings.shape[1];
+            uint32_t num_indices = indices.shape.count();
+            
+            out.grad().cpu_download();
+            indices.cpu_download();
+            embeddings.grad().cpu_download();
+            
+            float16_t* grad_out = out.grad().cpu();
+            uint16_t* idx = (uint16_t*)indices.cpu();
+            float16_t* grad_emb = embeddings.grad().cpu();
+            
+            // Accumulate gradients into embedding table
+            for (uint32_t i = 0; i < num_indices; ++i) {
+                uint32_t token_idx = idx[i];
+                for (uint32_t d = 0; d < embed_dim; ++d) {
+                    float val = float(grad_emb[token_idx * embed_dim + d]);
+                    val += float(grad_out[i * embed_dim + d]);
+                    grad_emb[token_idx * embed_dim + d] = float16_t(val);
+                }
+            }
+            embeddings.grad().cpu_upload();
+        };
+        
+        return out;
+    }
+
+    // Cross entropy loss for token prediction
+    // logits: (B*N, vocab_size) or reshaped from (B, N, vocab_size)
+    // targets: (B*N) target indices as uint16
+    // Returns scalar loss
+    // Note: gradient is computed in backward_fn (not forward) to avoid being zeroed
+    Tensor& cross_entropy_loss(Tensor& logits, Tensor& targets) {
+        nodes.push_back(std::make_unique<Tensor>(Shape({1})));
+        Tensor& loss = *nodes.back();
+        loss.forward_fn = [&logits, &targets, &loss]() {
+            // Compute loss value and gradient together
+            evk::ai::cross_entropy_loss(logits, targets, logits.grad(), loss);
+        };
+        loss.backward_fn = [&logits, &targets, &loss]() {
+            // Re-compute gradient (since eval() zeroes gradients before backward)
+            Tensor dummy_loss({1});
+            evk::ai::cross_entropy_loss(logits, targets, logits.grad(), dummy_loss);
+        };
+        return loss;
+    }
+
+    // Softmax along last dimension with backward pass
+    Tensor& softmax(Tensor& input) {
+        nodes.push_back(std::make_unique<Tensor>(input.shape));
+        Tensor& out = *nodes.back();
+        
+        out.forward_fn = [&input, &out]() {
+            evk::ai::softmax(input, out);
+        };
+        
+        out.backward_fn = [&input, &out]() {
+            // Softmax backward: grad_in[i] = sum_j(grad_out[j] * out[j] * (delta_ij - out[i]))
+            // Simplified: grad_in = out * (grad_out - sum(grad_out * out))
+            out.cpu_download();
+            out.grad().cpu_download();
+            input.grad().cpu_download();
+            
+            float16_t* outp = out.cpu();
+            float16_t* grad_out = out.grad().cpu();
+            float16_t* grad_in = input.grad().cpu();
+            
+            uint32_t last_dim = input.shape[-1];
+            uint32_t outer = input.shape.count() / last_dim;
+            
+            for (uint32_t o = 0; o < outer; ++o) {
+                uint32_t base = o * last_dim;
+                // Compute dot(grad_out, out) for this row
+                float dot = 0.0f;
+                for (uint32_t i = 0; i < last_dim; ++i) {
+                    dot += float(grad_out[base + i]) * float(outp[base + i]);
+                }
+                // grad_in = out * (grad_out - dot)
+                for (uint32_t i = 0; i < last_dim; ++i) {
+                    float g = float(outp[base + i]) * (float(grad_out[base + i]) - dot);
+                    grad_in[base + i] = float16_t(float(grad_in[base + i]) + g);
+                }
+            }
+            input.grad().cpu_upload();
+        };
+        
+        return out;
+    }
+
+    // Causal self-attention: Q @ K^T (scaled) -> causal_mask -> softmax -> @ V
+    // q: (B, N, D), k: (B, N, D), v: (B, N, D)
+    // Returns: (B, N, D) attention output
+    Tensor& causal_attention(Tensor& q, Tensor& k, Tensor& v, float scale = 0.0f) {
+        assert(q.shape.rank() == 3 && k.shape.rank() == 3 && v.shape.rank() == 3);
+        uint32_t B = q.shape[0], N = q.shape[1], D = q.shape[2];
+        
+        // Intermediate tensors stored in graph
+        nodes.push_back(std::make_unique<Tensor>(Shape({B, N, N}))); // scores
+        Tensor& scores = *nodes.back();
+        nodes.push_back(std::make_unique<Tensor>(Shape({B, N, N}))); // probs
+        Tensor& probs = *nodes.back();
+        nodes.push_back(std::make_unique<Tensor>(Shape({B, N, D}))); // output
+        Tensor& out = *nodes.back();
+        
+        float attn_scale = (scale > 0.0f) ? scale : (1.0f / std::sqrt(float(D)));
+        
+        out.forward_fn = [&q, &k, &v, &scores, &probs, &out, attn_scale, B, N, D]() {
+            // scores = Q @ K^T
+            evk::ai::matmul(q, k, scores, false, true, false, 16, 16);
+            
+            // Scale scores
+            scores.cpu_download();
+            float16_t* sp = scores.cpu();
+            for (uint32_t i = 0; i < scores.shape.count(); ++i) {
+                sp[i] = float16_t(float(sp[i]) * attn_scale);
+            }
+            scores.cpu_upload();
+            
+            // Apply causal mask
+            evk::ai::apply_causal_mask(scores);
+            
+            // Softmax
+            evk::ai::softmax(scores, probs);
+            
+            // out = probs @ V
+            evk::ai::matmul(probs, v, out, false, false, false, 16, 16);
+        };
+        
+        out.backward_fn = [&q, &k, &v, &scores, &probs, &out, attn_scale, B, N, D]() {
+            // Backward through probs @ V
+            // grad_probs = grad_out @ V^T
+            // grad_v += probs^T @ grad_out
+            Tensor grad_probs({B, N, N});
+            evk::ai::matmul(out.grad(), v, grad_probs, false, true, false, 16, 16);
+            evk::ai::matmul(probs, out.grad(), v.grad(), true, false, true, 16, 16);
+            
+            // Softmax backward
+            probs.cpu_download();
+            grad_probs.cpu_download();
+            Tensor grad_scores({B, N, N});
+            float16_t* pp = probs.cpu();
+            float16_t* gp = grad_probs.cpu();
+            float16_t* gs = grad_scores.cpu();
+            
+            for (uint32_t b = 0; b < B; ++b) {
+                for (uint32_t i = 0; i < N; ++i) {
+                    uint32_t row_base = b * N * N + i * N;
+                    float dot = 0.0f;
+                    for (uint32_t j = 0; j < N; ++j) {
+                        dot += float(gp[row_base + j]) * float(pp[row_base + j]);
+                    }
+                    for (uint32_t j = 0; j < N; ++j) {
+                        float g = float(pp[row_base + j]) * (float(gp[row_base + j]) - dot);
+                        gs[row_base + j] = float16_t(g * attn_scale);
+                    }
+                }
+            }
+            grad_scores.cpu_upload();
+            
+            // Backward through Q @ K^T
+            // grad_q += grad_scores @ K
+            // grad_k += grad_scores^T @ Q = Q^T @ grad_scores (transposed matmul)
+            evk::ai::matmul(grad_scores, k, q.grad(), false, false, true, 16, 16);
+            evk::ai::matmul(q, grad_scores, k.grad(), true, false, true, 16, 16);
+        };
+        
+        return out;
+    }
+
+    // Residual connection: out = a + b
+    // Same as add but with a clearer name for transformer blocks
+    Tensor& residual(Tensor& a, Tensor& b) {
+        return add(a, b);
+    }
+
     // eval the graph
     // if backward is true, also run the backward pass
     void eval(bool backward = false) {
@@ -521,12 +845,13 @@ struct Graph {
             }
         }
         if (backward) {
-            // Zero parameter grad tensors before running backward so parameter grads don't accumulate
-            for (auto& param : params) {
-                if (param->grad_tensor) {
-                    float16_t* gcpu = param->grad_tensor->cpu();
-                    memset(gcpu, 0, sizeof(float16_t) * param->grad_tensor->shape.count());
-                    param->grad_tensor->cpu_upload();
+            // Zero ALL gradient tensors before running backward
+            // This includes both parameters and intermediate tensors
+            for (auto& node : nodes) {
+                if (node->grad_tensor) {
+                    float16_t* gcpu = node->grad_tensor->cpu();
+                    memset(gcpu, 0, sizeof(float16_t) * node->grad_tensor->shape.count());
+                    node->grad_tensor->cpu_upload();
                 }
             }
 

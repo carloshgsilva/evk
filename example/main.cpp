@@ -904,6 +904,227 @@ void test_adam_vs_sgd() {
     TEST(adam_final_loss < 0.1f);
 }
 
+void test_next_token_prediction() {
+    printf("test_next_token_prediction()\n");
+    
+    // ========================================
+    // 1. Vocabulary and tokenization
+    // ========================================
+    const char* VOCAB = " abcdefghijklmnopqrstuvwxyz.,\n";
+    const uint32_t VOCAB_SIZE = 32;
+    const uint32_t ACTUAL_VOCAB = 30;
+    
+    auto char_to_token = [&](char c) -> uint16_t {
+        for (uint32_t i = 0; VOCAB[i]; ++i) {
+            if (VOCAB[i] == c) return uint16_t(i);
+        }
+        return 0;
+    };
+    
+    auto token_to_char = [&](uint16_t t) -> char {
+        if (t < ACTUAL_VOCAB) return VOCAB[t];
+        return '?';
+    };
+    
+    // ========================================
+    // 2. Lorem ipsum training samples
+    // ========================================
+    const char* samples[] = {
+        "lorem ipsum dolor sit amet.",
+        "consectetur adipiscing elit.",
+        "sed do eiusmod tempor incid.",
+        "incididunt ut labore dolore.",
+        "dolore magna aliqua ut enim.",
+        "enim ad minim veniam quis.",
+        "quis nostrud exercitation.",
+        "ullamco laboris nisi aliquip.",
+    };
+    const uint32_t NUM_SAMPLES = sizeof(samples) / sizeof(samples[0]);
+    
+    // ========================================
+    // 3. Model hyperparameters (simplified 2-layer MLP with causal context)
+    // ========================================
+    const uint32_t SEQ_LEN = 32;
+    const uint32_t EMBED_DIM = 64;
+    const uint32_t HIDDEN_DIM = 128;
+    const uint32_t BATCH_SIZE = 4;
+    
+    printf("  Model: vocab=%u, seq=%u, embed=%u, hidden=%u (using Graph API)\n", 
+           VOCAB_SIZE, SEQ_LEN, EMBED_DIM, HIDDEN_DIM);
+    
+    // ========================================
+    // 4. Build computation graph using Graph API
+    // ========================================
+    Graph model;
+    
+    // Input tokens (filled each batch) - indices as uint16
+    Tensor& input_tokens = model.tensor({BATCH_SIZE * SEQ_LEN});
+    Tensor& targets = model.tensor({BATCH_SIZE * SEQ_LEN});
+    
+    // Embedding parameters (learnable)
+    Tensor& token_emb = model.tensor({VOCAB_SIZE, EMBED_DIM}, true);
+    Tensor& pos_emb = model.tensor({SEQ_LEN, EMBED_DIM}, true);
+    
+    // Model parameters (learnable)
+    Tensor& w1 = model.tensor({EMBED_DIM, HIDDEN_DIM}, true);
+    Tensor& w2 = model.tensor({HIDDEN_DIM, EMBED_DIM}, true);
+    Tensor& w_out = model.tensor({EMBED_DIM, VOCAB_SIZE}, true);
+    
+    // Build forward graph:
+    // tokens -> embed(token_emb) -> add_position_embedding(pos_emb) -> Linear(w1) -> ReLU -> Linear(w2) -> residual -> Linear(w_out) -> logits
+    
+    // Token embedding lookup
+    Tensor& embedded = model.embed(token_emb, input_tokens);
+    
+    // Add positional embeddings (broadcast across batch)
+    Tensor& input_with_pos = model.add_position_embedding(embedded, pos_emb, BATCH_SIZE, SEQ_LEN);
+    
+    // MLP layers
+    Tensor& hidden = model.matmul(input_with_pos, w1);
+    Tensor& hidden_relu = model.relu(hidden);
+    Tensor& hidden_proj = model.matmul(hidden_relu, w2);
+    Tensor& residual = model.add(input_with_pos, hidden_proj);
+    Tensor& logits = model.matmul(residual, w_out);
+    Tensor& loss = model.cross_entropy_loss(logits, targets);
+    
+    // ========================================
+    // 5. Initialize weights using Tensor::random_init()
+    // ========================================
+    float scale = 0.1f / sqrtf(float(EMBED_DIM));
+    token_emb.random_init(0.1f);
+    pos_emb.random_init(0.1f);
+    w1.random_init(scale);
+    w2.random_init(scale);
+    w_out.random_init(scale);
+    
+    // ========================================
+    // 6. Training loop using Graph API
+    // ========================================
+    const int EPOCHS = 200;
+    const float LR = 0.01f;
+    
+    printf("  Training for %d epochs...\n", EPOCHS);
+    
+    float initial_loss = 0.0f;
+    float last_loss = 1e9f;
+    
+    for (int epoch = 0; epoch < EPOCHS; ++epoch) {
+        float epoch_loss = 0.0f;
+        int num_batches = 0;
+        
+        for (uint32_t batch_start = 0; batch_start + BATCH_SIZE <= NUM_SAMPLES; batch_start += BATCH_SIZE) {
+            // Prepare batch data - fill input_tokens and targets
+            uint16_t* inp = (uint16_t*)input_tokens.cpu();
+            uint16_t* tgt = (uint16_t*)targets.cpu();
+            
+            for (uint32_t b = 0; b < BATCH_SIZE; ++b) {
+                const char* sample = samples[batch_start + b];
+                uint32_t len = (uint32_t)strlen(sample);
+                
+                for (uint32_t t = 0; t < SEQ_LEN; ++t) {
+                    inp[b * SEQ_LEN + t] = (t < len) ? char_to_token(sample[t]) : uint16_t(0);
+                    tgt[b * SEQ_LEN + t] = (t + 1 < len) ? char_to_token(sample[t + 1]) : uint16_t(0);
+                }
+            }
+            input_tokens.cpu_upload();
+            targets.cpu_upload();
+            
+            // Forward + Backward pass using Graph API
+            // Embeddings are now part of the graph!
+            model.eval(true);
+            evk::Sync();
+            
+            loss.cpu_download();
+            float loss_val = float(loss.cpu()[0]);
+            epoch_loss += loss_val;
+            num_batches++;
+            
+            if (epoch == 0 && batch_start == 0) {
+                initial_loss = loss_val;
+            }
+            
+            // Optimizer step for ALL graph parameters (including embeddings)
+            // cross_entropy gradient is standard (softmax - one_hot), needs positive lr
+            model.step_adam(-LR);
+            
+            evk::Sync();
+        }
+        
+        float avg_loss = epoch_loss / float(num_batches);
+        
+        if (epoch % 40 == 0 || epoch == EPOCHS - 1) {
+            printf("  epoch %3d: loss = %.4f\n", epoch, avg_loss);
+        }
+        
+        last_loss = avg_loss;
+    }
+    
+    // ========================================
+    // 7. Autoregressive generation (using Graph forward pass)
+    // ========================================
+    printf("\n  Autoregressive generation:\n");
+    
+    const char* prompts[] = {"lorem ", "dolor ", "sed do"};
+    const int NUM_PROMPTS = 3;
+    const int GEN_LEN = 20;
+    
+    for (int p = 0; p < NUM_PROMPTS; ++p) {
+        char generated[64] = {0};
+        strcpy(generated, prompts[p]);
+        uint32_t cur_len = (uint32_t)strlen(generated);
+        
+        uint16_t tokens[SEQ_LEN] = {0};
+        for (uint32_t i = 0; i < cur_len && i < SEQ_LEN; ++i) {
+            tokens[i] = char_to_token(generated[i]);
+        }
+        
+        for (int g = 0; g < GEN_LEN && cur_len < SEQ_LEN - 1; ++g) {
+            // Fill input_tokens with current sequence
+            uint16_t* inp = (uint16_t*)input_tokens.cpu();
+            memset(inp, 0, BATCH_SIZE * SEQ_LEN * sizeof(uint16_t));
+            for (uint32_t i = 0; i < cur_len; ++i) {
+                inp[i] = tokens[i];
+            }
+            input_tokens.cpu_upload();
+            
+            // Forward pass only (embeddings are part of graph)
+            model.eval(false);
+            evk::Sync();
+            
+            // Greedy sampling: pick token with highest logit at position cur_len-1
+            logits.cpu_download();
+            float16_t* lp = logits.cpu();
+            uint32_t pos = cur_len - 1;
+            
+            float max_val = -1e9f;
+            uint16_t next_token = 0;
+            for (uint32_t voc = 0; voc < ACTUAL_VOCAB; ++voc) {
+                float val = float(lp[pos * VOCAB_SIZE + voc]);
+                if (val > max_val) {
+                    max_val = val;
+                    next_token = uint16_t(voc);
+                }
+            }
+            
+            tokens[cur_len] = next_token;
+            generated[cur_len] = token_to_char(next_token);
+            cur_len++;
+        }
+        
+        generated[cur_len] = '\0';
+        printf("    \"%s\" -> \"%s\"\n", prompts[p], generated);
+    }
+    
+    // ========================================
+    // 8. Validation
+    // ========================================
+    printf("\n  Validation:\n");
+    printf("  Initial loss: %.4f, Final loss: %.4f\n", initial_loss, last_loss);
+    
+    TEST(last_loss < initial_loss);
+    TEST(last_loss < 2.5f);
+}
+
 void test_adam_batched_matmul() {
     printf("test_adam_batched_matmul()\n");
     
@@ -1107,6 +1328,8 @@ int main() {
     // test_circle_fitting();
 
     // benchmark_matmul();
+
+    test_next_token_prediction();
 
     evk::ai::shutdown();
     evk::Shutdown();

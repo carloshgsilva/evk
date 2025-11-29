@@ -6,6 +6,7 @@ glslc shaders/sgd.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/sgd.comp.s
 glslc shaders/adam.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/adam.comp.spv &&^
 glslc shaders/add.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/add.comp.spv &&^
 glslc shaders/softmax.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/softmax.comp.spv &&^
+glslc shaders/cross_entropy.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/cross_entropy.comp.spv &&^
 glslc shaders/transpose.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/transpose.comp.spv &&^
 glslc shaders/flash_attention.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/flash_attention.comp.spv &&^
 glslc shaders/flash_attention_bwd.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/flash_attention_bwd.comp.spv &&^
