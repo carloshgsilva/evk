@@ -432,6 +432,13 @@ namespace evk::ai {
     // Softmax along last dimension
     // out has the same shape as in
     void softmax(Tensor& in, Tensor& out);
+
+    // ReLU activation (CPU implementation for now)
+    // out = max(0, in)
+    void relu(Tensor& in, Tensor& out);
+
+    // ReLU backward: grad_in = grad_out * (in > 0 ? 1 : 0)
+    void relu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in);
 }
 
 struct Graph {
@@ -451,15 +458,15 @@ struct Graph {
         return tensor;
     }
 
-    Tensor& matmul(Tensor& a, Tensor& b) {
+    Tensor& matmul(Tensor& a, Tensor& b, uint8_t tile_m = 16, uint8_t tile_n = 16) {
         nodes.push_back(std::make_unique<Tensor>(Shape({a.shape[0], b.shape[1]})));
         Tensor& c = *nodes.back();
-        c.forward_fn = [this, &a, &b, &c]() {
-            evk::ai::matmul(a, b, c);
+        c.forward_fn = [&a, &b, &c, tile_m, tile_n]() {
+            evk::ai::matmul(a, b, c, false, false, false, tile_m, tile_n);
         };
-        c.backward_fn = [this, &a, &b, &c]() {
-            evk::ai::matmul(c.grad(), b, a.grad(), false, true, false);
-            evk::ai::matmul(a, c.grad(), b.grad(), true, false, false);
+        c.backward_fn = [&a, &b, &c, tile_m, tile_n]() {
+            evk::ai::matmul(c.grad(), b, a.grad(), false, true, false, tile_m, tile_n);
+            evk::ai::matmul(a, c.grad(), b.grad(), true, false, false, tile_m, tile_n);
         };
         return c;
     }
@@ -488,6 +495,21 @@ struct Graph {
         };
         // mse_loss don't need 'backward_fn' because it's fused with forward
         return tensor;
+    }
+
+    Tensor& relu(Tensor& a) {
+        nodes.push_back(std::make_unique<Tensor>(a.shape));
+        Tensor& out = *nodes.back();
+
+        out.forward_fn = [&a, &out]() {
+            evk::ai::relu(a, out);
+        };
+
+        out.backward_fn = [&a, &out]() {
+            evk::ai::relu_backward(out.grad(), a, a.grad());
+        };
+
+        return out;
     }
 
     // eval the graph
