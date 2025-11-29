@@ -539,5 +539,37 @@ namespace evk::ai {
         evk::CmdDispatch(outerCount, 1, 1);
         evk::CmdBarrier();
     }
+
+    void relu(Tensor& in, Tensor& out) {
+        assert(in.shape.rank() == out.shape.rank());
+        for (uint32_t i = 0; i < in.shape.rank(); ++i) {
+            assert(in.shape[i] == out.shape[i]);
+        }
+
+        in.cpu_download();
+        float16_t* inp = in.cpu();
+        float16_t* outp = out.cpu();
+        uint32_t count = in.shape.count();
+        for (uint32_t i = 0; i < count; ++i) {
+            outp[i] = float16_t(fmaxf(0.0f, float(inp[i])));
+        }
+        out.cpu_upload();
+    }
+
+    void relu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in) {
+        assert(grad_out.shape.rank() == in.shape.rank());
+        assert(grad_in.shape.rank() == in.shape.rank());
+
+        grad_out.cpu_download();
+        in.cpu_download();
+        float16_t* go = grad_out.cpu();
+        float16_t* inp = in.cpu();
+        float16_t* gi = grad_in.cpu();
+        uint32_t count = in.shape.count();
+        for (uint32_t i = 0; i < count; ++i) {
+            gi[i] = float16_t(float(inp[i]) > 0.0f ? float(go[i]) : 0.0f);
+        }
+        grad_in.cpu_upload();
+    }
 }
 

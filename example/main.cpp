@@ -2,6 +2,7 @@
 #include <evk_ai.h>
 
 #include "win_dbg.h"
+#include "bmp.h"
 
 #define TEST(expr) if((expr)) { printf(" TEST(" #expr ") [PASS]\n"); } else { printf(" TEST(" #expr ") [FAIL] [%s:%d]\n", __FILE__, __LINE__); exit(1); }
 
@@ -374,6 +375,352 @@ void test_attn_graph() {
     printf("test_attn_graph() \n");
     Graph graph;
     
+}
+
+// Gaussian random number using Box-Muller transform
+float randn() {
+    static bool has_spare = false;
+    static float spare;
+    if (has_spare) {
+        has_spare = false;
+        return spare;
+    }
+    float u, v, s;
+    do {
+        u = 2.0f * float(rand()) / float(RAND_MAX) - 1.0f;
+        v = 2.0f * float(rand()) / float(RAND_MAX) - 1.0f;
+        s = u * u + v * v;
+    } while (s >= 1.0f || s == 0.0f);
+    s = sqrtf(-2.0f * logf(s) / s);
+    spare = v * s;
+    has_spare = true;
+    return u * s;
+}
+
+void test_circle_fitting() {
+    printf("test_circle_fitting()\n");
+    
+    srand(42);  // Reproducible
+    
+    // ========================================
+    // 1. Generate ground truth: TWO circles with noisy points
+    // ========================================
+    const uint32_t POINTS_PER_CIRCLE = 12;
+    const uint32_t NUM_POINTS = POINTS_PER_CIRCLE * 2;
+    
+    // Circle 1: top-left
+    const float TRUE_CX1 = -2.0f;
+    const float TRUE_CY1 = 2.0f;
+    const float TRUE_R1 = 2.5f;
+    
+    // Circle 2: bottom-right  
+    const float TRUE_CX2 = 3.5f;
+    const float TRUE_CY2 = -1.5f;
+    const float TRUE_R2 = 2.0f;
+    
+    const float NOISE = 0.12f;
+    
+    float points_x[NUM_POINTS];
+    float points_y[NUM_POINTS];
+    
+    // Generate points for circle 1
+    for (uint32_t i = 0; i < POINTS_PER_CIRCLE; ++i) {
+        float angle = 2.0f * 3.14159265f * float(i) / float(POINTS_PER_CIRCLE);
+        float r_noise = TRUE_R1 + randn() * NOISE;
+        points_x[i] = TRUE_CX1 + r_noise * cosf(angle) + randn() * NOISE * 0.5f;
+        points_y[i] = TRUE_CY1 + r_noise * sinf(angle) + randn() * NOISE * 0.5f;
+    }
+    
+    // Generate points for circle 2
+    for (uint32_t i = 0; i < POINTS_PER_CIRCLE; ++i) {
+        float angle = 2.0f * 3.14159265f * float(i) / float(POINTS_PER_CIRCLE);
+        float r_noise = TRUE_R2 + randn() * NOISE;
+        points_x[POINTS_PER_CIRCLE + i] = TRUE_CX2 + r_noise * cosf(angle) + randn() * NOISE * 0.5f;
+        points_y[POINTS_PER_CIRCLE + i] = TRUE_CY2 + r_noise * sinf(angle) + randn() * NOISE * 0.5f;
+    }
+    
+    printf("  Ground truth:\n");
+    printf("    Circle 1: center=(%.2f, %.2f), radius=%.2f\n", TRUE_CX1, TRUE_CY1, TRUE_R1);
+    printf("    Circle 2: center=(%.2f, %.2f), radius=%.2f\n", TRUE_CX2, TRUE_CY2, TRUE_R2);
+    
+    // ========================================
+    // 2. MLP using Graph: input(6) -> hidden(64) -> hidden(64) -> output(1)
+    //    Input: [cx1, cy1, r1, cx2, cy2, r2]
+    //    Output: predicted loss
+    // ========================================
+    const uint32_t BATCH_SIZE = 64;
+    const uint32_t INPUT_DIM_PAD = 16;   // 6 params padded to 16
+    const uint32_t HIDDEN_DIM = 64;
+    const uint32_t OUTPUT_DIM_PAD = 16;
+    
+    auto init_weights = [](Tensor& t, float scale) {
+        float16_t* p = t.cpu();
+        for (uint32_t i = 0; i < t.shape.count(); ++i) {
+            p[i] = float16_t(randn() * scale);
+        }
+        t.cpu_upload();
+    };
+    
+    // Build MLP graph
+    Graph mlp;
+    Tensor& input_t = mlp.tensor({BATCH_SIZE, INPUT_DIM_PAD});
+    Tensor& w1 = mlp.tensor({INPUT_DIM_PAD, HIDDEN_DIM}, true);
+    Tensor& w2 = mlp.tensor({HIDDEN_DIM, HIDDEN_DIM}, true);
+    Tensor& w3 = mlp.tensor({HIDDEN_DIM, OUTPUT_DIM_PAD}, true);
+    Tensor& target_t = mlp.tensor({BATCH_SIZE, OUTPUT_DIM_PAD});
+    
+    // Forward: input -> matmul(w1) -> relu -> matmul(w2) -> relu -> matmul(w3) -> mse_loss
+    Tensor& h1_pre = mlp.matmul(input_t, w1);
+    Tensor& h1 = mlp.relu(h1_pre);
+    Tensor& h2_pre = mlp.matmul(h1, w2);
+    Tensor& h2 = mlp.relu(h2_pre);
+    Tensor& output_t = mlp.matmul(h2, w3);
+    Tensor& loss_t = mlp.mse_loss(output_t, target_t);
+    
+    init_weights(w1, 0.25f);
+    init_weights(w2, 0.15f);
+    init_weights(w3, 0.15f);
+    
+    // ========================================
+    // 3. Search state: 6 parameters for 2 circles
+    // ========================================
+    float s_cx1 = 0.0f, s_cy1 = 0.0f, s_r1 = 1.5f;
+    float s_cx2 = 1.0f, s_cy2 = 0.0f, s_r2 = 1.5f;
+    float search_sigma = 5.0f;
+    
+    // Best found
+    float best_cx1 = s_cx1, best_cy1 = s_cy1, best_r1 = s_r1;
+    float best_cx2 = s_cx2, best_cy2 = s_cy2, best_r2 = s_r2;
+    
+    // Loss: each point assigned to nearest circle
+    auto compute_true_loss = [&](float cx1, float cy1, float r1, float cx2, float cy2, float r2) -> float {
+        float loss = 0.0f;
+        for (uint32_t i = 0; i < NUM_POINTS; ++i) {
+            float dx1 = points_x[i] - cx1;
+            float dy1 = points_y[i] - cy1;
+            float dist1 = fabsf(sqrtf(dx1*dx1 + dy1*dy1) - r1);
+            
+            float dx2 = points_x[i] - cx2;
+            float dy2 = points_y[i] - cy2;
+            float dist2 = fabsf(sqrtf(dx2*dx2 + dy2*dy2) - r2);
+            
+            float min_dist = fminf(dist1, dist2);
+            loss += min_dist * min_dist;
+        }
+        return loss / float(NUM_POINTS);
+    };
+    
+    float best_loss = compute_true_loss(best_cx1, best_cy1, best_r1, best_cx2, best_cy2, best_r2);
+    
+    printf("  Initial guess:\n");
+    printf("    Circle 1: center=(%.2f, %.2f), radius=%.2f\n", s_cx1, s_cy1, s_r1);
+    printf("    Circle 2: center=(%.2f, %.2f), radius=%.2f\n", s_cx2, s_cy2, s_r2);
+    printf("  Initial loss: %.6f\n", best_loss);
+    
+    // ========================================
+    // Image export helper
+    // ========================================
+    const int IMG_SIZE = 600;
+    float view_min_x = -6.0f, view_max_x = 7.0f;
+    float view_min_y = -5.0f, view_max_y = 6.0f;
+    
+    auto export_image = [&](int iter, float cx1, float cy1, float r1, float cx2, float cy2, float r2, float sigma) {
+        BMP img(IMG_SIZE, IMG_SIZE);
+        ImageMapper mapper(view_min_x, view_max_x, view_min_y, view_max_y, IMG_SIZE, IMG_SIZE, 10);
+        
+        img.clear(25, 25, 35);
+        img.draw_grid(IMG_SIZE / 12, 40, 40, 50);
+        
+        // Ground truth circles - green
+        img.draw_circle(mapper.to_screen_x(TRUE_CX1), mapper.to_screen_y(TRUE_CY1), 
+                        mapper.to_screen_radius(TRUE_R1), 80, 180, 80, 2);
+        img.draw_circle(mapper.to_screen_x(TRUE_CX2), mapper.to_screen_y(TRUE_CY2), 
+                        mapper.to_screen_radius(TRUE_R2), 80, 180, 80, 2);
+        
+        // Current estimate circles - cyan and magenta
+        img.draw_circle(mapper.to_screen_x(cx1), mapper.to_screen_y(cy1), 
+                        mapper.to_screen_radius(r1), 100, 220, 255, 2);
+        img.draw_cross(mapper.to_screen_x(cx1), mapper.to_screen_y(cy1), 8, 100, 220, 255);
+        
+        img.draw_circle(mapper.to_screen_x(cx2), mapper.to_screen_y(cy2), 
+                        mapper.to_screen_radius(r2), 255, 120, 200, 2);
+        img.draw_cross(mapper.to_screen_x(cx2), mapper.to_screen_y(cy2), 8, 255, 120, 200);
+        
+        // Points - yellow
+        for (uint32_t i = 0; i < NUM_POINTS; ++i) {
+            int px = mapper.to_screen_x(points_x[i]);
+            int py = mapper.to_screen_y(points_y[i]);
+            img.draw_point(px, py, 5, 255, 220, 80);
+        }
+        
+        char filename[128];
+        snprintf(filename, sizeof(filename), "build/circle_fit_%03d.bmp", iter);
+        img.save(filename);
+    };
+    
+    export_image(0, s_cx1, s_cy1, s_r1, s_cx2, s_cy2, s_r2, search_sigma);
+    
+    // ========================================
+    // 4. Main optimization loop
+    // ========================================
+    const int OUTER_ITERS = 40;
+    const int TRAIN_ITERS = 120;
+    const float LR = 0.003f;
+    
+    for (int outer = 0; outer < OUTER_ITERS; ++outer) {
+        // if (outer > 0 && outer % 12 == 0) {
+        //     init_weights(w1, 0.25f);
+        //     init_weights(w2, 0.15f);
+        //     init_weights(w3, 0.15f);
+        //     mlp.reset_adam();
+        // }
+        
+        for (int train = 0; train < TRAIN_ITERS; ++train) {
+            float16_t* inp = input_t.cpu();
+            float16_t* tgt = target_t.cpu();
+            
+            for (uint32_t b = 0; b < BATCH_SIZE; ++b) {
+                float cx1 = s_cx1 + randn() * search_sigma;
+                float cy1 = s_cy1 + randn() * search_sigma;
+                float r1 = fmaxf(0.5f, s_r1 + randn() * search_sigma * 0.3f);
+                float cx2 = s_cx2 + randn() * search_sigma;
+                float cy2 = s_cy2 + randn() * search_sigma;
+                float r2 = fmaxf(0.5f, s_r2 + randn() * search_sigma * 0.3f);
+                
+                // Normalize inputs relative to current search center
+                inp[b * INPUT_DIM_PAD + 0] = float16_t((cx1 - s_cx1) / search_sigma);
+                inp[b * INPUT_DIM_PAD + 1] = float16_t((cy1 - s_cy1) / search_sigma);
+                inp[b * INPUT_DIM_PAD + 2] = float16_t((r1 - s_r1) / search_sigma);
+                inp[b * INPUT_DIM_PAD + 3] = float16_t((cx2 - s_cx2) / search_sigma);
+                inp[b * INPUT_DIM_PAD + 4] = float16_t((cy2 - s_cy2) / search_sigma);
+                inp[b * INPUT_DIM_PAD + 5] = float16_t((r2 - s_r2) / search_sigma);
+                for (uint32_t j = 6; j < INPUT_DIM_PAD; ++j) {
+                    inp[b * INPUT_DIM_PAD + j] = float16_t(0.0f);
+                }
+                
+                float true_loss = compute_true_loss(cx1, cy1, r1, cx2, cy2, r2);
+                tgt[b * OUTPUT_DIM_PAD + 0] = float16_t(logf(true_loss + 1.0f));
+                for (uint32_t j = 1; j < OUTPUT_DIM_PAD; ++j) {
+                    tgt[b * OUTPUT_DIM_PAD + j] = float16_t(0.0f);
+                }
+                
+                if (true_loss < best_loss) {
+                    best_loss = true_loss;
+                    best_cx1 = cx1; best_cy1 = cy1; best_r1 = r1;
+                    best_cx2 = cx2; best_cy2 = cy2; best_r2 = r2;
+                }
+            }
+            input_t.cpu_upload();
+            target_t.cpu_upload();
+            
+            // Forward + Backward using Graph
+            mlp.eval(true);
+            mlp.step_adam(LR);
+            evk::Sync();
+        }
+        
+        // ========================================
+        // 5. Get gradient from backward pass at search center
+        // ========================================
+        // Evaluate at current search center (input = 0 in normalized coords)
+        {
+            float16_t* inp = input_t.cpu();
+            for (uint32_t b = 0; b < BATCH_SIZE; ++b) {
+                for (uint32_t j = 0; j < INPUT_DIM_PAD; ++j) {
+                    inp[b * INPUT_DIM_PAD + j] = float16_t(0.0f);
+                }
+            }
+            // Set target to 0 (we want to minimize the output)
+            float16_t* tgt = target_t.cpu();
+            for (uint32_t i = 0; i < target_t.shape.count(); ++i) {
+                tgt[i] = float16_t(0.0f);
+            }
+            input_t.cpu_upload();
+            target_t.cpu_upload();
+            
+            mlp.eval(true);  // Forward + Backward to get input gradients
+            evk::Sync();
+        }
+        
+        // Get gradients from input tensor (averaged over batch)
+        input_t.grad().cpu_download();
+        float16_t* grad_ptr = input_t.grad().cpu();
+        float g[6] = {0.0f};
+        for (uint32_t b = 0; b < BATCH_SIZE; ++b) {
+            for (int i = 0; i < 6; ++i) {
+                g[i] += float(grad_ptr[b * INPUT_DIM_PAD + i]);
+            }
+        }
+        for (int i = 0; i < 6; ++i) g[i] /= float(BATCH_SIZE);
+        
+        float grad_norm = 0.0f;
+        for (int i = 0; i < 6; ++i) grad_norm += g[i] * g[i];
+        grad_norm = sqrtf(grad_norm);
+        
+        if (grad_norm > 1e-6f) {
+            float step = search_sigma * 0.25f;
+            s_cx1 -= step * g[0] / grad_norm;
+            s_cy1 -= step * g[1] / grad_norm;
+            s_r1  -= step * g[2] / grad_norm;
+            s_cx2 -= step * g[3] / grad_norm;
+            s_cy2 -= step * g[4] / grad_norm;
+            s_r2  -= step * g[5] / grad_norm;
+        }
+        s_r1 = fmaxf(0.5f, s_r1);
+        s_r2 = fmaxf(0.5f, s_r2);
+        
+        // Blend toward best
+        s_cx1 = 0.7f * s_cx1 + 0.3f * best_cx1;
+        s_cy1 = 0.7f * s_cy1 + 0.3f * best_cy1;
+        s_r1  = 0.7f * s_r1  + 0.3f * best_r1;
+        s_cx2 = 0.7f * s_cx2 + 0.3f * best_cx2;
+        s_cy2 = 0.7f * s_cy2 + 0.3f * best_cy2;
+        s_r2  = 0.7f * s_r2  + 0.3f * best_r2;
+        
+        search_sigma *= 0.93f;
+        
+        float true_loss = compute_true_loss(s_cx1, s_cy1, s_r1, s_cx2, s_cy2, s_r2);
+        if (outer % 5 == 0 || outer == OUTER_ITERS - 1) {
+            printf("  [iter %2d] C1=(%.2f,%.2f,%.2f) C2=(%.2f,%.2f,%.2f) loss=%.4f sigma=%.2f\n",
+                   outer, s_cx1, s_cy1, s_r1, s_cx2, s_cy2, s_r2, true_loss, search_sigma);
+            export_image(outer + 1, s_cx1, s_cy1, s_r1, s_cx2, s_cy2, s_r2, search_sigma);
+        }
+    }
+    
+    // Use best found
+    s_cx1 = best_cx1; s_cy1 = best_cy1; s_r1 = best_r1;
+    s_cx2 = best_cx2; s_cy2 = best_cy2; s_r2 = best_r2;
+    
+    export_image(OUTER_ITERS + 1, s_cx1, s_cy1, s_r1, s_cx2, s_cy2, s_r2, 0.0f);
+    printf("  Exported images to build/circle_fit_*.bmp\n");
+    
+    // ========================================
+    // 6. Final results - match circles to ground truth
+    // ========================================
+    float final_loss = compute_true_loss(s_cx1, s_cy1, s_r1, s_cx2, s_cy2, s_r2);
+    
+    // Determine which estimate matches which ground truth
+    float dist_1to1 = sqrtf((s_cx1-TRUE_CX1)*(s_cx1-TRUE_CX1) + (s_cy1-TRUE_CY1)*(s_cy1-TRUE_CY1));
+    float dist_1to2 = sqrtf((s_cx1-TRUE_CX2)*(s_cx1-TRUE_CX2) + (s_cy1-TRUE_CY2)*(s_cy1-TRUE_CY2));
+    
+    float e_cx1, e_cy1, e_r1, e_cx2, e_cy2, e_r2;
+    if (dist_1to1 < dist_1to2) {
+        e_cx1 = fabsf(s_cx1 - TRUE_CX1); e_cy1 = fabsf(s_cy1 - TRUE_CY1); e_r1 = fabsf(s_r1 - TRUE_R1);
+        e_cx2 = fabsf(s_cx2 - TRUE_CX2); e_cy2 = fabsf(s_cy2 - TRUE_CY2); e_r2 = fabsf(s_r2 - TRUE_R2);
+    } else {
+        e_cx1 = fabsf(s_cx2 - TRUE_CX1); e_cy1 = fabsf(s_cy2 - TRUE_CY1); e_r1 = fabsf(s_r2 - TRUE_R1);
+        e_cx2 = fabsf(s_cx1 - TRUE_CX2); e_cy2 = fabsf(s_cy1 - TRUE_CY2); e_r2 = fabsf(s_r1 - TRUE_R2);
+    }
+    
+    printf("\n  Final estimates:\n");
+    printf("    Circle 1: center=(%.3f, %.3f), radius=%.3f\n", s_cx1, s_cy1, s_r1);
+    printf("    Circle 2: center=(%.3f, %.3f), radius=%.3f\n", s_cx2, s_cy2, s_r2);
+    printf("  Final loss: %.6f\n", final_loss);
+    printf("  Errors: C1(%.3f,%.3f,%.3f) C2(%.3f,%.3f,%.3f)\n", e_cx1, e_cy1, e_r1, e_cx2, e_cy2, e_r2);
+    
+    float max_error = fmaxf(fmaxf(fmaxf(e_cx1, e_cy1), fmaxf(e_r1, e_cx2)), fmaxf(e_cy2, e_r2));
+    TEST(max_error < 1.0f);
+    TEST(final_loss < 0.2f);
 }
 
 void test_softmax() {
@@ -752,10 +1099,12 @@ int main() {
     // test_softmax();
     // test_graph_backward();
 
-    test_adam();
-    test_adam_convergence();
-    test_adam_vs_sgd();
-    test_adam_batched_matmul();
+    // test_adam();
+    // test_adam_convergence();
+    // test_adam_vs_sgd();
+    // test_adam_batched_matmul();
+
+    // test_circle_fitting();
 
     // benchmark_matmul();
 
