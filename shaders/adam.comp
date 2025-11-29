@@ -1,0 +1,64 @@
+#include "evk.frag"
+
+// Adam optimizer compute shader for fp16
+// Updates: m = β1*m + (1-β1)*g
+//          v = β2*v + (1-β2)*g²
+//          m̂ = m / (1 - β1^t)
+//          v̂ = v / (1 - β2^t)
+//          θ = θ - α * m̂ / (√v̂ + ε)
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 paramBuffer;
+    BufferFp16 gradientBuffer;
+    BufferFp16 mBuffer;  // First moment estimate
+    BufferFp16 vBuffer;  // Second moment estimate
+    float learningRate;
+    float beta1;
+    float beta2;
+    float beta1CorrectionInv;  // 1 / (1 - β1^t)
+    float beta2CorrectionInv;  // 1 / (1 - β2^t)
+    float epsilon;
+    uint totalElements;
+)
+
+COMPUTE(256, 1, 1)
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    if (gid < totalElements) {
+        float param = float(paramBuffer.x[gid]);
+        float grad = float(gradientBuffer.x[gid]);
+        float m = float(mBuffer.x[gid]);
+        float v = float(vBuffer.x[gid]);
+
+        // Update biased first moment estimate
+        m = beta1 * m + (1.0 - beta1) * grad;
+        // Update biased second moment estimate
+        v = beta2 * v + (1.0 - beta2) * grad * grad;
+
+        // Store updated moments
+        mBuffer.x[gid] = float16_t(m);
+        vBuffer.x[gid] = float16_t(v);
+
+        // Bias-corrected estimates
+        float mHat = m * beta1CorrectionInv;
+        float vHat = v * beta2CorrectionInv;
+
+        // Update parameter
+        param = param - learningRate * mHat / (sqrt(vHat) + epsilon);
+        paramBuffer.x[gid] = float16_t(param);
+    }
+}
+
+
+
+
+

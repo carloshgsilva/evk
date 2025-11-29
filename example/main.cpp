@@ -387,6 +387,7 @@ namespace evk::ai {
         evk::Pipeline flash_attn_bwd;
         evk::Pipeline mse_loss;
         evk::Pipeline sgd;
+        evk::Pipeline adam;
         evk::Pipeline add;
         evk::Pipeline softmax;
         evk::Buffer flash_scratch;
@@ -412,9 +413,12 @@ namespace evk::ai {
         uint8_t acc_c;
         uint8_t transpose_a;
         uint8_t transpose_b;
+        uint32_t stride_a;
+        uint32_t stride_b;
+        uint32_t stride_c;
 
         operator uint64_t() const {
-            return hash_combine(m, k, n, tile_m, tile_n, acc_c, transpose_a, transpose_b);
+            return hash_combine(m, k, n, tile_m, tile_n, acc_c, transpose_a, transpose_b, stride_a, stride_b, stride_c);
         }
     };
     
@@ -438,6 +442,9 @@ namespace evk::ai {
                 uint32_t(config.acc_c),
                 uint32_t(config.transpose_a),
                 uint32_t(config.transpose_b),
+                uint32_t(config.stride_a),
+                uint32_t(config.stride_b),
+                uint32_t(config.stride_c),
             },
         });
         // printf("Created matmul pipeline for config: k=%d, n=%d, transpose_a=%d, sum_c=%d, tile_m=%d, tile_n=%d\n", config.k, config.n, config.transpose_a, config.sum_c, config.tile_m, config.tile_n);
@@ -497,6 +504,10 @@ namespace evk::ai {
             .name = "sgd",
             .CS = evk::loadSpirvFile("shaders/bin/sgd.comp.spv"),
         });
+        pipelines->adam = evk::CreatePipeline({
+            .name = "adam",
+            .CS = evk::loadSpirvFile("shaders/bin/adam.comp.spv"),
+        });
         pipelines->add = evk::CreatePipeline({
             .name = "add",
             .CS = evk::loadSpirvFile("shaders/bin/add.comp.spv"),
@@ -516,6 +527,7 @@ namespace evk::ai {
 
     // C = A * B
     // (...B, M, N) = (...B, M, K) * (...B, K, N)
+    // Supports broadcasting one operand across batch by using zero batch stride.
     void matmul(Tensor& a, Tensor& b, Tensor& c, bool transpose_a = false, bool transpose_b = false, bool acc_c = false, uint8_t TILE_M = 80u, uint8_t TILE_N = 80u) {
         const uint32_t TILE_K = 16u;
 
@@ -523,8 +535,14 @@ namespace evk::ai {
         assert(a.shape.rank() >= 2);
         assert(b.shape.rank() >= 2);
         assert(c.shape.rank() >= 2);
-        assert(a.shape.batch_size(2) == b.shape.batch_size(2));
-        assert(a.shape.batch_size(2) == c.shape.batch_size(2));
+        uint32_t batchA = (a.shape.rank() >= 3) ? a.shape.batch_size(2) : 1u;
+        uint32_t batchB = (b.shape.rank() >= 3) ? b.shape.batch_size(2) : 1u;
+        uint32_t batchC = (c.shape.rank() >= 3) ? c.shape.batch_size(2) : 1u;
+        uint32_t batch = (std::max)({batchA, batchB, batchC});
+        // Allow broadcasting for inputs; C must match final batch if batch>1
+        assert(batchA == batch || batchA == 1u);
+        assert(batchB == batch || batchB == 1u);
+        assert(batchC == batch || (batch == 1u && batchC == 1u));
 
         // Logical matrix dimensions honoring transpose flags
         // A logical dims: (M x K) if !transpose_a, else (K x M)
@@ -541,9 +559,7 @@ namespace evk::ai {
         assert(c.shape[-2] == a_rows);
         assert(c.shape[-1] == b_cols);
 
-        // Determine batch size B. If tensor rank >= 3 use batch product, otherwise 1.
-        uint32_t batch = 1;
-        if (a.shape.rank() >= 3) batch = a.shape.batch_size(2);
+        // Determine batch size from broadcasted inputs
 
         // Tile compatibility with physical tensor strides: we operate on the logical dims
         uint32_t M = a_rows;
@@ -557,6 +573,14 @@ namespace evk::ai {
         assert(N % TILE_N == 0);
         assert(c.shape[-2] % TILE_M == 0);
         assert(c.shape[-1] % TILE_N == 0);
+
+        // Compute per-batch strides in elements and allow broadcast via zero stride for inputs
+        uint32_t elemsA = a.shape[-2] * a.shape[-1];
+        uint32_t elemsB = b.shape[-2] * b.shape[-1];
+        uint32_t elemsC = c.shape[-2] * c.shape[-1];
+        uint32_t strideA = (batchA == 1u && batch > 1u) ? 0u : elemsA;
+        uint32_t strideB = (batchB == 1u && batch > 1u) ? 0u : elemsB;
+        uint32_t strideC = elemsC; // output cannot be broadcast across batches
 
         evk::CmdPush(evk::Constant{
             a.buffer.GetReference(),
@@ -575,6 +599,9 @@ namespace evk::ai {
             .acc_c = acc_c,
             .transpose_a = transpose_a,
             .transpose_b = transpose_b,
+            .stride_a = strideA,
+            .stride_b = strideB,
+            .stride_c = strideC,
         }));
         evk::CmdDispatch(tilesCols, tilesRows, batch);
         evk::CmdBarrier();
@@ -787,6 +814,96 @@ namespace evk::ai {
         evk::CmdDispatch(groupsX, 1, 1);
     }
 
+    // Adam optimizer state for a single parameter tensor
+    // Maintains first moment (m) and second moment (v) estimates
+    struct AdamState {
+        evk::Buffer m_buffer;  // First moment estimate
+        evk::Buffer v_buffer;  // Second moment estimate
+        uint32_t t = 0;        // Timestep counter
+
+        void init(uint32_t num_elements) {
+            uint32_t size = num_elements * sizeof(float16_t);
+            m_buffer = evk::CreateBuffer({
+                .size = size,
+                .usage = evk::BufferUsage::Storage | evk::BufferUsage::TransferDst,
+            });
+            v_buffer = evk::CreateBuffer({
+                .size = size,
+                .usage = evk::BufferUsage::Storage | evk::BufferUsage::TransferDst,
+            });
+            // Zero-initialize moment buffers
+            evk::Buffer zero_buf = evk::CreateBuffer({
+                .size = size,
+                .usage = evk::BufferUsage::TransferSrc,
+                .memoryType = evk::MemoryType::CPU,
+            });
+            memset(zero_buf.GetPtr(), 0, size);
+            evk::CmdCopy(zero_buf, m_buffer, size);
+            evk::CmdCopy(zero_buf, v_buffer, size);
+            evk::Sync();
+            t = 0;
+        }
+
+        void reset() {
+            m_buffer = {};
+            v_buffer = {};
+            t = 0;
+        }
+    };
+
+    // Adam: Adaptive Moment Estimation optimizer
+    // Uses fp16-appropriate epsilon (default 1e-4) to avoid underflow
+    // m = β1*m + (1-β1)*g
+    // v = β2*v + (1-β2)*g²
+    // m̂ = m / (1 - β1^t)
+    // v̂ = v / (1 - β2^t)
+    // θ = θ - α * m̂ / (√v̂ + ε)
+    void adam(Tensor& param, Tensor& gradient, AdamState& state,
+              float learning_rate = 0.001f,
+              float beta1 = 0.9f,
+              float beta2 = 0.999f,
+              float epsilon = 1e-4f) {
+        assert(param.shape.rank() == gradient.shape.rank());
+        for (uint32_t i = 0; i < param.shape.rank(); ++i) {
+            assert(param.shape[i] == gradient.shape[i]);
+        }
+
+        uint32_t totalElements = param.shape.count();
+
+        // Initialize state if needed
+        if (!state.m_buffer) {
+            state.init(totalElements);
+        }
+
+        // Increment timestep
+        state.t++;
+
+        // Compute bias correction terms
+        float beta1_t = std::pow(beta1, float(state.t));
+        float beta2_t = std::pow(beta2, float(state.t));
+        float beta1CorrectionInv = 1.0f / (1.0f - beta1_t);
+        float beta2CorrectionInv = 1.0f / (1.0f - beta2_t);
+
+        evk::CmdBind(pipelines->adam);
+        evk::CmdPush(evk::Constant{
+            param.buffer.GetReference(),
+            gradient.buffer.GetReference(),
+            state.m_buffer.GetReference(),
+            state.v_buffer.GetReference(),
+            learning_rate,
+            beta1,
+            beta2,
+            beta1CorrectionInv,
+            beta2CorrectionInv,
+            epsilon,
+            totalElements,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
+    }
+
     // Elementwise add: C = A + B
     void add(Tensor& a, Tensor& b, Tensor& c) {
         assert(a.shape.rank() == b.shape.rank());
@@ -838,6 +955,7 @@ namespace evk::ai {
 struct Graph {
     std::vector<std::unique_ptr<Tensor>> nodes;
     std::vector<Tensor*> params;
+    std::unordered_map<Tensor*, evk::ai::AdamState> adam_states;
 
     // Some operations need a reusable temp/scratch buffer
     std::unique_ptr<Tensor> scratch;
@@ -922,12 +1040,30 @@ struct Graph {
         }
     }
 
-    // apply the gradient update
+    // apply the gradient update using SGD
     void step(float lr = 0.001f) {
         for(auto& param : params) {
             assert(param->grad_tensor);
             evk::ai::sgd(*param, param->grad(), -lr);
         }
+    }
+
+    // apply the gradient update using Adam optimizer
+    // Uses fp16-appropriate epsilon (default 1e-4)
+    // Note: uses -lr internally to match gradient direction convention from mse_loss
+    void step_adam(float lr = 0.001f, float beta1 = 0.9f, float beta2 = 0.999f, float epsilon = 1e-4f) {
+        for(auto& param : params) {
+            assert(param->grad_tensor);
+            evk::ai::adam(*param, param->grad(), adam_states[param], -lr, beta1, beta2, epsilon);
+        }
+    }
+
+    // reset Adam optimizer states (useful when starting fresh training)
+    void reset_adam() {
+        for(auto& [param, state] : adam_states) {
+            state.reset();
+        }
+        adam_states.clear();
     }
 };
 
@@ -953,22 +1089,22 @@ void benchmark_matmul() {
             b->identity(3.0f);
         
             // warm up
-            for (uint32_t i = 0; i < 16; ++i) {
+            for (uint32_t i = 0; i < 4; ++i) {
                 evk::ai::matmul(*a, *b, *c, false, false, false, tile_m, tile_n);
             }
 
             float min_ms = 1e9f;
-            for(int it = 0; it < 512; ++it) {
+            for(int it = 0; it < 16; ++it) {
                 const uint32_t subIter = 32;
-                evk::CmdTimestamp("matmul", [&]() {
-                    for (uint32_t i = 0; i < subIter; ++i) {
+                for (uint32_t i = 0; i < subIter; ++i) {
+                    evk::CmdTimestamp("matmul", [&]() {
                         evk::ai::matmul(*a, *b, *c, false, false, false, tile_m, tile_n);
-                    }
-                });
+                    });
+                }
                 
                 evk::Sync();
                 for(auto ts: evk::GetTimestamps()) {
-                    min_ms = fminf(min_ms, float(ts.end - ts.start)/float(subIter));
+                    min_ms = fminf(min_ms, float(ts.end - ts.start));
                 }
             }
             float tflops = float(2 * uint64_t(M) * uint64_t(N) * uint64_t(M)) / (min_ms / 1000.0f) / 1e12f;
@@ -1040,6 +1176,31 @@ void test_matmul() {
         TEST(diagonal_test);
         TEST(off_diagonal_test);
     }
+}
+
+void test_matmul_broadcast() {
+    printf("test_matmul_broadcast()\n");
+    const uint32_t B = 3u;
+    const uint32_t M = 32u;
+    const uint32_t K = 32u;
+    const uint32_t N = 32u;
+
+    Tensor a({1, M, K});
+    Tensor b({K, N});
+    Tensor c({B, M, N});
+
+    a.fill(float16_t(1.0f));
+    b.identity(float16_t(1.0f));
+
+    evk::ai::matmul(a, b, c, false, false, false, 16, 16);
+
+    c.cpu_download();
+    float16_t* cp = c.cpu();
+    bool ok = true;
+    for (uint32_t i = 0; i < B * M * N; ++i) {
+        if (cp[i] != float16_t(1.0f)) { ok = false; break; }
+    }
+    TEST(ok);
 }
 
 void test_mse_loss() {
@@ -1159,7 +1320,7 @@ void test_flash_attention_backward() {
 void test_flash_attention_cmp_softmax() {
     printf("test_flash_attention_cmp_softmax()\n");
     const uint32_t B = 1u;
-    const uint32_t N = 1024u*16u;   // tile aligned
+    const uint32_t N = 1024u*32u;   // tile aligned
     const uint32_t Dh = 64u;  // tile aligned
     const uint32_t H = 1u;
     const uint32_t D = H * Dh;
@@ -1227,9 +1388,9 @@ void test_flash_attention_cmp_softmax() {
 
         for(auto& ts : evk::GetTimestamps()) {
             if (strcmp(ts.name, "flash_attention") == 0) {
-                flash_time = fmin(flash_time, float(ts.end - ts.start)/float(ITERS));
+                flash_time = fmin(flash_time, float(ts.end - ts.start));
             } else if (strcmp(ts.name, "attention") == 0) {
-                attention_time = fmin(attention_time, float(ts.end - ts.start)/float(ITERS));
+                attention_time = fmin(attention_time, float(ts.end - ts.start));
             }
         }
 
@@ -1243,6 +1404,7 @@ void test_flash_attention_cmp_softmax() {
         TEST(ok);
     }
     printf("  flash_attention: %.3fms\n  attention: %.3fms\n", flash_time, attention_time);
+    printf("  attention/B: %.3fms\n", attention_time / float(B));
 }
 
 void test_graph_backward() {
@@ -1319,6 +1481,147 @@ void test_softmax() {
     TEST(ok);
 }
 
+void test_adam() {
+    printf("test_adam()\n");
+    
+    // Test basic Adam update: param should move toward reducing gradient
+    Tensor param({4});
+    Tensor grad({4});
+    evk::ai::AdamState state;
+
+    // Initialize param to [1, 2, 3, 4]
+    float16_t* pp = param.cpu();
+    pp[0] = float16_t(1.0f);
+    pp[1] = float16_t(2.0f);
+    pp[2] = float16_t(3.0f);
+    pp[3] = float16_t(4.0f);
+    param.cpu_upload();
+
+    // Gradient pointing "up" - param should decrease
+    float16_t* gp = grad.cpu();
+    gp[0] = float16_t(0.1f);
+    gp[1] = float16_t(0.2f);
+    gp[2] = float16_t(0.3f);
+    gp[3] = float16_t(0.4f);
+    grad.cpu_upload();
+
+    // Store initial values
+    float initial_vals[4];
+    for (int i = 0; i < 4; ++i) initial_vals[i] = float(pp[i]);
+
+    // Run Adam for a few steps
+    for (int step = 0; step < 10; ++step) {
+        evk::ai::adam(param, grad, state, 0.1f, 0.9f, 0.999f, 1e-4f);
+    }
+    evk::Sync();
+
+    param.cpu_download();
+    pp = param.cpu();
+
+    // Check that params decreased (moved opposite to positive gradient)
+    bool ok = true;
+    for (int i = 0; i < 4; ++i) {
+        if (float(pp[i]) >= initial_vals[i]) {
+            ok = false;
+            printf("  param[%d]: %.4f >= initial %.4f\n", i, float(pp[i]), initial_vals[i]);
+        }
+    }
+    TEST(ok);
+
+    // Check that timestep was incremented
+    TEST(state.t == 10);
+}
+
+void test_adam_convergence() {
+    printf("test_adam_convergence()\n");
+    
+    // Test that Adam can minimize a simple loss function
+    // Same setup as test_graph_backward but using Adam
+    Graph graph;
+
+    const uint32_t SIZE = 80u;
+    Tensor& target = graph.tensor({SIZE, SIZE}).identity(3.0f);
+
+    Tensor& x = graph.tensor({SIZE, SIZE}).identity(1.0f);
+    Tensor& w = graph.tensor({SIZE, SIZE}, true).identity(1.0f);
+    Tensor& b = graph.tensor({SIZE, SIZE}, true).identity(1.0f);
+    Tensor& mul = graph.matmul(w, x);
+    Tensor& y = graph.add(mul, b);
+    Tensor& loss = graph.mse_loss(y, target);
+
+    float initial_loss = 0.0f;
+    float final_loss = 0.0f;
+
+    for(int i = 0; i < 100; ++i) {
+        graph.eval(true);
+        graph.step_adam(0.01f);  // Use Adam with lr=0.01
+        float loss_val = float(loss.item());
+        
+        if (i == 0) initial_loss = loss_val;
+        if (i == 99) final_loss = loss_val;
+    }
+
+    printf("  initial_loss: %.6f, final_loss: %.6f\n", initial_loss, final_loss);
+    
+    // Loss should converge to near zero
+    TEST(final_loss < 0.001f);
+    // Loss should decrease significantly from initial
+    TEST(final_loss < initial_loss);
+}
+
+void test_adam_vs_sgd() {
+    printf("test_adam_vs_sgd()\n");
+    
+    // Compare Adam vs SGD convergence speed
+    const uint32_t SIZE = 80u;
+    const int STEPS = 50;
+
+    // Run with SGD
+    float sgd_final_loss;
+    {
+        Graph graph;
+        Tensor& target = graph.tensor({SIZE, SIZE}).identity(3.0f);
+        Tensor& x = graph.tensor({SIZE, SIZE}).identity(1.0f);
+        Tensor& w = graph.tensor({SIZE, SIZE}, true).identity(1.0f);
+        Tensor& b = graph.tensor({SIZE, SIZE}, true).identity(1.0f);
+        Tensor& mul = graph.matmul(w, x);
+        Tensor& y = graph.add(mul, b);
+        Tensor& loss = graph.mse_loss(y, target);
+
+        for(int i = 0; i < STEPS; ++i) {
+            graph.eval(true);
+            graph.step(0.05f);  // SGD with lr=0.05
+        }
+        sgd_final_loss = float(loss.item());
+    }
+
+    // Run with Adam
+    float adam_final_loss;
+    {
+        Graph graph;
+        Tensor& target = graph.tensor({SIZE, SIZE}).identity(3.0f);
+        Tensor& x = graph.tensor({SIZE, SIZE}).identity(1.0f);
+        Tensor& w = graph.tensor({SIZE, SIZE}, true).identity(1.0f);
+        Tensor& b = graph.tensor({SIZE, SIZE}, true).identity(1.0f);
+        Tensor& mul = graph.matmul(w, x);
+        Tensor& y = graph.add(mul, b);
+        Tensor& loss = graph.mse_loss(y, target);
+
+        for(int i = 0; i < STEPS; ++i) {
+            graph.eval(true);
+            graph.step_adam(0.01f);  // Adam with lr=0.01
+        }
+        adam_final_loss = float(loss.item());
+    }
+
+    printf("  SGD final loss:  %.6f (lr=0.05, %d steps)\n", sgd_final_loss, STEPS);
+    printf("  Adam final loss: %.6f (lr=0.01, %d steps)\n", adam_final_loss, STEPS);
+    
+    // Both should converge to low loss
+    TEST(sgd_final_loss < 0.1f);
+    TEST(adam_final_loss < 0.1f);
+}
+
 int main() {
     set_unhandled_exception_filter();
 
@@ -1334,11 +1637,16 @@ int main() {
 
     // test_add();
     // test_matmul();
+    // test_matmul_broadcast();
     // test_mse_loss();
     // test_flash_attention_backward();
-    test_flash_attention_cmp_softmax();
+    // test_flash_attention_cmp_softmax();
     // test_softmax();
     // test_graph_backward();
+
+    test_adam();
+    test_adam_convergence();
+    test_adam_vs_sgd();
 
     // benchmark_matmul();
 

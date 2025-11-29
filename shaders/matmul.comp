@@ -11,6 +11,9 @@ CONSTANT(4) uint TILE_N = 0;
 CONSTANT(5) uint ACC_C = 0;
 CONSTANT(6) uint TRANSPOSE_A = 0;
 CONSTANT(7) uint TRANSPOSE_B = 0;
+CONSTANT(8) uint STRIDE_A = 0; // elements per batch for A (0 => broadcast)
+CONSTANT(9) uint STRIDE_B = 0; // elements per batch for B (0 => broadcast)
+CONSTANT(10) uint STRIDE_C = 0; // elements per batch for C
 
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_shader_16bit_storage : enable
@@ -41,6 +44,12 @@ uint coordToOffset(uint i, uint j, uint stride, bool colMajor) {
 COMPUTE(32, 1, 1)
 void main() {
     uvec2 tileID = uvec2(gl_WorkGroupID.xy);
+    uint batchID = gl_WorkGroupID.z;
+
+    // Compute base element offsets for this batch, allowing broadcast (stride == 0)
+    uint baseA = (STRIDE_A == 0u) ? 0u : batchID * STRIDE_A;
+    uint baseB = (STRIDE_B == 0u) ? 0u : batchID * STRIDE_B;
+    uint baseC = (STRIDE_C == 0u) ? 0u : batchID * STRIDE_C;
 
     // Initialize result to zero
     [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
@@ -58,10 +67,19 @@ void main() {
 
             // Load matA
             coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> matA;
-            if (TRANSPOSE_A != 0u) {
-                coopMatLoad(matA, inputA.x, coordToOffset(gi, gk, M, true), M, gl_CooperativeMatrixLayoutColumnMajor);
-            } else {
-                coopMatLoad(matA, inputA.x, coordToOffset(gi, gk, K, false), K, gl_CooperativeMatrixLayoutRowMajor);
+            if (STRIDE_A != 0u) {
+                if (TRANSPOSE_A != 0u) {
+                    coopMatLoad(matA, inputA.x, baseA + coordToOffset(gi, gk, M, true), M, gl_CooperativeMatrixLayoutColumnMajor);
+                } else {
+                    coopMatLoad(matA, inputA.x, baseA + coordToOffset(gi, gk, K, false), K, gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+            if (STRIDE_A == 0u) {
+                if (TRANSPOSE_A != 0u) {
+                    coopMatLoad(matA, inputA.x, coordToOffset(gi, gk, M, true), M, gl_CooperativeMatrixLayoutColumnMajor);
+                } else {
+                    coopMatLoad(matA, inputA.x, coordToOffset(gi, gk, K, false), K, gl_CooperativeMatrixLayoutRowMajor);
+                }
             }
 
             // Loop over each column of matB
@@ -70,10 +88,19 @@ void main() {
                 uint gk = chunkK;
 
                 // Load matB
-                if (TRANSPOSE_B != 0u) {
-                    coopMatLoad(matB, inputB.x, coordToOffset(gk, gj, K, true), K, gl_CooperativeMatrixLayoutColumnMajor);
-                } else {
-                    coopMatLoad(matB, inputB.x, coordToOffset(gk, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                if (STRIDE_B != 0u) {
+                    if (TRANSPOSE_B != 0u) {
+                        coopMatLoad(matB, inputB.x, baseB + coordToOffset(gk, gj, K, true), K, gl_CooperativeMatrixLayoutColumnMajor);
+                    } else {
+                        coopMatLoad(matB, inputB.x, baseB + coordToOffset(gk, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                }
+                if (STRIDE_B == 0u) {
+                    if (TRANSPOSE_B != 0u) {
+                        coopMatLoad(matB, inputB.x, coordToOffset(gk, gj, K, true), K, gl_CooperativeMatrixLayoutColumnMajor);
+                    } else {
+                        coopMatLoad(matB, inputB.x, coordToOffset(gk, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                    }
                 }
                 result[i][j] = coopMatMulAdd(matA, matB, result[i][j]);
             }
@@ -87,12 +114,27 @@ void main() {
             uint gj = TILE_N * tileID.x + SUB_TILE * j;
 
             if (ACC_C == 0u) {
-                coopMatStore(result[i][j], inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                if (STRIDE_C != 0u) {
+                    coopMatStore(result[i][j], inputC.x, baseC + coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                }
+                if (STRIDE_C == 0u) {
+                    coopMatStore(result[i][j], inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                }
             } else {
                 coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> mat_c;
-                coopMatLoad(mat_c, inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                if (STRIDE_C != 0u) {
+                    coopMatLoad(mat_c, inputC.x, baseC + coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                }
+                if (STRIDE_C == 0u) {
+                    coopMatLoad(mat_c, inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                }
                 result[i][j] = result[i][j] + mat_c;
-                coopMatStore(result[i][j], inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                if (STRIDE_C != 0u) {
+                    coopMatStore(result[i][j], inputC.x, baseC + coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                }
+                if (STRIDE_C == 0u) {
+                    coopMatStore(result[i][j], inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
+                }
             }
         }
     }
