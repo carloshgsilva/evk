@@ -16,6 +16,9 @@ find_package(Vulkan REQUIRED)
 target_link_libraries(evk PUBLIC Vulkan::Vulkan)
 target_compile_definitions(evk PUBLIC "EVK_VULKAN=1")
 
-add_executable(evk_example "${CMAKE_CURRENT_SOURCE_DIR}/example/main.cpp")
+add_executable(evk_example 
+    "${CMAKE_CURRENT_SOURCE_DIR}/example/main.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/evk_ai.cpp"
+)
 target_link_libraries(evk_example PRIVATE evk)
 set_target_properties(evk_example PROPERTIES CXX_STANDARD 20)
