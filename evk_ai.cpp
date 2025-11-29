@@ -5,6 +5,7 @@ namespace evk::ai {
         evk::Pipeline flash_attn;
         evk::Pipeline flash_attn_bwd;
         evk::Pipeline mse_loss;
+        evk::Pipeline cross_entropy;
         evk::Pipeline sgd;
         evk::Pipeline adam;
         evk::Pipeline add;
@@ -162,6 +163,10 @@ namespace evk::ai {
         pipelines->softmax = evk::CreatePipeline({
             .name = "softmax",
             .CS = evk::loadSpirvFile("shaders/bin/softmax.comp.spv"),
+        });
+        pipelines->cross_entropy = evk::CreatePipeline({
+            .name = "cross_entropy",
+            .CS = evk::loadSpirvFile("shaders/bin/cross_entropy.comp.spv"),
         });
         pipelines->flash_scratch = {};
         pipelines->flash_scratch_elems = 0;
@@ -570,6 +575,109 @@ namespace evk::ai {
             gi[i] = float16_t(float(inp[i]) > 0.0f ? float(go[i]) : 0.0f);
         }
         grad_in.cpu_upload();
+    }
+
+    void cross_entropy_loss(Tensor& logits, Tensor& targets, Tensor& grad, Tensor& result) {
+        assert(logits.shape.rank() == 2);
+        assert(targets.shape.rank() == 1);
+        assert(result.shape.rank() == 1 && result.shape[0] == 1);
+        
+        uint32_t totalPositions = logits.shape[0];
+        uint32_t vocabSize = logits.shape[1];
+        assert(targets.shape[0] == totalPositions);
+        assert(grad.shape[0] == totalPositions && grad.shape[1] == vocabSize);
+
+        // Zero out the result buffer first
+        float16_t* rp = result.cpu();
+        rp[0] = float16_t(0.0f);
+        result.cpu_upload();
+
+        evk::CmdBind(pipelines->cross_entropy);
+        evk::CmdPush(evk::Constant{
+            logits.buffer.GetReference(),
+            targets.buffer.GetReference(),
+            result.buffer.GetReference(),
+            grad.buffer.GetReference(),
+            vocabSize,
+            totalPositions,
+        });
+        evk::CmdDispatch(1, 1, 1);
+        evk::CmdBarrier();
+    }
+
+    void embed(Tensor& embeddings, Tensor& indices, Tensor& out) {
+        assert(embeddings.shape.rank() == 2);
+        uint32_t vocab_size = embeddings.shape[0];
+        uint32_t embed_dim = embeddings.shape[1];
+        
+        uint32_t num_indices = indices.shape.count();
+        assert(out.shape.count() == num_indices * embed_dim);
+
+        embeddings.cpu_download();
+        indices.cpu_download();
+        
+        float16_t* emb = embeddings.cpu();
+        uint16_t* idx = (uint16_t*)indices.cpu();
+        float16_t* outp = out.cpu();
+
+        for (uint32_t i = 0; i < num_indices; ++i) {
+            uint32_t token_idx = idx[i];
+            assert(token_idx < vocab_size);
+            for (uint32_t d = 0; d < embed_dim; ++d) {
+                outp[i * embed_dim + d] = emb[token_idx * embed_dim + d];
+            }
+        }
+        out.cpu_upload();
+    }
+
+    void embed_backward(Tensor& grad_out, Tensor& indices, Tensor& grad_embeddings) {
+        assert(grad_embeddings.shape.rank() == 2);
+        uint32_t vocab_size = grad_embeddings.shape[0];
+        uint32_t embed_dim = grad_embeddings.shape[1];
+        
+        uint32_t num_indices = indices.shape.count();
+        assert(grad_out.shape.count() == num_indices * embed_dim);
+
+        grad_out.cpu_download();
+        indices.cpu_download();
+        grad_embeddings.cpu_download();
+        
+        float16_t* grad_o = grad_out.cpu();
+        uint16_t* idx = (uint16_t*)indices.cpu();
+        float16_t* grad_e = grad_embeddings.cpu();
+
+        for (uint32_t i = 0; i < num_indices; ++i) {
+            uint32_t token_idx = idx[i];
+            assert(token_idx < vocab_size);
+            for (uint32_t d = 0; d < embed_dim; ++d) {
+                float val = float(grad_e[token_idx * embed_dim + d]);
+                val += float(grad_o[i * embed_dim + d]);
+                grad_e[token_idx * embed_dim + d] = float16_t(val);
+            }
+        }
+        grad_embeddings.cpu_upload();
+    }
+
+    void apply_causal_mask(Tensor& scores) {
+        assert(scores.shape.rank() >= 2);
+        uint32_t N = scores.shape[-1];
+        assert(scores.shape[-2] == N);
+        
+        uint32_t batch = scores.shape.count() / (N * N);
+        
+        scores.cpu_download();
+        float16_t* s = scores.cpu();
+        
+        const float NEG_INF = -65504.0f; // fp16 min
+        
+        for (uint32_t b = 0; b < batch; ++b) {
+            for (uint32_t i = 0; i < N; ++i) {
+                for (uint32_t j = i + 1; j < N; ++j) {
+                    s[b * N * N + i * N + j] = float16_t(NEG_INF);
+                }
+            }
+        }
+        scores.cpu_upload();
     }
 }
 

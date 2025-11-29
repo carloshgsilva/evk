@@ -1,0 +1,81 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Cross Entropy Loss compute shader
+// Computes: loss = -mean(log_softmax(logits)[target])
+// Also computes gradient: grad = softmax(logits) - one_hot(target)
+// Sequential approach for simplicity (similar to mse_loss)
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+layout(buffer_reference) buffer BufferU16 { uint16_t x[]; };
+
+PUSH(
+    BufferFp16 logitsBuffer;    // (totalPositions, vocabSize) logits
+    BufferU16 targetBuffer;     // (totalPositions) target indices as uint16
+    BufferFp16 resultBuffer;    // scalar output loss
+    BufferFp16 gradBuffer;      // (totalPositions, vocabSize) gradient output
+    uint vocabSize;             // V
+    uint totalPositions;        // B * N
+)
+
+COMPUTE(32, 1, 1)
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    
+    float totalLoss = 0.0;
+    
+    // Process each position
+    for (uint pos = 0; pos < totalPositions; ++pos) {
+        uint rowStart = pos * vocabSize;
+        uint targetIdx = uint(targetBuffer.x[pos]);
+        
+        // 1) Find max for numerical stability (parallel across lanes)
+        float localMax = -3.402823466e+38;
+        for (uint j = lid; j < vocabSize; j += 32) {
+            float v = float(logitsBuffer.x[rowStart + j]);
+            localMax = max(localMax, v);
+        }
+        float rowMax = subgroupMax(localMax);
+        
+        // 2) Compute exp sum
+        float localSum = 0.0;
+        for (uint j = lid; j < vocabSize; j += 32) {
+            float ex = exp(float(logitsBuffer.x[rowStart + j]) - rowMax);
+            localSum += ex;
+        }
+        float denom = subgroupAdd(localSum);
+        float invDenom = 1.0 / max(denom, 1e-20);
+        
+        // 3) Compute gradients and find target log probability
+        float targetLogProb = 0.0;
+        for (uint j = lid; j < vocabSize; j += 32) {
+            float logit = float(logitsBuffer.x[rowStart + j]);
+            float softmax_val = exp(logit - rowMax) * invDenom;
+            
+            // Gradient: softmax - one_hot(target)
+            float grad = softmax_val;
+            if (j == targetIdx) {
+                grad -= 1.0;
+                targetLogProb = logit - rowMax - log(max(denom, 1e-20));
+            }
+            gradBuffer.x[rowStart + j] = float16_t(grad);
+        }
+        
+        // Reduce target log probability
+        targetLogProb = subgroupAdd(targetLogProb);
+        
+        // Accumulate loss (negative log probability)
+        totalLoss += -targetLogProb;
+    }
+    
+    // Store mean loss
+    if (lid == 0) {
+        resultBuffer.x[0] = float16_t(totalLoss / float(totalPositions));
+    }
+}
