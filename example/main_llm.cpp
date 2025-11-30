@@ -667,7 +667,7 @@ struct CircleDataset {
             }
         }
         
-        // Draw loss curve (cyan color)
+        // Draw raw loss curve (cyan color, dimmer)
         int prev_x = -1, prev_y = -1;
         for (size_t i = 0; i < losses.size(); ++i) {
             int x = MARGIN + int(float(i) / float(losses.size() - 1) * float(plot_width));
@@ -678,7 +678,30 @@ struct CircleDataset {
             y = (std::max)(MARGIN, (std::min)(height - MARGIN, y));
             
             if (prev_x >= 0) {
-                bmp.draw_line(prev_x, prev_y, x, y, 0, 200, 255);
+                bmp.draw_line(prev_x, prev_y, x, y, 0, 100, 150);  // Dimmer cyan for raw
+            }
+            prev_x = x;
+            prev_y = y;
+        }
+        
+        // Draw smoothed loss curve overlay (bright yellow/orange)
+        // Using exponential moving average (EMA) for smoothing
+        float ema_alpha = 0.05f;  // Smoothing factor (smaller = smoother)
+        float ema = losses[0];
+        prev_x = -1;
+        prev_y = -1;
+        for (size_t i = 0; i < losses.size(); ++i) {
+            ema = ema_alpha * losses[i] + (1.0f - ema_alpha) * ema;
+            
+            int x = MARGIN + int(float(i) / float(losses.size() - 1) * float(plot_width));
+            float norm_loss = (ema - min_loss) / range;
+            int y = height - MARGIN - int(norm_loss * float(plot_height));
+            
+            // Clamp y
+            y = (std::max)(MARGIN, (std::min)(height - MARGIN, y));
+            
+            if (prev_x >= 0) {
+                bmp.draw_line(prev_x, prev_y, x, y, 255, 180, 0);  // Bright orange for smoothed
             }
             prev_x = x;
             prev_y = y;
@@ -911,8 +934,8 @@ void run_circle_detection() {
            detector.input_seq_len, detector.output_seq_len, detector.total_seq_len);
     
     // Training
-    const int EPOCHS = 1000;
-    const float LR = 0.005f;
+    const int EPOCHS = 15000;
+    const float LR = 0.001f;
     
     printf("  Training for %d epochs...\n", EPOCHS);
     
