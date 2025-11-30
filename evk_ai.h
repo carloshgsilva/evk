@@ -549,11 +549,35 @@ struct Graph {
             evk::ai::matmul(a, b, c, false, false, false, tile_m, tile_n);
         };
         c.backward_fn = [&a, &b, &c, tile_m, tile_n]() {
-            // grad_a = grad_c @ b^T (accumulate for params, set for intermediates)
-            // grad_b = a^T @ grad_c (accumulate for params)
-            // Using acc_c=true assumes grads are zero-initialized in eval()
+            // grad_a = grad_c @ b^T
+            // For 3D @ 2D broadcast case: grad_c is (B,M,N), b is (K,N), grad_a is (B,M,K)
             evk::ai::matmul(c.grad(), b, a.grad(), false, true, true, tile_m, tile_n);
-            evk::ai::matmul(a, c.grad(), b.grad(), true, false, true, tile_m, tile_n);
+            
+            // grad_b = a^T @ grad_c
+            // For 3D @ 2D broadcast case: a is (B,M,K), grad_c is (B,M,N), grad_b is (K,N)
+            // Need to sum across batch dimension
+            if (a.shape.rank() == 3 && b.shape.rank() == 2) {
+                // Create temp 3D gradient, then sum across batches
+                uint32_t B = a.shape[0];
+                uint32_t K = a.shape[2];
+                uint32_t N = b.shape[1];
+                Tensor temp_grad({B, K, N});
+                evk::ai::matmul(a, c.grad(), temp_grad, true, false, false, tile_m, tile_n);
+                
+                // Sum across batch dimension (CPU fallback)
+                temp_grad.cpu_download();
+                b.grad().cpu_download();
+                float16_t* tg = temp_grad.cpu();
+                float16_t* bg = b.grad().cpu();
+                for (uint32_t batch = 0; batch < B; ++batch) {
+                    for (uint32_t i = 0; i < K * N; ++i) {
+                        bg[i] = float16_t(float(bg[i]) + float(tg[batch * K * N + i]));
+                    }
+                }
+                b.grad().cpu_upload();
+            } else {
+                evk::ai::matmul(a, c.grad(), b.grad(), true, false, true, tile_m, tile_n);
+            }
         };
         return c;
     }
@@ -600,15 +624,17 @@ struct Graph {
     }
 
     // Add positional embeddings: out = input + pos_emb (broadcast across batch)
-    // input: (B*N, embed_dim) - flattened input
+    // input: (B, N, embed_dim) - 3D input
     // pos_emb: (N, embed_dim) - positional embeddings (learnable parameter)
-    // batch_size: number of batches in input
-    // seq_len: sequence length (N)
-    // Returns: (B*N, embed_dim) input with position encodings added
+    // batch_size: number of batches in input (must match input.shape[0])
+    // seq_len: sequence length (N, must match input.shape[1])
+    // Returns: (B, N, embed_dim) input with position encodings added
     Tensor& add_position_embedding(Tensor& input, Tensor& pos_emb, uint32_t batch_size, uint32_t seq_len) {
         uint32_t embed_dim = pos_emb.shape[1];
-        assert(input.shape[0] == batch_size * seq_len);
-        assert(input.shape[1] == embed_dim);
+        assert(input.shape.rank() == 3 && "input must be (B, N, D)");
+        assert(input.shape[0] == batch_size);
+        assert(input.shape[1] == seq_len);
+        assert(input.shape[2] == embed_dim);
         assert(pos_emb.shape[0] == seq_len);
         
         nodes.push_back(std::make_unique<Tensor>(input.shape));
@@ -661,18 +687,22 @@ struct Graph {
 
     // Embedding lookup: out = embeddings[indices]
     // embeddings: (vocab_size, embed_dim) - learnable parameter
-    // indices: (B, N) or (B*N) - token indices as uint16 (filled by user each batch)
-    // Returns: (B*N, embed_dim) flattened embedded tokens
+    // indices: (B, N) - token indices as uint16 (filled by user each batch)
+    // Returns: (B, N, embed_dim) embedded tokens
     Tensor& embed(Tensor& embeddings, Tensor& indices) {
-        uint32_t num_indices = indices.shape.count();
+        assert(indices.shape.rank() == 2 && "indices must be (B, N)");
+        uint32_t batch_size = indices.shape[0];
+        uint32_t seq_len = indices.shape[1];
         uint32_t embed_dim = embeddings.shape[1];
         
-        nodes.push_back(std::make_unique<Tensor>(Shape({num_indices, embed_dim})));
+        nodes.push_back(std::make_unique<Tensor>(Shape({batch_size, seq_len, embed_dim})));
         Tensor& out = *nodes.back();
         
         out.forward_fn = [&embeddings, &indices, &out]() {
+            uint32_t batch_size = indices.shape[0];
+            uint32_t seq_len = indices.shape[1];
             uint32_t embed_dim = embeddings.shape[1];
-            uint32_t num_indices = indices.shape.count();
+            uint32_t num_indices = batch_size * seq_len;
             
             embeddings.cpu_download();
             indices.cpu_download();
@@ -691,8 +721,10 @@ struct Graph {
         };
         
         out.backward_fn = [&embeddings, &indices, &out]() {
+            uint32_t batch_size = indices.shape[0];
+            uint32_t seq_len = indices.shape[1];
             uint32_t embed_dim = embeddings.shape[1];
-            uint32_t num_indices = indices.shape.count();
+            uint32_t num_indices = batch_size * seq_len;
             
             out.grad().cpu_download();
             indices.cpu_download();
@@ -718,21 +750,55 @@ struct Graph {
     }
 
     // Cross entropy loss for token prediction
-    // logits: (B*N, vocab_size) or reshaped from (B, N, vocab_size)
-    // targets: (B*N) target indices as uint16
+    // logits: (B, N, vocab_size) - 3D logits
+    // targets: (B, N) target indices as uint16
     // Returns scalar loss
     // Note: gradient is computed in backward_fn (not forward) to avoid being zeroed
     Tensor& cross_entropy_loss(Tensor& logits, Tensor& targets) {
+        assert(logits.shape.rank() == 3 && "logits must be (B, N, V)");
+        assert(targets.shape.rank() == 2 && "targets must be (B, N)");
+        
+        uint32_t B = logits.shape[0];
+        uint32_t N = logits.shape[1];
+        uint32_t V = logits.shape[2];
+        
+        // Create a persistent flat gradient tensor for the kernel
+        nodes.push_back(std::make_unique<Tensor>(Shape({B * N, V})));
+        Tensor& flat_grad = *nodes.back();
+        
         nodes.push_back(std::make_unique<Tensor>(Shape({1})));
         Tensor& loss = *nodes.back();
-        loss.forward_fn = [&logits, &targets, &loss]() {
-            // Compute loss value and gradient together
-            evk::ai::cross_entropy_loss(logits, targets, logits.grad(), loss);
+        
+        // Create a flattened view for the cross_entropy_loss kernel
+        // The kernel expects (B*N, V) logits and (B*N) targets
+        loss.forward_fn = [&logits, &targets, &loss, &flat_grad, B, N, V]() {
+            // Create temporary flattened tensors (use same buffer, just different shape interpretation)
+            Tensor flat_logits({B * N, V});
+            Tensor flat_targets({B * N});
+            
+            // Copy data (logits are already contiguous in the right order)
+            evk::CmdCopy(logits.buffer, flat_logits.buffer, logits.shape.count() * sizeof(float16_t));
+            evk::CmdCopy(targets.buffer, flat_targets.buffer, targets.shape.count() * sizeof(float16_t));
+            evk::Sync();
+            
+            // Compute loss and gradient into flat_grad
+            evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, loss);
         };
-        loss.backward_fn = [&logits, &targets, &loss]() {
+        loss.backward_fn = [&logits, &targets, &loss, &flat_grad, B, N, V]() {
             // Re-compute gradient (since eval() zeroes gradients before backward)
+            Tensor flat_logits({B * N, V});
+            Tensor flat_targets({B * N});
             Tensor dummy_loss({1});
-            evk::ai::cross_entropy_loss(logits, targets, logits.grad(), dummy_loss);
+            
+            evk::CmdCopy(logits.buffer, flat_logits.buffer, logits.shape.count() * sizeof(float16_t));
+            evk::CmdCopy(targets.buffer, flat_targets.buffer, targets.shape.count() * sizeof(float16_t));
+            evk::Sync();
+            
+            // Compute gradient into flat_grad, then copy to logits.grad()
+            evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, dummy_loss);
+            
+            // Copy flat gradient back to 3D logits gradient (same memory layout)
+            evk::CmdCopy(flat_grad.buffer, logits.grad().buffer, logits.shape.count() * sizeof(float16_t));
         };
         return loss;
     }

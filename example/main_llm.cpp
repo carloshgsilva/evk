@@ -86,8 +86,9 @@ float run_next_token_prediction_attention() {
     
     Graph model;
     
-    Tensor& input_tokens = model.tensor({BATCH_SIZE * SEQ_LEN});
-    Tensor& targets = model.tensor({BATCH_SIZE * SEQ_LEN});
+    // Use 3D tensors throughout: (B, N, ...)
+    Tensor& input_tokens = model.tensor({BATCH_SIZE, SEQ_LEN});
+    Tensor& targets = model.tensor({BATCH_SIZE, SEQ_LEN});
     
     Tensor& token_emb = model.tensor({VOCAB_SIZE, EMBED_DIM}, true);
     Tensor& pos_emb = model.tensor({SEQ_LEN, EMBED_DIM}, true);
@@ -102,29 +103,22 @@ float run_next_token_prediction_attention() {
     Tensor& w2 = model.tensor({HIDDEN_DIM, EMBED_DIM}, true);
     Tensor& w_out = model.tensor({EMBED_DIM, VOCAB_SIZE}, true);
     
+    // embed now returns (B, N, D) shape
     Tensor& embedded = model.embed(token_emb, input_tokens);
     Tensor& input_with_pos = model.add_position_embedding(embedded, pos_emb, BATCH_SIZE, SEQ_LEN);
     
-    // Project to Q, K, V
+    // Project to Q, K, V - all operations work with (B, N, D) directly
     Tensor& q = model.matmul(input_with_pos, w_q);
     Tensor& k = model.matmul(input_with_pos, w_k);
     Tensor& v = model.matmul(input_with_pos, w_v);
     
-    // Reshape Q, K, V for attention: (B*N, D) -> (B, N, D)
-    Tensor& q_3d = model.view(q, {BATCH_SIZE, SEQ_LEN, EMBED_DIM});
-    Tensor& k_3d = model.view(k, {BATCH_SIZE, SEQ_LEN, EMBED_DIM});
-    Tensor& v_3d = model.view(v, {BATCH_SIZE, SEQ_LEN, EMBED_DIM});
-    
-    // Causal self-attention
-    Tensor& attn_out_3d = model.causal_attention(q_3d, k_3d, v_3d);
-    
-    // Reshape back to 2D for FFN: (B, N, D) -> (B*N, D)
-    Tensor& attn_out = model.view(attn_out_3d, {BATCH_SIZE * SEQ_LEN, EMBED_DIM});
+    // Causal self-attention - no view() needed, already (B, N, D)
+    Tensor& attn_out = model.causal_attention(q, k, v);
     
     // Residual connection after attention
     Tensor& attn_residual = model.add(input_with_pos, attn_out);
     
-    // FFN
+    // FFN - matmul broadcasts (B, N, D) @ (D, H) -> (B, N, H)
     Tensor& hidden = model.matmul(attn_residual, w1);
     Tensor& hidden_relu = model.relu(hidden);
     Tensor& hidden_proj = model.matmul(hidden_relu, w2);
@@ -201,10 +195,10 @@ float run_next_token_prediction_attention() {
     // === Autoregressive Generation ===
     printf("\n  === Autoregressive Generation ===\n");
     
-    // Create inference graph with batch size 1
+    // Create inference graph with batch size 1, using 3D tensors throughout
     Graph inference;
     
-    Tensor& inf_input = inference.tensor({SEQ_LEN});
+    Tensor& inf_input = inference.tensor({1, SEQ_LEN});
     
     // Copy trained weights to inference graph (share the same tensors)
     Tensor& inf_token_emb = inference.tensor({VOCAB_SIZE, EMBED_DIM});
@@ -227,7 +221,7 @@ float run_next_token_prediction_attention() {
     evk::CmdCopy(w_out.buffer, inf_w_out.buffer, w_out.shape.count() * sizeof(float16_t));
     evk::Sync();
     
-    // Build inference graph
+    // Build inference graph - all 3D, no view() needed
     Tensor& inf_embedded = inference.embed(inf_token_emb, inf_input);
     Tensor& inf_input_pos = inference.add_position_embedding(inf_embedded, inf_pos_emb, 1, SEQ_LEN);
     
@@ -235,12 +229,8 @@ float run_next_token_prediction_attention() {
     Tensor& inf_k = inference.matmul(inf_input_pos, inf_w_k);
     Tensor& inf_v = inference.matmul(inf_input_pos, inf_w_v);
     
-    Tensor& inf_q_3d = inference.view(inf_q, {1, SEQ_LEN, EMBED_DIM});
-    Tensor& inf_k_3d = inference.view(inf_k, {1, SEQ_LEN, EMBED_DIM});
-    Tensor& inf_v_3d = inference.view(inf_v, {1, SEQ_LEN, EMBED_DIM});
-    
-    Tensor& inf_attn_3d = inference.causal_attention(inf_q_3d, inf_k_3d, inf_v_3d);
-    Tensor& inf_attn = inference.view(inf_attn_3d, {SEQ_LEN, EMBED_DIM});
+    // Causal attention - already (1, N, D)
+    Tensor& inf_attn = inference.causal_attention(inf_q, inf_k, inf_v);
     
     Tensor& inf_attn_res = inference.add(inf_input_pos, inf_attn);
     Tensor& inf_hidden = inference.matmul(inf_attn_res, inf_w1);
