@@ -155,8 +155,8 @@ struct float16_t {
 
 struct Shape {
     static constexpr uint32_t MAX_DIMENSIONS = 8;
-    uint32_t values[MAX_DIMENSIONS];
-    uint32_t size;
+    uint32_t values[MAX_DIMENSIONS] = {};
+    uint32_t size = 0;
 
     Shape() {
         size = 0;
@@ -217,7 +217,7 @@ struct Tensor {
     evk::Buffer buffer;
     evk::Buffer cpu_buffer;
     std::unique_ptr<Tensor> grad_tensor;
-    Shape shape;
+    Shape shape = {};
 
     std::function<void()> forward_fn;
     std::function<void()> backward_fn;
