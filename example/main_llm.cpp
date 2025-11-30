@@ -9,6 +9,61 @@
 // Transformer Model
 // ============================================================================
 
+// Attention block: Query-Only attention + FFN with residuals
+// Uses Query-Only Attention (https://arxiv.org/pdf/2510.00365)
+struct AttentionBlock {
+    // Weight tensors (owned by graph)
+    Tensor* w_q = nullptr;  // Query projection
+    Tensor* w1 = nullptr;   // FFN first layer
+    Tensor* w2 = nullptr;   // FFN second layer
+    
+    // Dimensions
+    uint32_t embed_dim;
+    uint32_t hidden_dim;
+    
+    AttentionBlock() : embed_dim(0), hidden_dim(0) {}
+    
+    // Initialize weights in the given graph
+    void init(Graph& graph, uint32_t embed_dim_, uint32_t hidden_dim_) {
+        embed_dim = embed_dim_;
+        hidden_dim = hidden_dim_;
+        
+        w_q = &graph.tensor({embed_dim, embed_dim}, true);
+        w1 = &graph.tensor({embed_dim, hidden_dim}, true);
+        w2 = &graph.tensor({hidden_dim, embed_dim}, true);
+    }
+    
+    // Initialize weights with random values
+    void init_weights(float scale) {
+        w_q->random_init(scale);
+        w1->random_init(scale);
+        w2->random_init(scale);
+    }
+    
+    // Forward pass through this block
+    // input: (B, N, embed_dim)
+    // Returns: (B, N, embed_dim) output with residual connections
+    Tensor& forward(Graph& graph, Tensor& input) {
+        // Attention projections (Query-Only: K and V are just input)
+        Tensor& q = graph.matmul(input, *w_q);
+        Tensor& k = input;
+        Tensor& v = input;
+        
+        // Causal self-attention with residual
+        Tensor& attn_out = graph.causal_attention(q, k, v);
+        Tensor& attn_residual = graph.add(input, attn_out);
+        
+        // FFN with residual
+        Tensor& hidden = graph.matmul(attn_residual, *w1);
+        Tensor& hidden_relu = graph.relu(hidden);
+        Tensor& hidden_proj = graph.matmul(hidden_relu, *w2);
+        Tensor& output = graph.add(attn_residual, hidden_proj);
+        
+        return output;
+    }
+};
+
+// Query-Only Attention Transformer with N layers
 struct Transformer {
     // Hyperparameters
     uint32_t vocab_size;
@@ -16,6 +71,7 @@ struct Transformer {
     uint32_t embed_dim;
     uint32_t hidden_dim;
     uint32_t batch_size;
+    uint32_t num_layers;
     
     // Vocabulary
     const char* vocab;
@@ -30,12 +86,10 @@ struct Transformer {
     // Weight tensors (owned by model graph)
     Tensor* token_emb = nullptr;
     Tensor* pos_emb = nullptr;
-    Tensor* w_q = nullptr; // Query-Only Attention (https://arxiv.org/pdf/2510.00365)
-    // Tensor* w_k = nullptr;
-    // Tensor* w_v = nullptr;
-    Tensor* w1 = nullptr;
-    Tensor* w2 = nullptr;
     Tensor* w_out = nullptr;
+    
+    // Attention blocks (N layers)
+    std::vector<AttentionBlock> blocks;
     
     // Inference graph (separate for generation)
     Graph inference;
@@ -45,17 +99,16 @@ struct Transformer {
     // Inference weight tensors (copies from training)
     Tensor* inf_token_emb = nullptr;
     Tensor* inf_pos_emb = nullptr;
-    Tensor* inf_w_q = nullptr;
-    // Tensor* inf_w_k = nullptr;
-    // Tensor* inf_w_v = nullptr;
-    Tensor* inf_w1 = nullptr;
-    Tensor* inf_w2 = nullptr;
     Tensor* inf_w_out = nullptr;
     
+    // Inference attention blocks
+    std::vector<AttentionBlock> inf_blocks;
+    
     Transformer(uint32_t vocab_size, uint32_t seq_len, uint32_t embed_dim, 
-                uint32_t hidden_dim, uint32_t batch_size, const char* vocab = nullptr)
+                uint32_t hidden_dim, uint32_t batch_size, uint32_t num_layers = 1,
+                const char* vocab = nullptr)
         : vocab_size(vocab_size), seq_len(seq_len), embed_dim(embed_dim),
-          hidden_dim(hidden_dim), batch_size(batch_size), vocab(vocab)
+          hidden_dim(hidden_dim), batch_size(batch_size), num_layers(num_layers), vocab(vocab)
     {
         actual_vocab_size = vocab ? (uint32_t)strlen(vocab) : vocab_size;
         build_training_graph();
@@ -70,34 +123,26 @@ struct Transformer {
         // Learnable parameters
         token_emb = &model.tensor({vocab_size, embed_dim}, true);
         pos_emb = &model.tensor({seq_len, embed_dim}, true);
-        w_q = &model.tensor({embed_dim, embed_dim}, true);
-        // w_k = &model.tensor({embed_dim, embed_dim}, false); // Not used in query-only attention
-        // w_v = &model.tensor({embed_dim, embed_dim}, false); // Not used in query-only attention
-        w1 = &model.tensor({embed_dim, hidden_dim}, true);
-        w2 = &model.tensor({hidden_dim, embed_dim}, true);
         w_out = &model.tensor({embed_dim, vocab_size}, true);
+        
+        // Initialize attention blocks
+        blocks.resize(num_layers);
+        for (uint32_t i = 0; i < num_layers; ++i) {
+            blocks[i].init(model, embed_dim, hidden_dim);
+        }
         
         // Forward pass
         Tensor& embedded = model.embed(*token_emb, *input_tokens);
         Tensor& input_with_pos = model.add_position_embedding(embedded, *pos_emb, batch_size, seq_len);
         
-        // Attention projections
-        Tensor& q = model.matmul(input_with_pos, *w_q);
-        Tensor& k = input_with_pos;//model.matmul(input_with_pos, *w_k);
-        Tensor& v = input_with_pos;//model.matmul(input_with_pos, *w_v);
-        
-        // Causal self-attention with residual
-        Tensor& attn_out = model.causal_attention(q, k, v);
-        Tensor& attn_residual = model.add(input_with_pos, attn_out);
-        
-        // FFN with residual
-        Tensor& hidden = model.matmul(attn_residual, *w1);
-        Tensor& hidden_relu = model.relu(hidden);
-        Tensor& hidden_proj = model.matmul(hidden_relu, *w2);
-        Tensor& residual = model.add(attn_residual, hidden_proj);
+        // Pass through N attention blocks
+        Tensor* x = &input_with_pos;
+        for (uint32_t i = 0; i < num_layers; ++i) {
+            x = &blocks[i].forward(model, *x);
+        }
         
         // Output projection and loss
-        Tensor& logits = model.matmul(residual, *w_out);
+        Tensor& logits = model.matmul(*x, *w_out);
         loss = &model.cross_entropy_loss(logits, *targets);
     }
     
@@ -108,30 +153,25 @@ struct Transformer {
         // Weight tensors (non-trainable, will be copied from training)
         inf_token_emb = &inference.tensor({vocab_size, embed_dim});
         inf_pos_emb = &inference.tensor({seq_len, embed_dim});
-        inf_w_q = &inference.tensor({embed_dim, embed_dim});
-        // inf_w_k = &inference.tensor({embed_dim, embed_dim});
-        // inf_w_v = &inference.tensor({embed_dim, embed_dim});
-        inf_w1 = &inference.tensor({embed_dim, hidden_dim});
-        inf_w2 = &inference.tensor({hidden_dim, embed_dim});
         inf_w_out = &inference.tensor({embed_dim, vocab_size});
+        
+        // Initialize inference attention blocks
+        inf_blocks.resize(num_layers);
+        for (uint32_t i = 0; i < num_layers; ++i) {
+            inf_blocks[i].init(inference, embed_dim, hidden_dim);
+        }
         
         // Forward pass (same architecture as training)
         Tensor& embedded = inference.embed(*inf_token_emb, *inf_input);
         Tensor& input_with_pos = inference.add_position_embedding(embedded, *inf_pos_emb, 1, seq_len);
         
-        Tensor& q = inference.matmul(input_with_pos, *inf_w_q);
-        Tensor& k = input_with_pos;//inference.matmul(input_with_pos, *inf_w_k);
-        Tensor& v = input_with_pos;//inference.matmul(input_with_pos, *inf_w_v);
+        // Pass through N attention blocks
+        Tensor* x = &input_with_pos;
+        for (uint32_t i = 0; i < num_layers; ++i) {
+            x = &inf_blocks[i].forward(inference, *x);
+        }
         
-        Tensor& attn_out = inference.causal_attention(q, k, v);
-        Tensor& attn_residual = inference.add(input_with_pos, attn_out);
-        
-        Tensor& hidden = inference.matmul(attn_residual, *inf_w1);
-        Tensor& hidden_relu = inference.relu(hidden);
-        Tensor& hidden_proj = inference.matmul(hidden_relu, *inf_w2);
-        Tensor& residual = inference.add(attn_residual, hidden_proj);
-        
-        inf_logits = &inference.matmul(residual, *inf_w_out);
+        inf_logits = &inference.matmul(*x, *inf_w_out);
     }
     
     void init_weights(uint32_t seed = 42) {
@@ -139,23 +179,26 @@ struct Transformer {
         float scale = 0.1f / sqrtf(float(embed_dim));
         token_emb->random_init(0.1f);
         pos_emb->random_init(0.1f);
-        w_q->random_init(scale);
-        // w_k->random_init(scale);
-        // w_v->random_init(scale);
-        w1->random_init(scale);
-        w2->random_init(scale);
+        
+        // Initialize all attention block weights (must be before w_out to match original order)
+        for (uint32_t i = 0; i < num_layers; ++i) {
+            blocks[i].init_weights(scale);
+        }
+        
         w_out->random_init(scale);
     }
     
     void copy_weights_to_inference() {
         evk::CmdCopy(token_emb->buffer, inf_token_emb->buffer, token_emb->shape.count() * sizeof(float16_t));
         evk::CmdCopy(pos_emb->buffer, inf_pos_emb->buffer, pos_emb->shape.count() * sizeof(float16_t));
-        evk::CmdCopy(w_q->buffer, inf_w_q->buffer, w_q->shape.count() * sizeof(float16_t));
-        // evk::CmdCopy(w_k->buffer, inf_w_k->buffer, w_k->shape.count() * sizeof(float16_t));
-        // evk::CmdCopy(w_v->buffer, inf_w_v->buffer, w_v->shape.count() * sizeof(float16_t));
-        evk::CmdCopy(w1->buffer, inf_w1->buffer, w1->shape.count() * sizeof(float16_t));
-        evk::CmdCopy(w2->buffer, inf_w2->buffer, w2->shape.count() * sizeof(float16_t));
         evk::CmdCopy(w_out->buffer, inf_w_out->buffer, w_out->shape.count() * sizeof(float16_t));
+        
+        // Copy all attention block weights
+        for (uint32_t i = 0; i < num_layers; ++i) {
+            evk::CmdCopy(blocks[i].w_q->buffer, inf_blocks[i].w_q->buffer, blocks[i].w_q->shape.count() * sizeof(float16_t));
+            evk::CmdCopy(blocks[i].w1->buffer, inf_blocks[i].w1->buffer, blocks[i].w1->shape.count() * sizeof(float16_t));
+            evk::CmdCopy(blocks[i].w2->buffer, inf_blocks[i].w2->buffer, blocks[i].w2->shape.count() * sizeof(float16_t));
+        }
         evk::Sync();
     }
     
@@ -349,15 +392,16 @@ float run_next_token_prediction_attention() {
     const uint32_t EMBED_DIM = 64;
     const uint32_t HIDDEN_DIM = 128;
     const uint32_t BATCH_SIZE = 4;
+    const uint32_t NUM_LAYERS = 1;  // Number of attention blocks
     
-    printf("  Attention Model: vocab=%u, seq=%u, embed=%u, hidden=%u\n", 
-           VOCAB_SIZE, SEQ_LEN, EMBED_DIM, HIDDEN_DIM);
+    printf("  Attention Model: vocab=%u, seq=%u, embed=%u, hidden=%u, layers=%u\n", 
+           VOCAB_SIZE, SEQ_LEN, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS);
     
     // Create and initialize transformer
-    Transformer transformer(VOCAB_SIZE, SEQ_LEN, EMBED_DIM, HIDDEN_DIM, BATCH_SIZE, VOCAB);
+    Transformer transformer(VOCAB_SIZE, SEQ_LEN, EMBED_DIM, HIDDEN_DIM, BATCH_SIZE, NUM_LAYERS, VOCAB);
     transformer.init_weights(42);
     
-    const int EPOCHS = 120;
+    const int EPOCHS = 60;
     const float LR = 0.01f;
     
     printf("  Training for %d epochs...\n", EPOCHS);
