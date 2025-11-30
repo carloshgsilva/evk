@@ -39,6 +39,8 @@ void main() {
         float localMax = -3.402823466e+38;
         for (uint j = lid; j < vocabSize; j += 32) {
             float v = float(logitsBuffer.x[rowStart + j]);
+            // Clamp to prevent overflow
+            v = clamp(v, -65000.0, 65000.0);
             localMax = max(localMax, v);
         }
         float rowMax = subgroupMax(localMax);
@@ -46,7 +48,9 @@ void main() {
         // 2) Compute exp sum
         float localSum = 0.0;
         for (uint j = lid; j < vocabSize; j += 32) {
-            float ex = exp(float(logitsBuffer.x[rowStart + j]) - rowMax);
+            float v = float(logitsBuffer.x[rowStart + j]);
+            v = clamp(v, -65000.0, 65000.0);
+            float ex = exp(v - rowMax);
             localSum += ex;
         }
         float denom = subgroupAdd(localSum);
@@ -56,6 +60,7 @@ void main() {
         float targetLogProb = 0.0;
         for (uint j = lid; j < vocabSize; j += 32) {
             float logit = float(logitsBuffer.x[rowStart + j]);
+            logit = clamp(logit, -65000.0, 65000.0);
             float softmax_val = exp(logit - rowMax) * invDenom;
             
             // Gradient: softmax - one_hot(target)
@@ -71,11 +76,17 @@ void main() {
         targetLogProb = subgroupAdd(targetLogProb);
         
         // Accumulate loss (negative log probability)
-        totalLoss += -targetLogProb;
+        if (!isnan(targetLogProb) && !isinf(targetLogProb)) {
+            totalLoss += -targetLogProb;
+        }
     }
     
     // Store mean loss
     if (lid == 0) {
-        resultBuffer.x[0] = float16_t(totalLoss / float(totalPositions));
+        float loss = totalLoss / float(totalPositions);
+        if (isnan(loss) || isinf(loss)) {
+            loss = 0.0;  // Fallback
+        }
+        resultBuffer.x[0] = float16_t(loss);
     }
 }

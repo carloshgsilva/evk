@@ -1,0 +1,35 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 inputBuffer;    // (batch_size, seq_len, embed_dim)
+    BufferFp16 posEmbBuffer;   // (seq_len, embed_dim)
+    BufferFp16 outputBuffer;   // (batch_size, seq_len, embed_dim)
+    uint batchSize;
+    uint seqLen;
+    uint embedDim;
+)
+
+// out[b, t, d] = input[b, t, d] + pos_emb[t, d]
+COMPUTE(256, 1, 1)
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint totalElements = batchSize * seqLen * embedDim;
+    if (gid >= totalElements) return;
+    
+    // Compute position: gid = b * (seqLen * embedDim) + t * embedDim + d
+    uint temp = gid;
+    uint d = temp % embedDim;
+    temp /= embedDim;
+    uint t = temp % seqLen;
+    // uint b = temp / seqLen;  // Not needed for pos_emb indexing
+    
+    float inVal = float(inputBuffer.x[gid]);
+    float posVal = float(posEmbBuffer.x[t * embedDim + d]);
+    outputBuffer.x[gid] = float16_t(inVal + posVal);
+}

@@ -39,22 +39,39 @@ void main() {
         float m = float(mBuffer.x[gid]);
         float v = float(vBuffer.x[gid]);
 
+        // Gradient clipping to prevent NaN from exploding gradients
+        grad = clamp(grad, -65504.0, 65504.0);  // fp16 max
+        
+        // Skip update if gradient is NaN or Inf
+        if (isnan(grad) || isinf(grad)) {
+            return;
+        }
+
         // Update biased first moment estimate
         m = beta1 * m + (1.0 - beta1) * grad;
         // Update biased second moment estimate
         v = beta2 * v + (1.0 - beta2) * grad * grad;
 
-        // Store updated moments
-        mBuffer.x[gid] = float16_t(m);
-        vBuffer.x[gid] = float16_t(v);
+        // Store updated moments (with NaN protection)
+        if (!isnan(m) && !isinf(m)) {
+            mBuffer.x[gid] = float16_t(m);
+        }
+        if (!isnan(v) && !isinf(v)) {
+            vBuffer.x[gid] = float16_t(v);
+        }
 
         // Bias-corrected estimates
         float mHat = m * beta1CorrectionInv;
         float vHat = v * beta2CorrectionInv;
 
-        // Update parameter
-        param = param - learningRate * mHat / (sqrt(vHat) + epsilon);
-        paramBuffer.x[gid] = float16_t(param);
+        // Update parameter with NaN protection
+        float update = learningRate * mHat / (sqrt(vHat) + epsilon);
+        if (!isnan(update) && !isinf(update)) {
+            param = param - update;
+            // Clamp parameter to fp16 range
+            param = clamp(param, -65504.0, 65504.0);
+            paramBuffer.x[gid] = float16_t(param);
+        }
     }
 }
 

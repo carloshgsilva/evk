@@ -1,0 +1,33 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 scoresBuffer;  // (batch, N, N)
+    uint batch;
+    uint N;
+)
+
+// Apply causal mask: set scores[b, i, j] = -inf for j > i
+COMPUTE(256, 1, 1)
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint totalElements = batch * N * N;
+    if (gid >= totalElements) return;
+    
+    // gid = b * N * N + i * N + j
+    uint temp = gid;
+    uint j = temp % N;
+    temp /= N;
+    uint i = temp % N;
+    // uint b = temp / N;  // Not needed
+    
+    // Causal mask: j > i should be -inf
+    if (j > i) {
+        scoresBuffer.x[gid] = float16_t(-65504.0); // fp16 min
+    }
+}

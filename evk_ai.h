@@ -448,7 +448,11 @@ namespace evk::ai {
     // out has the same shape as in
     void softmax(Tensor& in, Tensor& out);
 
-    // ReLU activation (CPU implementation for now)
+    // Softmax backward with optional scale factor
+    // grad_in = probs * (grad_out - dot(grad_out, probs)) * scale
+    void softmax_backward(Tensor& probs, Tensor& grad_out, Tensor& grad_in, float scale_factor = 1.0f);
+
+    // ReLU activation (GPU implementation)
     // out = max(0, in)
     void relu(Tensor& in, Tensor& out);
 
@@ -478,6 +482,23 @@ namespace evk::ai {
     // scores: (B, N, N) attention scores where scores[b, i, j] is query i attending to key j
     // For causal: j > i should be masked (set to -inf)
     void apply_causal_mask(Tensor& scores);
+
+    // Position embedding addition: out = input + pos_emb (broadcast across batch)
+    void position_add(Tensor& input, Tensor& pos_emb, Tensor& out,
+                      uint32_t batch_size, uint32_t seq_len, uint32_t embed_dim);
+
+    // Position embedding backward
+    void position_add_backward(Tensor& grad_out, Tensor& grad_input, Tensor& grad_pos,
+                               uint32_t batch_size, uint32_t seq_len, uint32_t embed_dim);
+
+    // In-place scale: tensor *= scale_factor
+    void scale(Tensor& tensor, float scale_factor);
+
+    // Zero out a tensor on GPU
+    void zero(Tensor& tensor);
+
+    // Sum across batch dimension: out[i] += sum_b(input[b, i])
+    void sum_batch(Tensor& input, Tensor& output, uint32_t batch_count, uint32_t size_per_batch);
 }
 
 struct Graph {
@@ -512,15 +533,8 @@ struct Graph {
         };
         
         out.backward_fn = [&a, &out]() {
-            // Gradient flows back unchanged (just reshape)
-            a.grad().cpu_download();
-            out.grad().cpu_download();
-            float16_t* ga = a.grad().cpu();
-            float16_t* go = out.grad().cpu();
-            for (uint32_t i = 0; i < a.shape.count(); ++i) {
-                ga[i] = float16_t(float(ga[i]) + float(go[i]));
-            }
-            a.grad().cpu_upload();
+            // Gradient flows back unchanged (just reshape) - use GPU add
+            evk::ai::add(a.grad(), out.grad(), a.grad());
         };
         
         return out;
@@ -557,24 +571,15 @@ struct Graph {
             // For 3D @ 2D broadcast case: a is (B,M,K), grad_c is (B,M,N), grad_b is (K,N)
             // Need to sum across batch dimension
             if (a.shape.rank() == 3 && b.shape.rank() == 2) {
-                // Create temp 3D gradient, then sum across batches
+                // Create temp 3D gradient, then sum across batches on GPU
                 uint32_t B = a.shape[0];
                 uint32_t K = a.shape[2];
                 uint32_t N = b.shape[1];
                 Tensor temp_grad({B, K, N});
                 evk::ai::matmul(a, c.grad(), temp_grad, true, false, false, tile_m, tile_n);
                 
-                // Sum across batch dimension (CPU fallback)
-                temp_grad.cpu_download();
-                b.grad().cpu_download();
-                float16_t* tg = temp_grad.cpu();
-                float16_t* bg = b.grad().cpu();
-                for (uint32_t batch = 0; batch < B; ++batch) {
-                    for (uint32_t i = 0; i < K * N; ++i) {
-                        bg[i] = float16_t(float(bg[i]) + float(tg[batch * K * N + i]));
-                    }
-                }
-                b.grad().cpu_upload();
+                // Sum across batch dimension on GPU
+                evk::ai::sum_batch(temp_grad, b.grad(), B, K * N);
             } else {
                 evk::ai::matmul(a, c.grad(), b.grad(), true, false, true, tile_m, tile_n);
             }
@@ -641,45 +646,12 @@ struct Graph {
         Tensor& out = *nodes.back();
         
         out.forward_fn = [&input, &pos_emb, &out, batch_size, seq_len, embed_dim]() {
-            input.cpu_download();
-            pos_emb.cpu_download();
-            float16_t* inp = input.cpu();
-            float16_t* pos = pos_emb.cpu();
-            float16_t* outp = out.cpu();
-            
-            for (uint32_t b = 0; b < batch_size; ++b) {
-                for (uint32_t t = 0; t < seq_len; ++t) {
-                    for (uint32_t d = 0; d < embed_dim; ++d) {
-                        uint32_t idx = b * seq_len * embed_dim + t * embed_dim + d;
-                        outp[idx] = float16_t(float(inp[idx]) + float(pos[t * embed_dim + d]));
-                    }
-                }
-            }
-            out.cpu_upload();
+            evk::ai::position_add(input, pos_emb, out, batch_size, seq_len, embed_dim);
         };
         
         out.backward_fn = [&input, &pos_emb, &out, batch_size, seq_len, embed_dim]() {
-            out.grad().cpu_download();
-            input.grad().cpu_download();
-            pos_emb.grad().cpu_download();
-            
-            float16_t* grad_out = out.grad().cpu();
-            float16_t* grad_inp = input.grad().cpu();
-            float16_t* grad_pos = pos_emb.grad().cpu();
-            
-            // Gradient flows to both input and pos_emb
-            for (uint32_t b = 0; b < batch_size; ++b) {
-                for (uint32_t t = 0; t < seq_len; ++t) {
-                    for (uint32_t d = 0; d < embed_dim; ++d) {
-                        uint32_t idx = b * seq_len * embed_dim + t * embed_dim + d;
-                        float g = float(grad_out[idx]);
-                        grad_inp[idx] = float16_t(float(grad_inp[idx]) + g);
-                        grad_pos[t * embed_dim + d] = float16_t(float(grad_pos[t * embed_dim + d]) + g);
-                    }
-                }
-            }
-            input.grad().cpu_upload();
-            pos_emb.grad().cpu_upload();
+            evk::ai::position_add_backward(out.grad(), input.grad(), pos_emb.grad(),
+                                           batch_size, seq_len, embed_dim);
         };
         
         return out;
@@ -699,51 +671,11 @@ struct Graph {
         Tensor& out = *nodes.back();
         
         out.forward_fn = [&embeddings, &indices, &out]() {
-            uint32_t batch_size = indices.shape[0];
-            uint32_t seq_len = indices.shape[1];
-            uint32_t embed_dim = embeddings.shape[1];
-            uint32_t num_indices = batch_size * seq_len;
-            
-            embeddings.cpu_download();
-            indices.cpu_download();
-            
-            float16_t* emb = embeddings.cpu();
-            uint16_t* idx = (uint16_t*)indices.cpu();
-            float16_t* outp = out.cpu();
-            
-            for (uint32_t i = 0; i < num_indices; ++i) {
-                uint32_t token_idx = idx[i];
-                for (uint32_t d = 0; d < embed_dim; ++d) {
-                    outp[i * embed_dim + d] = emb[token_idx * embed_dim + d];
-                }
-            }
-            out.cpu_upload();
+            evk::ai::embed(embeddings, indices, out);
         };
         
         out.backward_fn = [&embeddings, &indices, &out]() {
-            uint32_t batch_size = indices.shape[0];
-            uint32_t seq_len = indices.shape[1];
-            uint32_t embed_dim = embeddings.shape[1];
-            uint32_t num_indices = batch_size * seq_len;
-            
-            out.grad().cpu_download();
-            indices.cpu_download();
-            embeddings.grad().cpu_download();
-            
-            float16_t* grad_out = out.grad().cpu();
-            uint16_t* idx = (uint16_t*)indices.cpu();
-            float16_t* grad_emb = embeddings.grad().cpu();
-            
-            // Accumulate gradients into embedding table
-            for (uint32_t i = 0; i < num_indices; ++i) {
-                uint32_t token_idx = idx[i];
-                for (uint32_t d = 0; d < embed_dim; ++d) {
-                    float val = float(grad_emb[token_idx * embed_dim + d]);
-                    val += float(grad_out[i * embed_dim + d]);
-                    grad_emb[token_idx * embed_dim + d] = float16_t(val);
-                }
-            }
-            embeddings.grad().cpu_upload();
+            evk::ai::embed_backward(out.grad(), indices, embeddings.grad());
         };
         
         return out;
@@ -769,17 +701,15 @@ struct Graph {
         nodes.push_back(std::make_unique<Tensor>(Shape({1})));
         Tensor& loss = *nodes.back();
         
-        // Create a flattened view for the cross_entropy_loss kernel
         // The kernel expects (B*N, V) logits and (B*N) targets
+        // Since data is contiguous and layout matches, we can directly alias the buffers
         loss.forward_fn = [&logits, &targets, &loss, &flat_grad, B, N, V]() {
-            // Create temporary flattened tensors (use same buffer, just different shape interpretation)
+            // Directly use logits buffer aliased as flat (B*N, V)
+            // Directly use targets buffer aliased as flat (B*N)
             Tensor flat_logits({B * N, V});
+            flat_logits.buffer = logits.buffer;  // Alias, no copy
             Tensor flat_targets({B * N});
-            
-            // Copy data (logits are already contiguous in the right order)
-            evk::CmdCopy(logits.buffer, flat_logits.buffer, logits.shape.count() * sizeof(float16_t));
-            evk::CmdCopy(targets.buffer, flat_targets.buffer, targets.shape.count() * sizeof(float16_t));
-            evk::Sync();
+            flat_targets.buffer = targets.buffer;  // Alias, no copy
             
             // Compute loss and gradient into flat_grad
             evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, loss);
@@ -787,12 +717,10 @@ struct Graph {
         loss.backward_fn = [&logits, &targets, &loss, &flat_grad, B, N, V]() {
             // Re-compute gradient (since eval() zeroes gradients before backward)
             Tensor flat_logits({B * N, V});
+            flat_logits.buffer = logits.buffer;  // Alias, no copy
             Tensor flat_targets({B * N});
+            flat_targets.buffer = targets.buffer;  // Alias, no copy
             Tensor dummy_loss({1});
-            
-            evk::CmdCopy(logits.buffer, flat_logits.buffer, logits.shape.count() * sizeof(float16_t));
-            evk::CmdCopy(targets.buffer, flat_targets.buffer, targets.shape.count() * sizeof(float16_t));
-            evk::Sync();
             
             // Compute gradient into flat_grad, then copy to logits.grad()
             evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, dummy_loss);
@@ -813,33 +741,12 @@ struct Graph {
         };
         
         out.backward_fn = [&input, &out]() {
-            // Softmax backward: grad_in[i] = sum_j(grad_out[j] * out[j] * (delta_ij - out[i]))
-            // Simplified: grad_in = out * (grad_out - sum(grad_out * out))
-            out.cpu_download();
-            out.grad().cpu_download();
-            input.grad().cpu_download();
-            
-            float16_t* outp = out.cpu();
-            float16_t* grad_out = out.grad().cpu();
-            float16_t* grad_in = input.grad().cpu();
-            
-            uint32_t last_dim = input.shape[-1];
-            uint32_t outer = input.shape.count() / last_dim;
-            
-            for (uint32_t o = 0; o < outer; ++o) {
-                uint32_t base = o * last_dim;
-                // Compute dot(grad_out, out) for this row
-                float dot = 0.0f;
-                for (uint32_t i = 0; i < last_dim; ++i) {
-                    dot += float(grad_out[base + i]) * float(outp[base + i]);
-                }
-                // grad_in = out * (grad_out - dot)
-                for (uint32_t i = 0; i < last_dim; ++i) {
-                    float g = float(outp[base + i]) * (float(grad_out[base + i]) - dot);
-                    grad_in[base + i] = float16_t(float(grad_in[base + i]) + g);
-                }
-            }
-            input.grad().cpu_upload();
+            // Softmax backward on GPU (scale = 1.0)
+            // Note: softmax_backward writes to grad_in, so we need to use add mode
+            // For now, we use a temp tensor and then add
+            Tensor temp_grad(input.shape);
+            evk::ai::softmax_backward(out, out.grad(), temp_grad, 1.0f);
+            evk::ai::add(input.grad(), temp_grad, input.grad());
         };
         
         return out;
@@ -866,13 +773,8 @@ struct Graph {
             // scores = Q @ K^T
             evk::ai::matmul(q, k, scores, false, true, false, 16, 16);
             
-            // Scale scores
-            scores.cpu_download();
-            float16_t* sp = scores.cpu();
-            for (uint32_t i = 0; i < scores.shape.count(); ++i) {
-                sp[i] = float16_t(float(sp[i]) * attn_scale);
-            }
-            scores.cpu_upload();
+            // Scale scores (GPU)
+            evk::ai::scale(scores, attn_scale);
             
             // Apply causal mask
             evk::ai::apply_causal_mask(scores);
@@ -892,28 +794,9 @@ struct Graph {
             evk::ai::matmul(out.grad(), v, grad_probs, false, true, false, 16, 16);
             evk::ai::matmul(probs, out.grad(), v.grad(), true, false, true, 16, 16);
             
-            // Softmax backward
-            probs.cpu_download();
-            grad_probs.cpu_download();
+            // Softmax backward with attn_scale (GPU)
             Tensor grad_scores({B, N, N});
-            float16_t* pp = probs.cpu();
-            float16_t* gp = grad_probs.cpu();
-            float16_t* gs = grad_scores.cpu();
-            
-            for (uint32_t b = 0; b < B; ++b) {
-                for (uint32_t i = 0; i < N; ++i) {
-                    uint32_t row_base = b * N * N + i * N;
-                    float dot = 0.0f;
-                    for (uint32_t j = 0; j < N; ++j) {
-                        dot += float(gp[row_base + j]) * float(pp[row_base + j]);
-                    }
-                    for (uint32_t j = 0; j < N; ++j) {
-                        float g = float(pp[row_base + j]) * (float(gp[row_base + j]) - dot);
-                        gs[row_base + j] = float16_t(g * attn_scale);
-                    }
-                }
-            }
-            grad_scores.cpu_upload();
+            evk::ai::softmax_backward(probs, grad_probs, grad_scores, attn_scale);
             
             // Backward through Q @ K^T
             // grad_q += grad_scores @ K
@@ -940,15 +823,14 @@ struct Graph {
             }
         }
         if (backward) {
-            // Zero ALL gradient tensors before running backward
+            // Zero ALL gradient tensors before running backward (GPU)
             // This includes both parameters and intermediate tensors
             for (auto& node : nodes) {
                 if (node->grad_tensor) {
-                    float16_t* gcpu = node->grad_tensor->cpu();
-                    memset(gcpu, 0, sizeof(float16_t) * node->grad_tensor->shape.count());
-                    node->grad_tensor->cpu_upload();
+                    evk::ai::zero(node->grad());
                 }
             }
+            evk::Sync();
 
             // Run backward functions in reverse node order so intermediate
             // operators (e.g. matmul) can populate grads for parameters.

@@ -1,0 +1,27 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 inputBuffer;   // (batch, size) - 3D flattened to batches
+    BufferFp16 outputBuffer;  // (size) - sum over batch dimension
+    uint batchCount;
+    uint sizePerBatch;
+)
+
+// Sum across batch dimension: out[i] += sum_b(input[b, i])
+COMPUTE(256, 1, 1)
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= sizePerBatch) return;
+    
+    float sum = float(outputBuffer.x[gid]);
+    for (uint b = 0; b < batchCount; ++b) {
+        sum += float(inputBuffer.x[b * sizePerBatch + gid]);
+    }
+    outputBuffer.x[gid] = float16_t(sum);
+}
