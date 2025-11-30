@@ -474,10 +474,16 @@ float run_next_token_prediction_attention() {
 // Forward declaration
 void run_circle_detection();
 
+#include <chrono>
 void main_llm() {
     printf("=== main_llm ===\n");
     // run_next_token_prediction_attention();  // Comment out for now
+
+    auto start = std::chrono::high_resolution_clock::now();
     run_circle_detection();
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    printf("run_circle_detection() took %.4f seconds\n", duration.count());
 }
 
 // ============================================================================
@@ -676,15 +682,6 @@ struct CircleDataset {
             }
             prev_x = x;
             prev_y = y;
-        }
-        
-        // Draw points on the curve
-        for (size_t i = 0; i < losses.size(); i += (std::max)(size_t(1), losses.size() / 20)) {
-            int x = MARGIN + int(float(i) / float(losses.size() - 1) * float(plot_width));
-            float norm_loss = (losses[i] - min_loss) / range;
-            int y = height - MARGIN - int(norm_loss * float(plot_height));
-            y = (std::max)(MARGIN, (std::min)(height - MARGIN, y));
-            bmp.draw_point(x, y, 3, 255, 255, 0);
         }
         
         bmp.save(filename);
@@ -898,7 +895,7 @@ void run_circle_detection() {
     constexpr uint32_t EMBED_DIM = 64;
     constexpr uint32_t HIDDEN_DIM = 128;
     constexpr uint32_t BATCH_SIZE = 16;
-    constexpr uint32_t NUM_LAYERS = 4;
+    constexpr uint32_t NUM_LAYERS = 1;
     
     printf("  Config: n_points=%u, n_max_prims=%u, grid=%u, embed=%u, hidden=%u, layers=%u\n",
            N_POINTS, N_MAX_PRIMS, GRID_SIZE, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS);
@@ -914,7 +911,7 @@ void run_circle_detection() {
            detector.input_seq_len, detector.output_seq_len, detector.total_seq_len);
     
     // Training
-    const int EPOCHS = 100;
+    const int EPOCHS = 2500;
     const float LR = 0.005f;
     
     printf("  Training for %d epochs...\n", EPOCHS);

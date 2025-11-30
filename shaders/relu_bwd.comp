@@ -1,0 +1,25 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 gradOutBuffer;
+    BufferFp16 inputBuffer;
+    BufferFp16 gradInBuffer;
+    uint totalElements;
+)
+
+// ReLU backward: grad_in = grad_out * (input > 0 ? 1 : 0)
+COMPUTE(256, 1, 1)
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= totalElements) return;
+    
+    float inVal = float(inputBuffer.x[gid]);
+    float gradOut = float(gradOutBuffer.x[gid]);
+    gradInBuffer.x[gid] = float16_t(inVal > 0.0 ? gradOut : 0.0);
+}

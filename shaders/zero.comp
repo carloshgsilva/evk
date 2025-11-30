@@ -1,0 +1,20 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 dataBuffer;
+    uint totalElements;
+)
+
+// Zero out buffer
+COMPUTE(256, 1, 1)
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= totalElements) return;
+    dataBuffer.x[gid] = float16_t(0.0);
+}

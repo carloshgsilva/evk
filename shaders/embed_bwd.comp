@@ -1,0 +1,35 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+layout(buffer_reference) buffer BufferU16 { uint16_t x[]; };
+
+PUSH(
+    BufferFp16 gradOutBuffer;     // (num_indices, embed_dim)
+    BufferU16 indicesBuffer;      // (num_indices)
+    BufferFp16 gradEmbBuffer;     // (vocab_size, embed_dim)
+    uint embedDim;
+    uint numIndices;
+)
+
+// Backward pass for embedding - sequential per embedding dimension to avoid races
+// One workgroup processes one embedding dimension across all indices
+COMPUTE(1, 1, 1)
+void main() {
+    uint dim = gl_GlobalInvocationID.x;
+    if (dim >= embedDim) return;
+    
+    // For each index, accumulate gradient into the embedding table
+    // Sequential to avoid race conditions on same token indices
+    for (uint idx = 0; idx < numIndices; ++idx) {
+        uint tokenIdx = indicesBuffer.x[idx];
+        float gradVal = float(gradOutBuffer.x[idx * embedDim + dim]);
+        
+        uint targetIdx = tokenIdx * embedDim + dim;
+        float oldVal = float(gradEmbBuffer.x[targetIdx]);
+        gradEmbBuffer.x[targetIdx] = float16_t(oldVal + gradVal);
+    }
+}

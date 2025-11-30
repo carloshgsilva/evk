@@ -10,6 +10,17 @@ namespace evk::ai {
         evk::Pipeline adam;
         evk::Pipeline add;
         evk::Pipeline softmax;
+        evk::Pipeline softmax_bwd;
+        evk::Pipeline embed;
+        evk::Pipeline embed_bwd;
+        evk::Pipeline position_add;
+        evk::Pipeline position_add_bwd;
+        evk::Pipeline causal_mask;
+        evk::Pipeline relu;
+        evk::Pipeline relu_bwd;
+        evk::Pipeline scale;
+        evk::Pipeline zero;
+        evk::Pipeline sum_batch;
         evk::Buffer flash_scratch;
         uint32_t flash_scratch_elems = 0;
     };
@@ -164,9 +175,53 @@ namespace evk::ai {
             .name = "softmax",
             .CS = evk::loadSpirvFile("shaders/bin/softmax.comp.spv"),
         });
+        pipelines->softmax_bwd = evk::CreatePipeline({
+            .name = "softmax_bwd",
+            .CS = evk::loadSpirvFile("shaders/bin/softmax_bwd.comp.spv"),
+        });
         pipelines->cross_entropy = evk::CreatePipeline({
             .name = "cross_entropy",
             .CS = evk::loadSpirvFile("shaders/bin/cross_entropy.comp.spv"),
+        });
+        pipelines->embed = evk::CreatePipeline({
+            .name = "embed",
+            .CS = evk::loadSpirvFile("shaders/bin/embed.comp.spv"),
+        });
+        pipelines->embed_bwd = evk::CreatePipeline({
+            .name = "embed_bwd",
+            .CS = evk::loadSpirvFile("shaders/bin/embed_bwd.comp.spv"),
+        });
+        pipelines->position_add = evk::CreatePipeline({
+            .name = "position_add",
+            .CS = evk::loadSpirvFile("shaders/bin/position_add.comp.spv"),
+        });
+        pipelines->position_add_bwd = evk::CreatePipeline({
+            .name = "position_add_bwd",
+            .CS = evk::loadSpirvFile("shaders/bin/position_add_bwd.comp.spv"),
+        });
+        pipelines->causal_mask = evk::CreatePipeline({
+            .name = "causal_mask",
+            .CS = evk::loadSpirvFile("shaders/bin/causal_mask.comp.spv"),
+        });
+        pipelines->relu = evk::CreatePipeline({
+            .name = "relu",
+            .CS = evk::loadSpirvFile("shaders/bin/relu.comp.spv"),
+        });
+        pipelines->relu_bwd = evk::CreatePipeline({
+            .name = "relu_bwd",
+            .CS = evk::loadSpirvFile("shaders/bin/relu_bwd.comp.spv"),
+        });
+        pipelines->scale = evk::CreatePipeline({
+            .name = "scale",
+            .CS = evk::loadSpirvFile("shaders/bin/scale.comp.spv"),
+        });
+        pipelines->zero = evk::CreatePipeline({
+            .name = "zero",
+            .CS = evk::loadSpirvFile("shaders/bin/zero.comp.spv"),
+        });
+        pipelines->sum_batch = evk::CreatePipeline({
+            .name = "sum_batch",
+            .CS = evk::loadSpirvFile("shaders/bin/sum_batch.comp.spv"),
         });
         pipelines->flash_scratch = {};
         pipelines->flash_scratch_elems = 0;
@@ -545,36 +600,65 @@ namespace evk::ai {
         evk::CmdBarrier();
     }
 
+    void softmax_backward(Tensor& probs, Tensor& grad_out, Tensor& grad_in, float scale_factor) {
+        assert(probs.shape.rank() == grad_out.shape.rank());
+        assert(grad_in.shape.rank() == grad_out.shape.rank());
+
+        uint32_t lastDim = probs.shape[-1];
+        uint32_t outerCount = probs.shape.count() / lastDim;
+
+        evk::CmdBind(pipelines->softmax_bwd);
+        evk::CmdPush(evk::Constant{
+            probs.buffer.GetReference(),
+            grad_out.buffer.GetReference(),
+            grad_in.buffer.GetReference(),
+            scale_factor,
+            lastDim,
+            outerCount,
+        });
+        evk::CmdDispatch(outerCount, 1, 1);
+        evk::CmdBarrier();
+    }
+
     void relu(Tensor& in, Tensor& out) {
         assert(in.shape.rank() == out.shape.rank());
         for (uint32_t i = 0; i < in.shape.rank(); ++i) {
             assert(in.shape[i] == out.shape[i]);
         }
 
-        in.cpu_download();
-        float16_t* inp = in.cpu();
-        float16_t* outp = out.cpu();
-        uint32_t count = in.shape.count();
-        for (uint32_t i = 0; i < count; ++i) {
-            outp[i] = float16_t(fmaxf(0.0f, float(inp[i])));
-        }
-        out.cpu_upload();
+        uint32_t totalElements = in.shape.count();
+
+        evk::CmdBind(pipelines->relu);
+        evk::CmdPush(evk::Constant{
+            in.buffer.GetReference(),
+            out.buffer.GetReference(),
+            totalElements,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
     }
 
     void relu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in) {
         assert(grad_out.shape.rank() == in.shape.rank());
         assert(grad_in.shape.rank() == in.shape.rank());
 
-        grad_out.cpu_download();
-        in.cpu_download();
-        float16_t* go = grad_out.cpu();
-        float16_t* inp = in.cpu();
-        float16_t* gi = grad_in.cpu();
-        uint32_t count = in.shape.count();
-        for (uint32_t i = 0; i < count; ++i) {
-            gi[i] = float16_t(float(inp[i]) > 0.0f ? float(go[i]) : 0.0f);
-        }
-        grad_in.cpu_upload();
+        uint32_t totalElements = in.shape.count();
+
+        evk::CmdBind(pipelines->relu_bwd);
+        evk::CmdPush(evk::Constant{
+            grad_out.buffer.GetReference(),
+            in.buffer.GetReference(),
+            grad_in.buffer.GetReference(),
+            totalElements,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
     }
 
     void cross_entropy_loss(Tensor& logits, Tensor& targets, Tensor& grad, Tensor& result) {
@@ -613,21 +697,21 @@ namespace evk::ai {
         uint32_t num_indices = indices.shape.count();
         assert(out.shape.count() == num_indices * embed_dim);
 
-        embeddings.cpu_download();
-        indices.cpu_download();
-        
-        float16_t* emb = embeddings.cpu();
-        uint16_t* idx = (uint16_t*)indices.cpu();
-        float16_t* outp = out.cpu();
+        uint32_t totalElements = num_indices * embed_dim;
 
-        for (uint32_t i = 0; i < num_indices; ++i) {
-            uint32_t token_idx = idx[i];
-            assert(token_idx < vocab_size);
-            for (uint32_t d = 0; d < embed_dim; ++d) {
-                outp[i * embed_dim + d] = emb[token_idx * embed_dim + d];
-            }
-        }
-        out.cpu_upload();
+        evk::CmdBind(pipelines->embed);
+        evk::CmdPush(evk::Constant{
+            embeddings.buffer.GetReference(),
+            indices.buffer.GetReference(),
+            out.buffer.GetReference(),
+            embed_dim,
+            num_indices,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
     }
 
     void embed_backward(Tensor& grad_out, Tensor& indices, Tensor& grad_embeddings) {
@@ -638,24 +722,18 @@ namespace evk::ai {
         uint32_t num_indices = indices.shape.count();
         assert(grad_out.shape.count() == num_indices * embed_dim);
 
-        grad_out.cpu_download();
-        indices.cpu_download();
-        grad_embeddings.cpu_download();
-        
-        float16_t* grad_o = grad_out.cpu();
-        uint16_t* idx = (uint16_t*)indices.cpu();
-        float16_t* grad_e = grad_embeddings.cpu();
+        evk::CmdBind(pipelines->embed_bwd);
+        evk::CmdPush(evk::Constant{
+            grad_out.buffer.GetReference(),
+            indices.buffer.GetReference(),
+            grad_embeddings.buffer.GetReference(),
+            embed_dim,
+            num_indices,
+        });
 
-        for (uint32_t i = 0; i < num_indices; ++i) {
-            uint32_t token_idx = idx[i];
-            assert(token_idx < vocab_size);
-            for (uint32_t d = 0; d < embed_dim; ++d) {
-                float val = float(grad_e[token_idx * embed_dim + d]);
-                val += float(grad_o[i * embed_dim + d]);
-                grad_e[token_idx * embed_dim + d] = float16_t(val);
-            }
-        }
-        grad_embeddings.cpu_upload();
+        // Dispatch one workgroup per embedding dimension (sequential over indices to avoid races)
+        evk::CmdDispatch(embed_dim, 1, 1);
+        evk::CmdBarrier();
     }
 
     void apply_causal_mask(Tensor& scores) {
@@ -664,20 +742,127 @@ namespace evk::ai {
         assert(scores.shape[-2] == N);
         
         uint32_t batch = scores.shape.count() / (N * N);
+        uint32_t totalElements = batch * N * N;
+
+        evk::CmdBind(pipelines->causal_mask);
+        evk::CmdPush(evk::Constant{
+            scores.buffer.GetReference(),
+            batch,
+            N,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
+    }
+
+    // Position embedding addition: out = input + pos_emb (broadcast across batch)
+    void position_add(Tensor& input, Tensor& pos_emb, Tensor& out,
+                      uint32_t batch_size, uint32_t seq_len, uint32_t embed_dim) {
+        uint32_t totalElements = batch_size * seq_len * embed_dim;
+
+        evk::CmdBind(pipelines->position_add);
+        evk::CmdPush(evk::Constant{
+            input.buffer.GetReference(),
+            pos_emb.buffer.GetReference(),
+            out.buffer.GetReference(),
+            batch_size,
+            seq_len,
+            embed_dim,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
+    }
+
+    // Position embedding backward
+    void position_add_backward(Tensor& grad_out, Tensor& grad_input, Tensor& grad_pos,
+                               uint32_t batch_size, uint32_t seq_len, uint32_t embed_dim) {
+        const uint32_t WORKGROUP_SIZE = 256u;
         
-        scores.cpu_download();
-        float16_t* s = scores.cpu();
-        
-        const float NEG_INF = -65504.0f; // fp16 min
-        
-        for (uint32_t b = 0; b < batch; ++b) {
-            for (uint32_t i = 0; i < N; ++i) {
-                for (uint32_t j = i + 1; j < N; ++j) {
-                    s[b * N * N + i * N + j] = float16_t(NEG_INF);
-                }
-            }
-        }
-        scores.cpu_upload();
+        // Mode 0: grad_input accumulation
+        uint32_t totalElements = batch_size * seq_len * embed_dim;
+        evk::CmdBind(pipelines->position_add_bwd);
+        evk::CmdPush(evk::Constant{
+            grad_out.buffer.GetReference(),
+            grad_input.buffer.GetReference(),
+            grad_pos.buffer.GetReference(),
+            batch_size,
+            seq_len,
+            embed_dim,
+            0u, // mode = 0
+        });
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
+
+        // Mode 1: grad_pos accumulation  
+        uint32_t posElements = seq_len * embed_dim;
+        evk::CmdBind(pipelines->position_add_bwd);
+        evk::CmdPush(evk::Constant{
+            grad_out.buffer.GetReference(),
+            grad_input.buffer.GetReference(),
+            grad_pos.buffer.GetReference(),
+            batch_size,
+            seq_len,
+            embed_dim,
+            1u, // mode = 1
+        });
+        groupsX = (posElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
+    }
+
+    // In-place scale: buffer *= scale
+    void scale(Tensor& tensor, float scale_factor) {
+        uint32_t totalElements = tensor.shape.count();
+
+        evk::CmdBind(pipelines->scale);
+        evk::CmdPush(evk::Constant{
+            tensor.buffer.GetReference(),
+            scale_factor,
+            totalElements,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
+    }
+
+    // Zero out a tensor on GPU
+    void zero(Tensor& tensor) {
+        uint32_t totalElements = tensor.shape.count();
+
+        evk::CmdBind(pipelines->zero);
+        evk::CmdPush(evk::Constant{
+            tensor.buffer.GetReference(),
+            totalElements,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
+    }
+
+    // Sum across batch dimension: out[i] += sum_b(input[b, i])
+    void sum_batch(Tensor& input, Tensor& output, uint32_t batch_count, uint32_t size_per_batch) {
+        evk::CmdBind(pipelines->sum_batch);
+        evk::CmdPush(evk::Constant{
+            input.buffer.GetReference(),
+            output.buffer.GetReference(),
+            batch_count,
+            size_per_batch,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (size_per_batch + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
     }
 }
 

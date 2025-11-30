@@ -1,0 +1,49 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 gradOutBuffer;   // (batch_size, seq_len, embed_dim)
+    BufferFp16 gradInBuffer;    // (batch_size, seq_len, embed_dim)
+    BufferFp16 gradPosBuffer;   // (seq_len, embed_dim)
+    uint batchSize;
+    uint seqLen;
+    uint embedDim;
+    uint mode;  // 0 = grad_input, 1 = grad_pos (accumulated)
+)
+
+// Backward for position embedding addition
+// Mode 0: grad_input = grad_out (simple copy/add)
+// Mode 1: grad_pos[t,d] = sum over batches of grad_out[b,t,d]
+COMPUTE(256, 1, 1)
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    
+    if (mode == 0) {
+        // Simple gradient copy to input
+        uint totalElements = batchSize * seqLen * embedDim;
+        if (gid >= totalElements) return;
+        
+        float gradOutVal = float(gradOutBuffer.x[gid]);
+        float gradInVal = float(gradInBuffer.x[gid]);
+        gradInBuffer.x[gid] = float16_t(gradInVal + gradOutVal);
+    } else {
+        // Accumulate gradient for position embedding
+        uint posElements = seqLen * embedDim;
+        if (gid >= posElements) return;
+        
+        uint t = gid / embedDim;
+        uint d = gid % embedDim;
+        
+        float sum = float(gradPosBuffer.x[gid]);
+        for (uint b = 0; b < batchSize; ++b) {
+            uint srcIdx = b * seqLen * embedDim + t * embedDim + d;
+            sum += float(gradOutBuffer.x[srcIdx]);
+        }
+        gradPosBuffer.x[gid] = float16_t(sum);
+    }
+}
