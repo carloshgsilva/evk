@@ -598,8 +598,8 @@ struct Graph {
         };
 
         c.backward_fn = [this, &a, &b, &c]() {
-            evk::CmdCopy(c.grad().buffer, a.grad().buffer, a.grad().shape.count() * sizeof(float16_t));
-            evk::CmdCopy(c.grad().buffer, b.grad().buffer, b.grad().shape.count() * sizeof(float16_t));
+            evk::ai::add(a.grad(), c.grad(), a.grad());
+            evk::ai::add(b.grad(), c.grad(), b.grad());
         };
 
         return c;
