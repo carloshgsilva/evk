@@ -64,6 +64,7 @@ struct AttentionBlock {
 };
 
 // Query-Only Attention Transformer with N layers
+// Takes uint16_t tokens as input directly
 struct Transformer {
     // Hyperparameters
     uint32_t vocab_size;
@@ -72,10 +73,6 @@ struct Transformer {
     uint32_t hidden_dim;
     uint32_t batch_size;
     uint32_t num_layers;
-    
-    // Vocabulary
-    const char* vocab;
-    uint32_t actual_vocab_size;
     
     // Training graph
     Graph model;
@@ -105,12 +102,10 @@ struct Transformer {
     std::vector<AttentionBlock> inf_blocks;
     
     Transformer(uint32_t vocab_size, uint32_t seq_len, uint32_t embed_dim, 
-                uint32_t hidden_dim, uint32_t batch_size, uint32_t num_layers = 1,
-                const char* vocab = nullptr)
+                uint32_t hidden_dim, uint32_t batch_size, uint32_t num_layers = 1)
         : vocab_size(vocab_size), seq_len(seq_len), embed_dim(embed_dim),
-          hidden_dim(hidden_dim), batch_size(batch_size), num_layers(num_layers), vocab(vocab)
+          hidden_dim(hidden_dim), batch_size(batch_size), num_layers(num_layers)
     {
-        actual_vocab_size = vocab ? (uint32_t)strlen(vocab) : vocab_size;
         build_training_graph();
         build_inference_graph();
     }
@@ -202,35 +197,17 @@ struct Transformer {
         evk::Sync();
     }
     
-    uint16_t char_to_token(char c) const {
-        if (!vocab) return uint16_t(c);
-        for (uint32_t i = 0; vocab[i]; ++i) {
-            if (vocab[i] == c) return uint16_t(i);
-        }
-        return 0;
-    }
-    
-    char token_to_char(uint16_t t) const {
-        if (!vocab) return char(t);
-        return (t < actual_vocab_size) ? vocab[t] : '?';
-    }
-    
-    // Train on a single batch of samples
-    // samples: array of strings (must have at least batch_size elements starting at batch_start)
+    // Train on a single batch with raw token arrays
+    // input: (batch_size * seq_len) array of input tokens
+    // target: (batch_size * seq_len) array of target tokens
     // Returns the loss value for this batch
-    float train_batch(const char** samples, uint32_t batch_start, float learning_rate) {
+    float train_batch(const uint16_t* input, const uint16_t* target, float learning_rate) {
         uint16_t* inp = (uint16_t*)input_tokens->cpu();
         uint16_t* tgt = (uint16_t*)targets->cpu();
         
-        for (uint32_t b = 0; b < batch_size; ++b) {
-            const char* sample = samples[batch_start + b];
-            uint32_t len = (uint32_t)strlen(sample);
-            
-            for (uint32_t t = 0; t < seq_len; ++t) {
-                inp[b * seq_len + t] = (t < len) ? char_to_token(sample[t]) : uint16_t(0);
-                tgt[b * seq_len + t] = (t + 1 < len) ? char_to_token(sample[t + 1]) : uint16_t(0);
-            }
-        }
+        memcpy(inp, input, batch_size * seq_len * sizeof(uint16_t));
+        memcpy(tgt, target, batch_size * seq_len * sizeof(uint16_t));
+        
         input_tokens->cpu_upload();
         targets->cpu_upload();
         
@@ -246,55 +223,25 @@ struct Transformer {
         return loss_val;
     }
     
-    // Train for multiple epochs over all samples
-    // samples: array of training strings
-    // num_samples: total number of samples
-    // epochs: number of training epochs
-    // learning_rate: Adam learning rate
-    // log_interval: print loss every N epochs (0 to disable)
-    // Returns final average loss
-    float train(const char** samples, uint32_t num_samples, int epochs, 
-                float learning_rate = 0.01f, int log_interval = 10) {
-        float last_loss = 0.0f;
-        
-        for (int epoch = 0; epoch < epochs; ++epoch) {
-            float epoch_loss = 0.0f;
-            int num_batches = 0;
-            
-            for (uint32_t batch_start = 0; batch_start + batch_size <= num_samples; batch_start += batch_size) {
-                epoch_loss += train_batch(samples, batch_start, learning_rate);
-                num_batches++;
-            }
-            
-            last_loss = epoch_loss / float(num_batches);
-            
-            if (log_interval > 0 && (epoch % log_interval == 0 || epoch == epochs - 1)) {
-                printf("  epoch %3d: loss = %.4f\n", epoch, last_loss);
-            }
-        }
-        
-        return last_loss;
-    }
-    
     // Generate tokens autoregressively from a prefix
-    // prefix: starting string
+    // prefix: array of prefix tokens
+    // prefix_len: length of prefix
+    // output: array to store generated tokens (must be at least prefix_len + max_new_tokens)
     // max_new_tokens: maximum number of new tokens to generate
-    // Returns the generated string (prefix + generated tokens)
-    std::string generate(const char* prefix, int max_new_tokens) {
+    // Returns the total length of generated sequence (prefix + new tokens)
+    uint32_t generate(const uint16_t* prefix, uint32_t prefix_len, uint16_t* output, int max_new_tokens) {
         // Ensure inference weights are up to date
         copy_weights_to_inference();
         
-        uint32_t prefix_len = (uint32_t)strlen(prefix);
-        
-        // Initialize sequence with prefix
-        std::string generated(prefix);
+        // Copy prefix to output
+        memcpy(output, prefix, prefix_len * sizeof(uint16_t));
         uint32_t cur_len = prefix_len;
         
         for (int g = 0; g < max_new_tokens && cur_len < seq_len; ++g) {
             // Fill input tokens
             uint16_t* inp = (uint16_t*)inf_input->cpu();
             for (uint32_t t = 0; t < seq_len; ++t) {
-                inp[t] = (t < cur_len) ? char_to_token(generated[t]) : uint16_t(0);
+                inp[t] = (t < cur_len) ? output[t] : uint16_t(0);
             }
             inf_input->cpu_upload();
             
@@ -319,11 +266,105 @@ struct Transformer {
             }
             
             // Append generated token
-            generated += token_to_char(max_idx);
+            output[cur_len] = max_idx;
             cur_len++;
         }
         
-        return generated;
+        return cur_len;
+    }
+};
+
+// Helper class for text-based transformer usage with vocabulary
+struct TextTransformer {
+    Transformer transformer;
+    const char* vocab;
+    uint32_t actual_vocab_size;
+    
+    TextTransformer(uint32_t vocab_size, uint32_t seq_len, uint32_t embed_dim, 
+                    uint32_t hidden_dim, uint32_t batch_size, uint32_t num_layers = 1,
+                    const char* vocab = nullptr)
+        : transformer(vocab_size, seq_len, embed_dim, hidden_dim, batch_size, num_layers),
+          vocab(vocab)
+    {
+        actual_vocab_size = vocab ? (uint32_t)strlen(vocab) : vocab_size;
+    }
+    
+    void init_weights(uint32_t seed = 42) { transformer.init_weights(seed); }
+    
+    uint16_t char_to_token(char c) const {
+        if (!vocab) return uint16_t(c);
+        for (uint32_t i = 0; vocab[i]; ++i) {
+            if (vocab[i] == c) return uint16_t(i);
+        }
+        return 0;
+    }
+    
+    char token_to_char(uint16_t t) const {
+        if (!vocab) return char(t);
+        return (t < actual_vocab_size) ? vocab[t] : '?';
+    }
+    
+    // Train on a single batch of string samples
+    float train_batch(const char** samples, uint32_t batch_start, float learning_rate) {
+        uint32_t seq_len = transformer.seq_len;
+        uint32_t batch_size = transformer.batch_size;
+        
+        std::vector<uint16_t> inp(batch_size * seq_len);
+        std::vector<uint16_t> tgt(batch_size * seq_len);
+        
+        for (uint32_t b = 0; b < batch_size; ++b) {
+            const char* sample = samples[batch_start + b];
+            uint32_t len = (uint32_t)strlen(sample);
+            
+            for (uint32_t t = 0; t < seq_len; ++t) {
+                inp[b * seq_len + t] = (t < len) ? char_to_token(sample[t]) : uint16_t(0);
+                tgt[b * seq_len + t] = (t + 1 < len) ? char_to_token(sample[t + 1]) : uint16_t(0);
+            }
+        }
+        
+        return transformer.train_batch(inp.data(), tgt.data(), learning_rate);
+    }
+    
+    // Train for multiple epochs over all string samples
+    float train(const char** samples, uint32_t num_samples, int epochs, 
+                float learning_rate = 0.01f, int log_interval = 10) {
+        float last_loss = 0.0f;
+        
+        for (int epoch = 0; epoch < epochs; ++epoch) {
+            float epoch_loss = 0.0f;
+            int num_batches = 0;
+            
+            for (uint32_t batch_start = 0; batch_start + transformer.batch_size <= num_samples; batch_start += transformer.batch_size) {
+                epoch_loss += train_batch(samples, batch_start, learning_rate);
+                num_batches++;
+            }
+            
+            last_loss = epoch_loss / float(num_batches);
+            
+            if (log_interval > 0 && (epoch % log_interval == 0 || epoch == epochs - 1)) {
+                printf("  epoch %3d: loss = %.4f\n", epoch, last_loss);
+            }
+        }
+        
+        return last_loss;
+    }
+    
+    // Generate text autoregressively from a prefix string
+    std::string generate(const char* prefix, int max_new_tokens) {
+        uint32_t prefix_len = (uint32_t)strlen(prefix);
+        std::vector<uint16_t> prefix_tokens(prefix_len);
+        for (uint32_t i = 0; i < prefix_len; ++i) {
+            prefix_tokens[i] = char_to_token(prefix[i]);
+        }
+        
+        std::vector<uint16_t> output(transformer.seq_len);
+        uint32_t total_len = transformer.generate(prefix_tokens.data(), prefix_len, output.data(), max_new_tokens);
+        
+        std::string result;
+        for (uint32_t i = 0; i < total_len; ++i) {
+            result += token_to_char(output[i]);
+        }
+        return result;
     }
 };
 
@@ -398,7 +439,7 @@ float run_next_token_prediction_attention() {
            VOCAB_SIZE, SEQ_LEN, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS);
     
     // Create and initialize transformer
-    Transformer transformer(VOCAB_SIZE, SEQ_LEN, EMBED_DIM, HIDDEN_DIM, BATCH_SIZE, NUM_LAYERS, VOCAB);
+    TextTransformer transformer(VOCAB_SIZE, SEQ_LEN, EMBED_DIM, HIDDEN_DIM, BATCH_SIZE, NUM_LAYERS, VOCAB);
     transformer.init_weights(42);
     
     const int EPOCHS = 60;
@@ -651,7 +692,20 @@ struct CircleDataset {
     }
 };
 
-// Transformer for circle detection
+// Helper functions for computing CircleDetector dimensions
+inline uint32_t compute_vocab_size(uint32_t grid_size) {
+    uint32_t raw_vocab = grid_size + 1;  // +1 for "no value" token (0)
+    return ((raw_vocab + 15) / 16) * 16;  // Pad to multiple of 16
+}
+
+inline uint32_t compute_total_seq_len(uint32_t n_points, uint32_t n_max_prims) {
+    uint32_t input_seq_len = n_points * 2;  // x, y for each point
+    uint32_t output_seq_len = n_max_prims * 3;  // x, y, r for each circle
+    uint32_t raw_total = input_seq_len + output_seq_len;
+    return ((raw_total + 15) / 16) * 16;  // Pad to multiple of 16
+}
+
+// Circle detection using Transformer
 // Input: N_POINTS 2D points -> encoded as tokens
 // Output: N_MAX_PRIMS * 3 values (x, y, r for each circle)
 struct CircleDetector {
@@ -659,10 +713,6 @@ struct CircleDetector {
     uint32_t n_points;          // Number of input points
     uint32_t n_max_prims;       // Max number of output circles
     uint32_t grid_size;         // Discrete coordinate space
-    uint32_t embed_dim;
-    uint32_t hidden_dim;
-    uint32_t batch_size;
-    uint32_t num_layers;
     
     // Computed dimensions
     uint32_t vocab_size;        // grid_size for x, y, r
@@ -670,133 +720,24 @@ struct CircleDetector {
     uint32_t output_seq_len;    // n_max_prims * 3 (x, y, r per circle)
     uint32_t total_seq_len;     // input + output sequence
     
-    // Training graph
-    Graph model;
-    Tensor* input_tokens = nullptr;     // (B, input_seq_len) - unused, for reference
-    Tensor* full_input = nullptr;       // (B, total_seq_len) - actual transformer input
-    Tensor* target_tokens = nullptr;    // (B, total_seq_len)
-    Tensor* loss = nullptr;
-    
-    // Weight tensors
-    Tensor* token_emb = nullptr;        // (vocab_size, embed_dim)
-    Tensor* pos_emb = nullptr;          // (total_seq_len, embed_dim)
-    Tensor* w_out = nullptr;            // (embed_dim, vocab_size)
-    
-    // Attention blocks
-    std::vector<AttentionBlock> blocks;
-    
-    // Inference graph
-    Graph inference;
-    Tensor* inf_input = nullptr;
-    Tensor* inf_logits = nullptr;
-    Tensor* inf_token_emb = nullptr;
-    Tensor* inf_pos_emb = nullptr;
-    Tensor* inf_w_out = nullptr;
-    std::vector<AttentionBlock> inf_blocks;
+    // Underlying transformer
+    Transformer transformer;
     
     CircleDetector(uint32_t n_points_, uint32_t n_max_prims_, uint32_t grid_size_,
                    uint32_t embed_dim_, uint32_t hidden_dim_, uint32_t batch_size_,
                    uint32_t num_layers_ = 2)
         : n_points(n_points_), n_max_prims(n_max_prims_), grid_size(grid_size_),
-          embed_dim(embed_dim_), hidden_dim(hidden_dim_), batch_size(batch_size_),
-          num_layers(num_layers_)
+          vocab_size(compute_vocab_size(grid_size_)),
+          input_seq_len(n_points_ * 2),
+          output_seq_len(n_max_prims_ * 3),
+          total_seq_len(compute_total_seq_len(n_points_, n_max_prims_)),
+          transformer(compute_vocab_size(grid_size_), compute_total_seq_len(n_points_, n_max_prims_), 
+                     embed_dim_, hidden_dim_, batch_size_, num_layers_)
     {
-        // Pad vocab_size to multiple of 16 for matmul tile alignment
-        uint32_t raw_vocab = grid_size + 1;  // +1 for "no value" token (0)
-        vocab_size = ((raw_vocab + 15) / 16) * 16;
-        
-        input_seq_len = n_points * 2;  // x, y for each point
-        output_seq_len = n_max_prims * 3;  // x, y, r for each circle
-        
-        // Pad total sequence length to multiple of 16 for matmul tile alignment
-        uint32_t raw_total = input_seq_len + output_seq_len;
-        total_seq_len = ((raw_total + 15) / 16) * 16;
-        
-        build_training_graph();
-        build_inference_graph();
-    }
-    
-    void build_training_graph() {
-        // Input: points encoded as sequence of x, y coordinates
-        input_tokens = &model.tensor({batch_size, input_seq_len});
-        
-        // Target: circle parameters encoded as sequence of x, y, r values
-        // We use teacher forcing: input is [points, shifted_targets]
-        // Full sequence for transformer
-        full_input = &model.tensor({batch_size, total_seq_len});
-        target_tokens = &model.tensor({batch_size, total_seq_len});
-        
-        // Learnable parameters
-        token_emb = &model.tensor({vocab_size, embed_dim}, true);
-        pos_emb = &model.tensor({total_seq_len, embed_dim}, true);
-        w_out = &model.tensor({embed_dim, vocab_size}, true);
-        
-        // Attention blocks
-        blocks.resize(num_layers);
-        for (uint32_t i = 0; i < num_layers; ++i) {
-            blocks[i].init(model, embed_dim, hidden_dim);
-        }
-        
-        // Forward pass
-        Tensor& embedded = model.embed(*token_emb, *full_input);
-        Tensor& input_with_pos = model.add_position_embedding(embedded, *pos_emb, batch_size, total_seq_len);
-        
-        Tensor* x = &input_with_pos;
-        for (uint32_t i = 0; i < num_layers; ++i) {
-            x = &blocks[i].forward(model, *x);
-        }
-        
-        Tensor& logits = model.matmul(*x, *w_out);
-        loss = &model.cross_entropy_loss(logits, *target_tokens);
-    }
-    
-    void build_inference_graph() {
-        inf_input = &inference.tensor({1, total_seq_len});
-        
-        inf_token_emb = &inference.tensor({vocab_size, embed_dim});
-        inf_pos_emb = &inference.tensor({total_seq_len, embed_dim});
-        inf_w_out = &inference.tensor({embed_dim, vocab_size});
-        
-        inf_blocks.resize(num_layers);
-        for (uint32_t i = 0; i < num_layers; ++i) {
-            inf_blocks[i].init(inference, embed_dim, hidden_dim);
-        }
-        
-        Tensor& embedded = inference.embed(*inf_token_emb, *inf_input);
-        Tensor& input_with_pos = inference.add_position_embedding(embedded, *inf_pos_emb, 1, total_seq_len);
-        
-        Tensor* x = &input_with_pos;
-        for (uint32_t i = 0; i < num_layers; ++i) {
-            x = &inf_blocks[i].forward(inference, *x);
-        }
-        
-        inf_logits = &inference.matmul(*x, *inf_w_out);
     }
     
     void init_weights(uint32_t seed = 42) {
-        srand(seed);
-        float scale = 0.1f / sqrtf(float(embed_dim));
-        token_emb->random_init(0.1f);
-        pos_emb->random_init(0.1f);
-        
-        for (uint32_t i = 0; i < num_layers; ++i) {
-            blocks[i].init_weights(scale);
-        }
-        
-        w_out->random_init(scale);
-    }
-    
-    void copy_weights_to_inference() {
-        evk::CmdCopy(token_emb->buffer, inf_token_emb->buffer, token_emb->shape.count() * sizeof(float16_t));
-        evk::CmdCopy(pos_emb->buffer, inf_pos_emb->buffer, pos_emb->shape.count() * sizeof(float16_t));
-        evk::CmdCopy(w_out->buffer, inf_w_out->buffer, w_out->shape.count() * sizeof(float16_t));
-        
-        for (uint32_t i = 0; i < num_layers; ++i) {
-            evk::CmdCopy(blocks[i].w_q->buffer, inf_blocks[i].w_q->buffer, blocks[i].w_q->shape.count() * sizeof(float16_t));
-            evk::CmdCopy(blocks[i].w1->buffer, inf_blocks[i].w1->buffer, blocks[i].w1->shape.count() * sizeof(float16_t));
-            evk::CmdCopy(blocks[i].w2->buffer, inf_blocks[i].w2->buffer, blocks[i].w2->shape.count() * sizeof(float16_t));
-        }
-        evk::Sync();
+        transformer.init_weights(seed);
     }
     
     // Encode points into input tokens
@@ -841,10 +782,10 @@ struct CircleDetector {
         std::vector<CircleData> circles(n_max_prims);
         std::vector<PointData> points(n_points);
         
-        uint16_t* full_inp = (uint16_t*)full_input->cpu();
-        uint16_t* tgt = (uint16_t*)target_tokens->cpu();
+        std::vector<uint16_t> full_inp(transformer.batch_size * total_seq_len);
+        std::vector<uint16_t> tgt(transformer.batch_size * total_seq_len);
         
-        for (uint32_t b = 0; b < batch_size; ++b) {
+        for (uint32_t b = 0; b < transformer.batch_size; ++b) {
             uint32_t num_circles = dataset.generate_sample(circles.data(), points.data());
             
             // Encode input points
@@ -888,26 +829,14 @@ struct CircleDetector {
             }
         }
         
-        full_input->cpu_upload();
-        target_tokens->cpu_upload();
-        
-        model.eval(true);
-        evk::Sync();
-        
-        loss->cpu_download();
-        float loss_val = float(loss->cpu()[0]);
-        
-        model.step_adam(-learning_rate);
-        evk::Sync();
-        
-        return loss_val;
+        return transformer.train_batch(full_inp.data(), tgt.data(), learning_rate);
     }
     
     // Predict circles from points (autoregressive generation)
     void predict(const PointData* points, CircleData* circles_out) {
-        copy_weights_to_inference();
+        transformer.copy_weights_to_inference();
         
-        uint16_t* inp = (uint16_t*)inf_input->cpu();
+        uint16_t* inp = (uint16_t*)transformer.inf_input->cpu();
         
         // Encode input points
         std::vector<uint16_t> point_tokens(input_seq_len);
@@ -927,12 +856,12 @@ struct CircleDetector {
         std::vector<uint16_t> generated_tokens(output_seq_len);
         
         for (uint32_t out_pos = 0; out_pos < output_seq_len; ++out_pos) {
-            inf_input->cpu_upload();
-            inference.eval(false);
+            transformer.inf_input->cpu_upload();
+            transformer.inference.eval(false);
             evk::Sync();
             
-            inf_logits->cpu_download();
-            float16_t* logits = inf_logits->cpu();
+            transformer.inf_logits->cpu_download();
+            float16_t* logits = transformer.inf_logits->cpu();
             
             // Get prediction at current output position
             uint32_t pos = input_seq_len + out_pos;
@@ -985,7 +914,7 @@ void run_circle_detection() {
            detector.input_seq_len, detector.output_seq_len, detector.total_seq_len);
     
     // Training
-    const int EPOCHS = 600;
+    const int EPOCHS = 100;
     const float LR = 0.005f;
     
     printf("  Training for %d epochs...\n", EPOCHS);
