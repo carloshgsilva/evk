@@ -29,11 +29,16 @@ void main() {
     uint lid = gl_LocalInvocationID.x;
     
     float totalLoss = 0.0;
+    uint validPositions = 0;  // Count positions with valid targets
     
     // Process each position
     for (uint pos = 0; pos < totalPositions; ++pos) {
         uint rowStart = pos * vocabSize;
         uint targetIdx = uint(targetBuffer.x[pos]);
+        
+        // Check if this is a valid position (target != 0 means valid)
+        // Target 0 is used as "ignore" marker for input positions
+        bool isValidTarget = (targetIdx != 0);
         
         // 1) Find max for numerical stability (parallel across lanes)
         float localMax = -3.402823466e+38;
@@ -64,26 +69,32 @@ void main() {
             float softmax_val = exp(logit - rowMax) * invDenom;
             
             // Gradient: softmax - one_hot(target)
+            // But zero out gradient if this is an ignored position
             float grad = softmax_val;
             if (j == targetIdx) {
                 grad -= 1.0;
                 targetLogProb = logit - rowMax - log(max(denom, 1e-20));
             }
-            gradBuffer.x[rowStart + j] = float16_t(grad);
+            // Zero gradient for ignored positions (target == 0)
+            gradBuffer.x[rowStart + j] = float16_t(isValidTarget ? grad : 0.0);
         }
         
-        // Reduce target log probability
-        targetLogProb = subgroupAdd(targetLogProb);
-        
-        // Accumulate loss (negative log probability)
-        if (!isnan(targetLogProb) && !isinf(targetLogProb)) {
-            totalLoss += -targetLogProb;
+        // Only accumulate loss for valid positions
+        if (isValidTarget) {
+            // Reduce target log probability
+            targetLogProb = subgroupAdd(targetLogProb);
+            
+            // Accumulate loss (negative log probability)
+            if (!isnan(targetLogProb) && !isinf(targetLogProb)) {
+                totalLoss += -targetLogProb;
+            }
+            validPositions++;
         }
     }
     
-    // Store mean loss
+    // Store mean loss (over valid positions only)
     if (lid == 0) {
-        float loss = totalLoss / float(totalPositions);
+        float loss = (validPositions > 0) ? (totalLoss / float(validPositions)) : 0.0;
         if (isnan(loss) || isinf(loss)) {
             loss = 0.0;  // Fallback
         }
