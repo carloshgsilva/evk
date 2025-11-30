@@ -497,6 +497,35 @@ struct Graph {
         return tensor;
     }
 
+    // View/reshape a tensor with a different shape (same total elements)
+    // This creates a new tensor node that shares the same underlying buffer
+    // but has a different logical shape for operations like attention
+    Tensor& view(Tensor& a, Shape new_shape) {
+        assert(a.shape.count() == new_shape.count() && "view requires same number of elements");
+        
+        nodes.push_back(std::make_unique<Tensor>(new_shape));
+        Tensor& out = *nodes.back();
+        
+        out.forward_fn = [&a, &out]() {
+            // Just copy the buffer - shapes are already set
+            evk::CmdCopy(a.buffer, out.buffer, a.shape.count() * sizeof(float16_t));
+        };
+        
+        out.backward_fn = [&a, &out]() {
+            // Gradient flows back unchanged (just reshape)
+            a.grad().cpu_download();
+            out.grad().cpu_download();
+            float16_t* ga = a.grad().cpu();
+            float16_t* go = out.grad().cpu();
+            for (uint32_t i = 0; i < a.shape.count(); ++i) {
+                ga[i] = float16_t(float(ga[i]) + float(go[i]));
+            }
+            a.grad().cpu_upload();
+        };
+        
+        return out;
+    }
+
     // Matrix multiplication with automatic shape inference
     // Supports 2D (M,K) @ (K,N) -> (M,N)
     // Supports 3D (B,M,K) @ (K,N) -> (B,M,N) with broadcast
@@ -822,9 +851,9 @@ struct Graph {
             
             // Backward through Q @ K^T
             // grad_q += grad_scores @ K
-            // grad_k += grad_scores^T @ Q = Q^T @ grad_scores (transposed matmul)
+            // grad_k += grad_scores^T @ Q
             evk::ai::matmul(grad_scores, k, q.grad(), false, false, true, 16, 16);
-            evk::ai::matmul(q, grad_scores, k.grad(), true, false, true, 16, 16);
+            evk::ai::matmul(grad_scores, q, k.grad(), true, false, true, 16, 16);
         };
         
         return out;
