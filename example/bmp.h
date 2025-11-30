@@ -95,6 +95,36 @@ struct BMP {
         }
     }
 
+    void draw_rotated_square(int cx, int cy, int half_size, float rotation, uint8_t r, uint8_t g, uint8_t b, int thickness = 2) {
+        float cos_r = cosf(rotation);
+        float sin_r = sinf(rotation);
+        
+        float corners[4][2] = {
+            {-float(half_size), -float(half_size)},
+            { float(half_size), -float(half_size)},
+            { float(half_size),  float(half_size)},
+            {-float(half_size),  float(half_size)}
+        };
+        
+        int screen_corners[4][2];
+        for (int i = 0; i < 4; ++i) {
+            float rx = corners[i][0] * cos_r - corners[i][1] * sin_r;
+            float ry = corners[i][0] * sin_r + corners[i][1] * cos_r;
+            screen_corners[i][0] = cx + int(rx);
+            screen_corners[i][1] = cy + int(ry);
+        }
+        
+        for (int t = -thickness/2; t <= thickness/2; ++t) {
+            for (int i = 0; i < 4; ++i) {
+                int next = (i + 1) % 4;
+                draw_line(screen_corners[i][0] + t, screen_corners[i][1],
+                          screen_corners[next][0] + t, screen_corners[next][1], r, g, b);
+                draw_line(screen_corners[i][0], screen_corners[i][1] + t,
+                          screen_corners[next][0], screen_corners[next][1] + t, r, g, b);
+            }
+        }
+    }
+
     bool save(const char* filename) {
         FILE* f = fopen(filename, "wb");
         if (!f) return false;

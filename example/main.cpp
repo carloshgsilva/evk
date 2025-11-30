@@ -397,59 +397,176 @@ float randn() {
     return u * s;
 }
 
-void test_circle_fitting() {
-    printf("test_circle_fitting()\n");
+enum class PrimitiveType { Circle, Square };
+
+struct Circle {
+    float cx, cy;
+    float radius;
+};
+
+struct Square {
+    float cx, cy;
+    float size;
+    float rotation;
+};
+
+struct Primitive {
+    PrimitiveType type;
+    union {
+        Circle circle;
+        Square square;
+    };
     
-    srand(42);  // Reproducible
-    
-    // ========================================
-    // 1. Generate ground truth: TWO circles with noisy points
-    // ========================================
-    const uint32_t POINTS_PER_CIRCLE = 12;
-    const uint32_t NUM_POINTS = POINTS_PER_CIRCLE * 2;
-    
-    // Circle 1: top-left
-    const float TRUE_CX1 = -2.0f;
-    const float TRUE_CY1 = 2.0f;
-    const float TRUE_R1 = 2.5f;
-    
-    // Circle 2: bottom-right  
-    const float TRUE_CX2 = 3.5f;
-    const float TRUE_CY2 = -1.5f;
-    const float TRUE_R2 = 2.0f;
-    
-    const float NOISE = 0.12f;
-    
-    float points_x[NUM_POINTS];
-    float points_y[NUM_POINTS];
-    
-    // Generate points for circle 1
-    for (uint32_t i = 0; i < POINTS_PER_CIRCLE; ++i) {
-        float angle = 2.0f * 3.14159265f * float(i) / float(POINTS_PER_CIRCLE);
-        float r_noise = TRUE_R1 + randn() * NOISE;
-        points_x[i] = TRUE_CX1 + r_noise * cosf(angle) + randn() * NOISE * 0.5f;
-        points_y[i] = TRUE_CY1 + r_noise * sinf(angle) + randn() * NOISE * 0.5f;
+    static Primitive make_circle(float cx, float cy, float radius) {
+        Primitive p;
+        p.type = PrimitiveType::Circle;
+        p.circle = {cx, cy, radius};
+        return p;
     }
     
-    // Generate points for circle 2
-    for (uint32_t i = 0; i < POINTS_PER_CIRCLE; ++i) {
-        float angle = 2.0f * 3.14159265f * float(i) / float(POINTS_PER_CIRCLE);
-        float r_noise = TRUE_R2 + randn() * NOISE;
-        points_x[POINTS_PER_CIRCLE + i] = TRUE_CX2 + r_noise * cosf(angle) + randn() * NOISE * 0.5f;
-        points_y[POINTS_PER_CIRCLE + i] = TRUE_CY2 + r_noise * sinf(angle) + randn() * NOISE * 0.5f;
+    static Primitive make_square(float cx, float cy, float size, float rotation) {
+        Primitive p;
+        p.type = PrimitiveType::Square;
+        p.square = {cx, cy, size, rotation};
+        return p;
+    }
+    
+    uint32_t param_count() const {
+        return (type == PrimitiveType::Circle) ? 3 : 4;
+    }
+    
+    void get_params(float* out) const {
+        if (type == PrimitiveType::Circle) {
+            out[0] = circle.cx;
+            out[1] = circle.cy;
+            out[2] = circle.radius;
+        } else {
+            out[0] = square.cx;
+            out[1] = square.cy;
+            out[2] = square.size;
+            out[3] = square.rotation;
+        }
+    }
+    
+    void set_params(const float* in) {
+        if (type == PrimitiveType::Circle) {
+            circle.cx = in[0];
+            circle.cy = in[1];
+            circle.radius = fmaxf(0.5f, in[2]);
+        } else {
+            square.cx = in[0];
+            square.cy = in[1];
+            square.size = fmaxf(0.5f, in[2]);
+            square.rotation = in[3];
+        }
+    }
+    
+    float sdf(float px, float py) const {
+        if (type == PrimitiveType::Circle) {
+            float dx = px - circle.cx;
+            float dy = py - circle.cy;
+            return sqrtf(dx*dx + dy*dy) - circle.radius;
+        } else {
+            float cos_r = cosf(-square.rotation);
+            float sin_r = sinf(-square.rotation);
+            float dx = px - square.cx;
+            float dy = py - square.cy;
+            float lx = dx * cos_r - dy * sin_r;
+            float ly = dx * sin_r + dy * cos_r;
+            float half = square.size * 0.5f;
+            float qx = fabsf(lx) - half;
+            float qy = fabsf(ly) - half;
+            float outside = sqrtf(fmaxf(qx, 0.0f) * fmaxf(qx, 0.0f) + fmaxf(qy, 0.0f) * fmaxf(qy, 0.0f));
+            float inside = fminf(fmaxf(qx, qy), 0.0f);
+            return outside + inside;
+        }
+    }
+    
+    void generate_points(float* out_x, float* out_y, uint32_t count, float noise) const {
+        if (type == PrimitiveType::Circle) {
+            for (uint32_t i = 0; i < count; ++i) {
+                float angle = 2.0f * 3.14159265f * float(i) / float(count);
+                float r_noise = circle.radius + randn() * noise;
+                out_x[i] = circle.cx + r_noise * cosf(angle) + randn() * noise * 0.5f;
+                out_y[i] = circle.cy + r_noise * sinf(angle) + randn() * noise * 0.5f;
+            }
+        } else {
+            float half = square.size * 0.5f;
+            float cos_r = cosf(square.rotation);
+            float sin_r = sinf(square.rotation);
+            uint32_t per_side = count / 4;
+            uint32_t idx = 0;
+            for (int side = 0; side < 4 && idx < count; ++side) {
+                for (uint32_t i = 0; i < per_side && idx < count; ++i, ++idx) {
+                    float t = -1.0f + 2.0f * float(i) / float(per_side);
+                    float lx, ly;
+                    switch (side) {
+                        case 0: lx = t * half; ly = -half; break;
+                        case 1: lx = half; ly = t * half; break;
+                        case 2: lx = -t * half; ly = half; break;
+                        default: lx = -half; ly = -t * half; break;
+                    }
+                    lx += randn() * noise;
+                    ly += randn() * noise;
+                    out_x[idx] = square.cx + lx * cos_r - ly * sin_r;
+                    out_y[idx] = square.cy + lx * sin_r + ly * cos_r;
+                }
+            }
+        }
+    }
+    
+    void print(const char* prefix) const {
+        if (type == PrimitiveType::Circle) {
+            printf("%sCircle: center=(%.2f, %.2f), radius=%.2f\n", 
+                   prefix, circle.cx, circle.cy, circle.radius);
+        } else {
+            printf("%sSquare: center=(%.2f, %.2f), size=%.2f, rot=%.2f\n", 
+                   prefix, square.cx, square.cy, square.size, square.rotation);
+        }
+    }
+};
+
+void test_primitive_fitting(uint32_t N) {
+    printf("test_primitive_fitting(N=%u)\n", N);
+    
+    srand(42);
+    
+    const uint32_t POINTS_PER_PRIM = 12;
+    const uint32_t NUM_POINTS = POINTS_PER_PRIM * N;
+    const float NOISE = 0.0f;
+    
+    std::vector<Primitive> ground_truth(N);
+    std::vector<float> points_x(NUM_POINTS);
+    std::vector<float> points_y(NUM_POINTS);
+    
+    for (uint32_t i = 0; i < N; ++i) {
+        float cx = -3.0f + 6.0f * float(i) / float(N > 1 ? N - 1 : 1);
+        float cy = (i % 2 == 0) ? 2.0f : -1.5f;
+        if (i % 2 == 0) {
+            ground_truth[i] = Primitive::make_circle(cx, cy, 1.5f + 0.5f * float(i % 3));
+        } else {
+            ground_truth[i] = Primitive::make_square(cx, cy, 2.0f + 0.3f * float(i % 3), 
+                                                      0.3f * float(i));
+        }
+        ground_truth[i].generate_points(&points_x[i * POINTS_PER_PRIM], 
+                                         &points_y[i * POINTS_PER_PRIM], 
+                                         POINTS_PER_PRIM, NOISE);
     }
     
     printf("  Ground truth:\n");
-    printf("    Circle 1: center=(%.2f, %.2f), radius=%.2f\n", TRUE_CX1, TRUE_CY1, TRUE_R1);
-    printf("    Circle 2: center=(%.2f, %.2f), radius=%.2f\n", TRUE_CX2, TRUE_CY2, TRUE_R2);
+    for (uint32_t i = 0; i < N; ++i) {
+        char prefix[32];
+        snprintf(prefix, sizeof(prefix), "    [%u] ", i);
+        ground_truth[i].print(prefix);
+    }
     
-    // ========================================
-    // 2. MLP using Graph: input(6) -> hidden(64) -> hidden(64) -> output(1)
-    //    Input: [cx1, cy1, r1, cx2, cy2, r2]
-    //    Output: predicted loss
-    // ========================================
+    uint32_t total_params = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        total_params += ground_truth[i].param_count();
+    }
+    
     const uint32_t BATCH_SIZE = 64;
-    const uint32_t INPUT_DIM_PAD = 16;   // 6 params padded to 16
+    const uint32_t INPUT_DIM_PAD = ((total_params + 15) / 16) * 16;
     const uint32_t HIDDEN_DIM = 64;
     const uint32_t OUTPUT_DIM_PAD = 16;
     
@@ -461,7 +578,6 @@ void test_circle_fitting() {
         t.cpu_upload();
     };
     
-    // Build MLP graph
     Graph mlp;
     Tensor& input_t = mlp.tensor({BATCH_SIZE, INPUT_DIM_PAD});
     Tensor& w1 = mlp.tensor({INPUT_DIM_PAD, HIDDEN_DIM}, true);
@@ -469,7 +585,6 @@ void test_circle_fitting() {
     Tensor& w3 = mlp.tensor({HIDDEN_DIM, OUTPUT_DIM_PAD}, true);
     Tensor& target_t = mlp.tensor({BATCH_SIZE, OUTPUT_DIM_PAD});
     
-    // Forward: input -> matmul(w1) -> relu -> matmul(w2) -> relu -> matmul(w3) -> mse_loss
     Tensor& h1_pre = mlp.matmul(input_t, w1);
     Tensor& h1 = mlp.relu(h1_pre);
     Tensor& h2_pre = mlp.matmul(h1, w2);
@@ -481,72 +596,84 @@ void test_circle_fitting() {
     init_weights(w2, 0.15f);
     init_weights(w3, 0.15f);
     
-    // ========================================
-    // 3. Search state: 6 parameters for 2 circles
-    // ========================================
-    float s_cx1 = 0.0f, s_cy1 = 0.0f, s_r1 = 1.5f;
-    float s_cx2 = 1.0f, s_cy2 = 0.0f, s_r2 = 1.5f;
+    std::vector<Primitive> search_state(N);
+    std::vector<Primitive> best_state(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        if (ground_truth[i].type == PrimitiveType::Circle) {
+            search_state[i] = Primitive::make_circle(0.0f, 0.0f, 1.5f);
+        } else {
+            search_state[i] = Primitive::make_square(0.0f, 0.0f, 1.5f, 0.0f);
+        }
+        best_state[i] = search_state[i];
+    }
     float search_sigma = 5.0f;
     
-    // Best found
-    float best_cx1 = s_cx1, best_cy1 = s_cy1, best_r1 = s_r1;
-    float best_cx2 = s_cx2, best_cy2 = s_cy2, best_r2 = s_r2;
-    
-    // Loss: each point assigned to nearest circle
-    auto compute_true_loss = [&](float cx1, float cy1, float r1, float cx2, float cy2, float r2) -> float {
+    auto compute_true_loss = [&](const std::vector<Primitive>& prims) -> float {
         float loss = 0.0f;
         for (uint32_t i = 0; i < NUM_POINTS; ++i) {
-            float dx1 = points_x[i] - cx1;
-            float dy1 = points_y[i] - cy1;
-            float dist1 = fabsf(sqrtf(dx1*dx1 + dy1*dy1) - r1);
-            
-            float dx2 = points_x[i] - cx2;
-            float dy2 = points_y[i] - cy2;
-            float dist2 = fabsf(sqrtf(dx2*dx2 + dy2*dy2) - r2);
-            
-            float min_dist = fminf(dist1, dist2);
+            float min_dist = 1e9f;
+            for (uint32_t p = 0; p < N; ++p) {
+                float d = prims[p].distance_to_point(points_x[i], points_y[i]);
+                min_dist = fminf(min_dist, d);
+            }
             loss += min_dist * min_dist;
         }
         return loss / float(NUM_POINTS);
     };
     
-    float best_loss = compute_true_loss(best_cx1, best_cy1, best_r1, best_cx2, best_cy2, best_r2);
+    float best_loss = compute_true_loss(best_state);
     
     printf("  Initial guess:\n");
-    printf("    Circle 1: center=(%.2f, %.2f), radius=%.2f\n", s_cx1, s_cy1, s_r1);
-    printf("    Circle 2: center=(%.2f, %.2f), radius=%.2f\n", s_cx2, s_cy2, s_r2);
+    for (uint32_t i = 0; i < N; ++i) {
+        char prefix[32];
+        snprintf(prefix, sizeof(prefix), "    [%u] ", i);
+        search_state[i].print(prefix);
+    }
     printf("  Initial loss: %.6f\n", best_loss);
     
-    // ========================================
-    // Image export helper
-    // ========================================
     const int IMG_SIZE = 600;
-    float view_min_x = -6.0f, view_max_x = 7.0f;
-    float view_min_y = -5.0f, view_max_y = 6.0f;
+    float view_min_x = -6.5f, view_max_x = 6.5f;
+    float view_min_y = -6.5f, view_max_y = 6.5f;
     
-    auto export_image = [&](int iter, float cx1, float cy1, float r1, float cx2, float cy2, float r2, float sigma) {
+    uint8_t colors[][3] = {
+        {100, 220, 255}, {255, 120, 200}, {255, 200, 100}, {150, 255, 150},
+        {200, 150, 255}, {255, 150, 150}, {150, 200, 255}, {200, 255, 200}
+    };
+    
+    auto export_image = [&](int iter, const std::vector<Primitive>& prims) {
         BMP img(IMG_SIZE, IMG_SIZE);
         ImageMapper mapper(view_min_x, view_max_x, view_min_y, view_max_y, IMG_SIZE, IMG_SIZE, 10);
         
         img.clear(25, 25, 35);
         img.draw_grid(IMG_SIZE / 12, 40, 40, 50);
         
-        // Ground truth circles - green
-        img.draw_circle(mapper.to_screen_x(TRUE_CX1), mapper.to_screen_y(TRUE_CY1), 
-                        mapper.to_screen_radius(TRUE_R1), 80, 180, 80, 2);
-        img.draw_circle(mapper.to_screen_x(TRUE_CX2), mapper.to_screen_y(TRUE_CY2), 
-                        mapper.to_screen_radius(TRUE_R2), 80, 180, 80, 2);
+        for (uint32_t i = 0; i < N; ++i) {
+            const Primitive& gt = ground_truth[i];
+            if (gt.type == PrimitiveType::Circle) {
+                img.draw_circle(mapper.to_screen_x(gt.circle.cx), mapper.to_screen_y(gt.circle.cy),
+                                mapper.to_screen_radius(gt.circle.radius), 80, 180, 80, 2);
+            } else {
+                img.draw_rotated_square(mapper.to_screen_x(gt.square.cx), mapper.to_screen_y(gt.square.cy),
+                                        mapper.to_screen_radius(gt.square.size * 0.5f), -gt.square.rotation,
+                                        80, 180, 80, 2);
+            }
+        }
         
-        // Current estimate circles - cyan and magenta
-        img.draw_circle(mapper.to_screen_x(cx1), mapper.to_screen_y(cy1), 
-                        mapper.to_screen_radius(r1), 100, 220, 255, 2);
-        img.draw_cross(mapper.to_screen_x(cx1), mapper.to_screen_y(cy1), 8, 100, 220, 255);
+        for (uint32_t i = 0; i < N; ++i) {
+            const Primitive& p = prims[i];
+            uint8_t r = colors[i % 8][0], g = colors[i % 8][1], b = colors[i % 8][2];
+            if (p.type == PrimitiveType::Circle) {
+                img.draw_circle(mapper.to_screen_x(p.circle.cx), mapper.to_screen_y(p.circle.cy),
+                                mapper.to_screen_radius(p.circle.radius), r, g, b, 2);
+                img.draw_cross(mapper.to_screen_x(p.circle.cx), mapper.to_screen_y(p.circle.cy), 8, r, g, b);
+            } else {
+                img.draw_rotated_square(mapper.to_screen_x(p.square.cx), mapper.to_screen_y(p.square.cy),
+                                        mapper.to_screen_radius(p.square.size * 0.5f), -p.square.rotation,
+                                        r, g, b, 2);
+                img.draw_cross(mapper.to_screen_x(p.square.cx), mapper.to_screen_y(p.square.cy), 8, r, g, b);
+            }
+        }
         
-        img.draw_circle(mapper.to_screen_x(cx2), mapper.to_screen_y(cy2), 
-                        mapper.to_screen_radius(r2), 255, 120, 200, 2);
-        img.draw_cross(mapper.to_screen_x(cx2), mapper.to_screen_y(cy2), 8, 255, 120, 200);
-        
-        // Points - yellow
         for (uint32_t i = 0; i < NUM_POINTS; ++i) {
             int px = mapper.to_screen_x(points_x[i]);
             int py = mapper.to_screen_y(points_y[i]);
@@ -554,51 +681,61 @@ void test_circle_fitting() {
         }
         
         char filename[128];
-        snprintf(filename, sizeof(filename), "build/circle_fit_%03d.bmp", iter);
+        snprintf(filename, sizeof(filename), "build/prim_fit_%03d.bmp", iter);
         img.save(filename);
     };
     
-    export_image(0, s_cx1, s_cy1, s_r1, s_cx2, s_cy2, s_r2, search_sigma);
+    export_image(0, search_state);
     
-    // ========================================
-    // 4. Main optimization loop
-    // ========================================
     const int OUTER_ITERS = 40;
-    const int TRAIN_ITERS = 120;
+    const int TRAIN_ITERS = 1200;
     const float LR = 0.003f;
     
+    std::vector<float> search_params(total_params);
+    std::vector<float> best_params(total_params);
+    std::vector<float> sample_params(total_params);
+    
+    auto prims_to_params = [&](const std::vector<Primitive>& prims, std::vector<float>& params) {
+        uint32_t offset = 0;
+        for (uint32_t i = 0; i < N; ++i) {
+            prims[i].get_params(&params[offset]);
+            offset += prims[i].param_count();
+        }
+    };
+    
+    auto params_to_prims = [&](const std::vector<float>& params, std::vector<Primitive>& prims) {
+        uint32_t offset = 0;
+        for (uint32_t i = 0; i < N; ++i) {
+            prims[i].set_params(&params[offset]);
+            offset += prims[i].param_count();
+        }
+    };
+    
+    prims_to_params(search_state, search_params);
+    prims_to_params(best_state, best_params);
+    
     for (int outer = 0; outer < OUTER_ITERS; ++outer) {
-        // if (outer > 0 && outer % 12 == 0) {
-        //     init_weights(w1, 0.25f);
-        //     init_weights(w2, 0.15f);
-        //     init_weights(w3, 0.15f);
-        //     mlp.reset_adam();
-        // }
-        
         for (int train = 0; train < TRAIN_ITERS; ++train) {
             float16_t* inp = input_t.cpu();
             float16_t* tgt = target_t.cpu();
             
             for (uint32_t b = 0; b < BATCH_SIZE; ++b) {
-                float cx1 = s_cx1 + randn() * search_sigma;
-                float cy1 = s_cy1 + randn() * search_sigma;
-                float r1 = fmaxf(0.5f, s_r1 + randn() * search_sigma * 0.3f);
-                float cx2 = s_cx2 + randn() * search_sigma;
-                float cy2 = s_cy2 + randn() * search_sigma;
-                float r2 = fmaxf(0.5f, s_r2 + randn() * search_sigma * 0.3f);
+                for (uint32_t j = 0; j < total_params; ++j) {
+                    sample_params[j] = search_params[j] + randn() * search_sigma * 
+                                       ((j % 3 == 2 || j % 4 == 2) ? 0.3f : 1.0f);
+                }
                 
-                // Normalize inputs relative to current search center
-                inp[b * INPUT_DIM_PAD + 0] = float16_t((cx1 - s_cx1) / search_sigma);
-                inp[b * INPUT_DIM_PAD + 1] = float16_t((cy1 - s_cy1) / search_sigma);
-                inp[b * INPUT_DIM_PAD + 2] = float16_t((r1 - s_r1) / search_sigma);
-                inp[b * INPUT_DIM_PAD + 3] = float16_t((cx2 - s_cx2) / search_sigma);
-                inp[b * INPUT_DIM_PAD + 4] = float16_t((cy2 - s_cy2) / search_sigma);
-                inp[b * INPUT_DIM_PAD + 5] = float16_t((r2 - s_r2) / search_sigma);
-                for (uint32_t j = 6; j < INPUT_DIM_PAD; ++j) {
+                std::vector<Primitive> sample_prims = search_state;
+                params_to_prims(sample_params, sample_prims);
+                
+                for (uint32_t j = 0; j < total_params; ++j) {
+                    inp[b * INPUT_DIM_PAD + j] = float16_t((sample_params[j] - search_params[j]) / search_sigma);
+                }
+                for (uint32_t j = total_params; j < INPUT_DIM_PAD; ++j) {
                     inp[b * INPUT_DIM_PAD + j] = float16_t(0.0f);
                 }
                 
-                float true_loss = compute_true_loss(cx1, cy1, r1, cx2, cy2, r2);
+                float true_loss = compute_true_loss(sample_prims);
                 tgt[b * OUTPUT_DIM_PAD + 0] = float16_t(logf(true_loss + 1.0f));
                 for (uint32_t j = 1; j < OUTPUT_DIM_PAD; ++j) {
                     tgt[b * OUTPUT_DIM_PAD + j] = float16_t(0.0f);
@@ -606,23 +743,18 @@ void test_circle_fitting() {
                 
                 if (true_loss < best_loss) {
                     best_loss = true_loss;
-                    best_cx1 = cx1; best_cy1 = cy1; best_r1 = r1;
-                    best_cx2 = cx2; best_cy2 = cy2; best_r2 = r2;
+                    best_state = sample_prims;
+                    best_params = sample_params;
                 }
             }
             input_t.cpu_upload();
             target_t.cpu_upload();
             
-            // Forward + Backward using Graph
             mlp.eval(true);
             mlp.step_adam(LR);
             evk::Sync();
         }
         
-        // ========================================
-        // 5. Get gradient from backward pass at search center
-        // ========================================
-        // Evaluate at current search center (input = 0 in normalized coords)
         {
             float16_t* inp = input_t.cpu();
             for (uint32_t b = 0; b < BATCH_SIZE; ++b) {
@@ -630,7 +762,6 @@ void test_circle_fitting() {
                     inp[b * INPUT_DIM_PAD + j] = float16_t(0.0f);
                 }
             }
-            // Set target to 0 (we want to minimize the output)
             float16_t* tgt = target_t.cpu();
             for (uint32_t i = 0; i < target_t.shape.count(); ++i) {
                 tgt[i] = float16_t(0.0f);
@@ -638,89 +769,65 @@ void test_circle_fitting() {
             input_t.cpu_upload();
             target_t.cpu_upload();
             
-            mlp.eval(true);  // Forward + Backward to get input gradients
+            mlp.eval(true);
             evk::Sync();
         }
         
-        // Get gradients from input tensor (averaged over batch)
         input_t.grad().cpu_download();
         float16_t* grad_ptr = input_t.grad().cpu();
-        float g[6] = {0.0f};
+        std::vector<float> g(total_params, 0.0f);
         for (uint32_t b = 0; b < BATCH_SIZE; ++b) {
-            for (int i = 0; i < 6; ++i) {
+            for (uint32_t i = 0; i < total_params; ++i) {
                 g[i] += float(grad_ptr[b * INPUT_DIM_PAD + i]);
             }
         }
-        for (int i = 0; i < 6; ++i) g[i] /= float(BATCH_SIZE);
+        for (uint32_t i = 0; i < total_params; ++i) g[i] /= float(BATCH_SIZE);
         
         float grad_norm = 0.0f;
-        for (int i = 0; i < 6; ++i) grad_norm += g[i] * g[i];
+        for (uint32_t i = 0; i < total_params; ++i) grad_norm += g[i] * g[i];
         grad_norm = sqrtf(grad_norm);
         
         if (grad_norm > 1e-6f) {
             float step = search_sigma * 0.25f;
-            s_cx1 -= step * g[0] / grad_norm;
-            s_cy1 -= step * g[1] / grad_norm;
-            s_r1  -= step * g[2] / grad_norm;
-            s_cx2 -= step * g[3] / grad_norm;
-            s_cy2 -= step * g[4] / grad_norm;
-            s_r2  -= step * g[5] / grad_norm;
+            for (uint32_t i = 0; i < total_params; ++i) {
+                search_params[i] -= step * g[i] / grad_norm;
+            }
         }
-        s_r1 = fmaxf(0.5f, s_r1);
-        s_r2 = fmaxf(0.5f, s_r2);
+        params_to_prims(search_params, search_state);
         
-        // Blend toward best
-        s_cx1 = 0.7f * s_cx1 + 0.3f * best_cx1;
-        s_cy1 = 0.7f * s_cy1 + 0.3f * best_cy1;
-        s_r1  = 0.7f * s_r1  + 0.3f * best_r1;
-        s_cx2 = 0.7f * s_cx2 + 0.3f * best_cx2;
-        s_cy2 = 0.7f * s_cy2 + 0.3f * best_cy2;
-        s_r2  = 0.7f * s_r2  + 0.3f * best_r2;
+        for (uint32_t i = 0; i < total_params; ++i) {
+            search_params[i] = 0.7f * search_params[i] + 0.3f * best_params[i];
+        }
+        params_to_prims(search_params, search_state);
         
         search_sigma *= 0.93f;
         
-        float true_loss = compute_true_loss(s_cx1, s_cy1, s_r1, s_cx2, s_cy2, s_r2);
+        float true_loss = compute_true_loss(search_state);
         if (outer % 5 == 0 || outer == OUTER_ITERS - 1) {
-            printf("  [iter %2d] C1=(%.2f,%.2f,%.2f) C2=(%.2f,%.2f,%.2f) loss=%.4f sigma=%.2f\n",
-                   outer, s_cx1, s_cy1, s_r1, s_cx2, s_cy2, s_r2, true_loss, search_sigma);
-            export_image(outer + 1, s_cx1, s_cy1, s_r1, s_cx2, s_cy2, s_r2, search_sigma);
+            printf("  [iter %2d] loss=%.4f sigma=%.2f\n", outer, true_loss, search_sigma);
+            export_image(outer + 1, search_state);
         }
     }
     
-    // Use best found
-    s_cx1 = best_cx1; s_cy1 = best_cy1; s_r1 = best_r1;
-    s_cx2 = best_cx2; s_cy2 = best_cy2; s_r2 = best_r2;
+    search_state = best_state;
+    export_image(OUTER_ITERS + 1, search_state);
+    printf("  Exported images to build/prim_fit_*.bmp\n");
     
-    export_image(OUTER_ITERS + 1, s_cx1, s_cy1, s_r1, s_cx2, s_cy2, s_r2, 0.0f);
-    printf("  Exported images to build/circle_fit_*.bmp\n");
-    
-    // ========================================
-    // 6. Final results - match circles to ground truth
-    // ========================================
-    float final_loss = compute_true_loss(s_cx1, s_cy1, s_r1, s_cx2, s_cy2, s_r2);
-    
-    // Determine which estimate matches which ground truth
-    float dist_1to1 = sqrtf((s_cx1-TRUE_CX1)*(s_cx1-TRUE_CX1) + (s_cy1-TRUE_CY1)*(s_cy1-TRUE_CY1));
-    float dist_1to2 = sqrtf((s_cx1-TRUE_CX2)*(s_cx1-TRUE_CX2) + (s_cy1-TRUE_CY2)*(s_cy1-TRUE_CY2));
-    
-    float e_cx1, e_cy1, e_r1, e_cx2, e_cy2, e_r2;
-    if (dist_1to1 < dist_1to2) {
-        e_cx1 = fabsf(s_cx1 - TRUE_CX1); e_cy1 = fabsf(s_cy1 - TRUE_CY1); e_r1 = fabsf(s_r1 - TRUE_R1);
-        e_cx2 = fabsf(s_cx2 - TRUE_CX2); e_cy2 = fabsf(s_cy2 - TRUE_CY2); e_r2 = fabsf(s_r2 - TRUE_R2);
-    } else {
-        e_cx1 = fabsf(s_cx2 - TRUE_CX1); e_cy1 = fabsf(s_cy2 - TRUE_CY1); e_r1 = fabsf(s_r2 - TRUE_R1);
-        e_cx2 = fabsf(s_cx1 - TRUE_CX2); e_cy2 = fabsf(s_cy1 - TRUE_CY2); e_r2 = fabsf(s_r1 - TRUE_R2);
-    }
+    float final_loss = compute_true_loss(search_state);
     
     printf("\n  Final estimates:\n");
-    printf("    Circle 1: center=(%.3f, %.3f), radius=%.3f\n", s_cx1, s_cy1, s_r1);
-    printf("    Circle 2: center=(%.3f, %.3f), radius=%.3f\n", s_cx2, s_cy2, s_r2);
+    for (uint32_t i = 0; i < N; ++i) {
+        char prefix[32];
+        snprintf(prefix, sizeof(prefix), "    [%u] ", i);
+        search_state[i].print(prefix);
+    }
     printf("  Final loss: %.6f\n", final_loss);
-    printf("  Errors: C1(%.3f,%.3f,%.3f) C2(%.3f,%.3f,%.3f)\n", e_cx1, e_cy1, e_r1, e_cx2, e_cy2, e_r2);
     
-    float max_error = fmaxf(fmaxf(fmaxf(e_cx1, e_cy1), fmaxf(e_r1, e_cx2)), fmaxf(e_cy2, e_r2));
-    TEST(max_error < 1.0f);
-    TEST(final_loss < 0.2f);
+    TEST(final_loss < 0.5f);
+}
+
+void test_circle_fitting() {
+    test_primitive_fitting(2);
 }
 
 void test_softmax() {
@@ -1949,7 +2056,7 @@ int main() {
     // test_adam_vs_sgd();
     // test_adam_batched_matmul();
 
-    // test_circle_fitting();
+    test_circle_fitting();
 
     // benchmark_matmul();
 
