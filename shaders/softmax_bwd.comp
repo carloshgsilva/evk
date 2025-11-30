@@ -17,7 +17,7 @@ PUSH(
     uint outerCount;            // number of rows = totalElements / lastDim
 )
 
-// Softmax backward with scale: grad_in = probs * (grad_out - dot(grad_out, probs)) * scale
+// Softmax backward with scale: grad_in += probs * (grad_out - dot(grad_out, probs)) * scale
 // One workgroup per row, single subgroup (size 32)
 COMPUTE(32, 1, 1)
 void main() {
@@ -36,11 +36,12 @@ void main() {
     }
     float dotProd = subgroupAdd(localDot);
 
-    // 2) Compute grad_in = probs * (grad_out - dotProd) * scale
+    // 2) Accumulate: grad_in += probs * (grad_out - dotProd) * scale
     for (uint j = lid; j < lastDim; j += 32) {
         float p = float(probsBuffer.x[rowStart + j]);
         float g = float(gradOutBuffer.x[rowStart + j]);
+        float existing = float(gradInBuffer.x[rowStart + j]);
         float grad = p * (g - dotProd) * scale;
-        gradInBuffer.x[rowStart + j] = float16_t(grad);
+        gradInBuffer.x[rowStart + j] = float16_t(existing + grad);
     }
 }

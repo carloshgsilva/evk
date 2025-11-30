@@ -217,7 +217,7 @@ struct Transformer {
         loss->cpu_download();
         float loss_val = float(loss->cpu()[0]);
         
-        model.step_adam(-learning_rate);
+        model.step_adam(learning_rate);
         evk::Sync();
         
         return loss_val;
@@ -811,10 +811,10 @@ struct CircleDetector {
             }
             
             // Target: shift by 1 (predict next token)
-            // For input positions, we don't care (could be anything)
+            // For input positions, use target=0 (IGNORE token) to exclude from loss
             // For output positions, target is the circle token sequence
             for (uint32_t t = 0; t < input_seq_len; ++t) {
-                tgt[b * total_seq_len + t] = 0;  // Ignore loss on input positions
+                tgt[b * total_seq_len + t] = 0;  // IGNORE token - no loss computed here
             }
             for (uint32_t t = 0; t < output_seq_len; ++t) {
                 tgt[b * total_seq_len + input_seq_len + t] = circle_tokens[t];
@@ -895,7 +895,7 @@ void run_circle_detection() {
     constexpr uint32_t EMBED_DIM = 64;
     constexpr uint32_t HIDDEN_DIM = 128;
     constexpr uint32_t BATCH_SIZE = 16;
-    constexpr uint32_t NUM_LAYERS = 1;
+    constexpr uint32_t NUM_LAYERS = 4;
     
     printf("  Config: n_points=%u, n_max_prims=%u, grid=%u, embed=%u, hidden=%u, layers=%u\n",
            N_POINTS, N_MAX_PRIMS, GRID_SIZE, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS);
@@ -911,7 +911,7 @@ void run_circle_detection() {
            detector.input_seq_len, detector.output_seq_len, detector.total_seq_len);
     
     // Training
-    const int EPOCHS = 2500;
+    const int EPOCHS = 1000;
     const float LR = 0.005f;
     
     printf("  Training for %d epochs...\n", EPOCHS);
@@ -923,7 +923,7 @@ void run_circle_detection() {
         float epoch_loss = detector.train_batch(dataset, LR);
         loss_history.push_back(epoch_loss);
         
-        if (epoch % 20 == 0 || epoch == EPOCHS - 1) {
+        if (epoch % 50 == 0 || epoch == EPOCHS - 1) {
             printf("  epoch %3d: loss = %.4f\n", epoch, epoch_loss);
             CircleDataset::save_loss_graph("loss_graph.bmp", loss_history);
         }

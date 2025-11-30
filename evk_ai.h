@@ -462,8 +462,10 @@ namespace evk::ai {
     // Cross entropy loss for classification
     // logits: (B*N, V) unnormalized log probabilities
     // targets: (B*N) target class indices stored as uint16
-    // grad: (B*N, V) gradient output (softmax - one_hot)
-    // result: scalar loss value
+    //         NOTE: target=0 is the IGNORE token - positions with target=0
+    //         are excluded from loss computation and gradients are zeroed
+    // grad: (B*N, V) gradient output (softmax - one_hot, or zero if ignored)
+    // result: scalar loss value (mean over non-ignored positions only)
     void cross_entropy_loss(Tensor& logits, Tensor& targets, Tensor& grad, Tensor& result);
 
     // Embedding lookup: out[i] = embeddings[indices[i]]
@@ -533,8 +535,8 @@ struct Graph {
         };
         
         out.backward_fn = [&a, &out]() {
-            // Gradient flows back unchanged (just reshape) - use GPU add
-            evk::ai::add(a.grad(), out.grad(), a.grad());
+            // Gradient flows back unchanged (just reshape)
+            evk::CmdCopy(out.grad().buffer, a.grad().buffer, a.shape.count() * sizeof(float16_t));
         };
         
         return out;
@@ -684,8 +686,10 @@ struct Graph {
     // Cross entropy loss for token prediction
     // logits: (B, N, vocab_size) - 3D logits
     // targets: (B, N) target indices as uint16
-    // Returns scalar loss
-    // Note: gradient is computed in backward_fn (not forward) to avoid being zeroed
+    //         NOTE: target=0 is the IGNORE token - positions with target=0
+    //         are excluded from loss computation and produce zero gradients.
+    //         Use this to mask out input positions in sequence-to-sequence tasks.
+    // Returns scalar loss (mean over non-ignored positions only)
     Tensor& cross_entropy_loss(Tensor& logits, Tensor& targets) {
         assert(logits.shape.rank() == 3 && "logits must be (B, N, V)");
         assert(targets.shape.rank() == 2 && "targets must be (B, N)");
@@ -742,11 +746,8 @@ struct Graph {
         
         out.backward_fn = [&input, &out]() {
             // Softmax backward on GPU (scale = 1.0)
-            // Note: softmax_backward writes to grad_in, so we need to use add mode
-            // For now, we use a temp tensor and then add
-            Tensor temp_grad(input.shape);
-            evk::ai::softmax_backward(out, out.grad(), temp_grad, 1.0f);
-            evk::ai::add(input.grad(), temp_grad, input.grad());
+            // The shader accumulates directly into input.grad()
+            evk::ai::softmax_backward(out, out.grad(), input.grad(), 1.0f);
         };
         
         return out;
@@ -790,19 +791,17 @@ struct Graph {
             // Backward through probs @ V
             // grad_probs = grad_out @ V^T
             // grad_v += probs^T @ grad_out
-            Tensor grad_probs({B, N, N});
-            evk::ai::matmul(out.grad(), v, grad_probs, false, true, false, 16, 16);
+            evk::ai::matmul(out.grad(), v, probs.grad(), false, true, false, 16, 16);
             evk::ai::matmul(probs, out.grad(), v.grad(), true, false, true, 16, 16);
             
             // Softmax backward with attn_scale (GPU)
-            Tensor grad_scores({B, N, N});
-            evk::ai::softmax_backward(probs, grad_probs, grad_scores, attn_scale);
+            evk::ai::softmax_backward(probs, probs.grad(), scores.grad(), attn_scale);
             
             // Backward through Q @ K^T
             // grad_q += grad_scores @ K
             // grad_k += grad_scores^T @ Q
-            evk::ai::matmul(grad_scores, k, q.grad(), false, false, true, 16, 16);
-            evk::ai::matmul(grad_scores, q, k.grad(), true, false, true, 16, 16);
+            evk::ai::matmul(scores.grad(), k, q.grad(), false, false, true, 16, 16);
+            evk::ai::matmul(scores.grad(), q, k.grad(), true, false, true, 16, 16);
         };
         
         return out;
@@ -853,11 +852,10 @@ struct Graph {
 
     // apply the gradient update using Adam optimizer
     // Uses fp16-appropriate epsilon (default 1e-4)
-    // Note: uses -lr internally to match gradient direction convention from mse_loss
     void step_adam(float lr = 0.001f, float beta1 = 0.9f, float beta2 = 0.999f, float epsilon = 1e-4f) {
         for(auto& param : params) {
             assert(param->grad_tensor);
-            evk::ai::adam(*param, param->grad(), adam_states[param], -lr, beta1, beta2, epsilon);
+            evk::ai::adam(*param, param->grad(), adam_states[param], lr, beta1, beta2, epsilon);
         }
     }
 
