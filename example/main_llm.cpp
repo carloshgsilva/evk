@@ -30,9 +30,9 @@ struct Transformer {
     // Weight tensors (owned by model graph)
     Tensor* token_emb = nullptr;
     Tensor* pos_emb = nullptr;
-    Tensor* w_q = nullptr;
-    Tensor* w_k = nullptr;
-    Tensor* w_v = nullptr;
+    Tensor* w_q = nullptr; // Query-Only Attention (https://arxiv.org/pdf/2510.00365)
+    // Tensor* w_k = nullptr;
+    // Tensor* w_v = nullptr;
     Tensor* w1 = nullptr;
     Tensor* w2 = nullptr;
     Tensor* w_out = nullptr;
@@ -46,8 +46,8 @@ struct Transformer {
     Tensor* inf_token_emb = nullptr;
     Tensor* inf_pos_emb = nullptr;
     Tensor* inf_w_q = nullptr;
-    Tensor* inf_w_k = nullptr;
-    Tensor* inf_w_v = nullptr;
+    // Tensor* inf_w_k = nullptr;
+    // Tensor* inf_w_v = nullptr;
     Tensor* inf_w1 = nullptr;
     Tensor* inf_w2 = nullptr;
     Tensor* inf_w_out = nullptr;
@@ -71,8 +71,8 @@ struct Transformer {
         token_emb = &model.tensor({vocab_size, embed_dim}, true);
         pos_emb = &model.tensor({seq_len, embed_dim}, true);
         w_q = &model.tensor({embed_dim, embed_dim}, true);
-        w_k = &model.tensor({embed_dim, embed_dim}, true);
-        w_v = &model.tensor({embed_dim, embed_dim}, true);
+        // w_k = &model.tensor({embed_dim, embed_dim}, false); // Not used in query-only attention
+        // w_v = &model.tensor({embed_dim, embed_dim}, false); // Not used in query-only attention
         w1 = &model.tensor({embed_dim, hidden_dim}, true);
         w2 = &model.tensor({hidden_dim, embed_dim}, true);
         w_out = &model.tensor({embed_dim, vocab_size}, true);
@@ -83,8 +83,8 @@ struct Transformer {
         
         // Attention projections
         Tensor& q = model.matmul(input_with_pos, *w_q);
-        Tensor& k = model.matmul(input_with_pos, *w_k);
-        Tensor& v = model.matmul(input_with_pos, *w_v);
+        Tensor& k = input_with_pos;//model.matmul(input_with_pos, *w_k);
+        Tensor& v = input_with_pos;//model.matmul(input_with_pos, *w_v);
         
         // Causal self-attention with residual
         Tensor& attn_out = model.causal_attention(q, k, v);
@@ -109,8 +109,8 @@ struct Transformer {
         inf_token_emb = &inference.tensor({vocab_size, embed_dim});
         inf_pos_emb = &inference.tensor({seq_len, embed_dim});
         inf_w_q = &inference.tensor({embed_dim, embed_dim});
-        inf_w_k = &inference.tensor({embed_dim, embed_dim});
-        inf_w_v = &inference.tensor({embed_dim, embed_dim});
+        // inf_w_k = &inference.tensor({embed_dim, embed_dim});
+        // inf_w_v = &inference.tensor({embed_dim, embed_dim});
         inf_w1 = &inference.tensor({embed_dim, hidden_dim});
         inf_w2 = &inference.tensor({hidden_dim, embed_dim});
         inf_w_out = &inference.tensor({embed_dim, vocab_size});
@@ -120,8 +120,8 @@ struct Transformer {
         Tensor& input_with_pos = inference.add_position_embedding(embedded, *inf_pos_emb, 1, seq_len);
         
         Tensor& q = inference.matmul(input_with_pos, *inf_w_q);
-        Tensor& k = inference.matmul(input_with_pos, *inf_w_k);
-        Tensor& v = inference.matmul(input_with_pos, *inf_w_v);
+        Tensor& k = input_with_pos;//inference.matmul(input_with_pos, *inf_w_k);
+        Tensor& v = input_with_pos;//inference.matmul(input_with_pos, *inf_w_v);
         
         Tensor& attn_out = inference.causal_attention(q, k, v);
         Tensor& attn_residual = inference.add(input_with_pos, attn_out);
@@ -140,8 +140,8 @@ struct Transformer {
         token_emb->random_init(0.1f);
         pos_emb->random_init(0.1f);
         w_q->random_init(scale);
-        w_k->random_init(scale);
-        w_v->random_init(scale);
+        // w_k->random_init(scale);
+        // w_v->random_init(scale);
         w1->random_init(scale);
         w2->random_init(scale);
         w_out->random_init(scale);
@@ -151,8 +151,8 @@ struct Transformer {
         evk::CmdCopy(token_emb->buffer, inf_token_emb->buffer, token_emb->shape.count() * sizeof(float16_t));
         evk::CmdCopy(pos_emb->buffer, inf_pos_emb->buffer, pos_emb->shape.count() * sizeof(float16_t));
         evk::CmdCopy(w_q->buffer, inf_w_q->buffer, w_q->shape.count() * sizeof(float16_t));
-        evk::CmdCopy(w_k->buffer, inf_w_k->buffer, w_k->shape.count() * sizeof(float16_t));
-        evk::CmdCopy(w_v->buffer, inf_w_v->buffer, w_v->shape.count() * sizeof(float16_t));
+        // evk::CmdCopy(w_k->buffer, inf_w_k->buffer, w_k->shape.count() * sizeof(float16_t));
+        // evk::CmdCopy(w_v->buffer, inf_w_v->buffer, w_v->shape.count() * sizeof(float16_t));
         evk::CmdCopy(w1->buffer, inf_w1->buffer, w1->shape.count() * sizeof(float16_t));
         evk::CmdCopy(w2->buffer, inf_w2->buffer, w2->shape.count() * sizeof(float16_t));
         evk::CmdCopy(w_out->buffer, inf_w_out->buffer, w_out->shape.count() * sizeof(float16_t));
