@@ -1,75 +1,64 @@
-# EVK - Easy Vulkan
+# EVK
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+A lightweight C++20 wrapper for Vulkan 1.3 focused on simplicity and performance.
 
-A modern, easy-to-use C++ wrapper for Vulkan 1.3 that simplifies graphics programming while maintaining high performance and full access to Vulkan's capabilities.
+## Overview
 
-## Features
+EVK provides a clean abstraction over the Vulkan API while maintaining direct access to GPU capabilities. It handles the boilerplate of Vulkan setup, resource management, and synchronization, letting you focus on your application logic.
 
-### 🚀 Core Features
-- **Vulkan 1.3 Support** - Full support for the latest Vulkan API features
-- **Modern C++20** - Leverages modern C++ features for cleaner, safer code
-- **Automatic Resource Management** - Smart pointers and RAII for Vulkan resources
-- **Memory Management** - Integrated Vulkan Memory Allocator (VMA) for optimal GPU memory usage
-- **Multi-threaded** - Designed for modern multi-threaded applications
+**Key characteristics:**
+- Single header interface (`evk.h`)
+- RAII-based resource management
+- Integrated memory allocation via VMA
+- Support for graphics, compute, and ray tracing pipelines
 
-### 🎨 Graphics Pipeline
-- **Graphics & Compute Pipelines** - Support for both graphics and compute workloads
-- **Shader Support** - Direct shader bytecode loading for vertex, fragment, and compute shaders
-- **Render Passes** - Simplified render pass management with automatic layout transitions
-- **Depth/Stencil Testing** - Full depth and stencil buffer support
-- **Blending Modes** - Alpha blending and additive blending support
-- **Face Culling** - Front, back, and no culling options
+## Requirements
 
-### 📦 Resource Management
-- **Buffers** - Vertex, index, uniform, storage, and indirect buffers
-- **Images/Textures** - 2D/3D textures with mipmapping and array layers
-- **Memory Types** - CPU, GPU, CPU-to-GPU, and GPU-to-CPU memory configurations
-- **Resource Barriers** - Automatic and manual pipeline barriers for synchronization
+- C++20 compiler
+- Vulkan SDK
+- CMake 3.8+
 
-### ⚡ Advanced Features
-- **Ray Tracing** - Built-in support for Vulkan ray tracing with BLAS/TLAS
-- **ImGui Integration** - Ready-to-use ImGui backend for Vulkan
-- **Timestamp Queries** - GPU timing and profiling support
-- **Memory Budget Tracking** - Monitor GPU memory usage and budgets
-- **Indirect Drawing** - Support for indirect draw calls and compute dispatches
+## Building
 
-### 🧮 Math Library
-- **GLSL-compatible Types** - vec2, vec3, vec4, mat4, quat with operator overloading
-- **Matrix Operations** - Compose, decompose, inverse, transpose, look-at
-- **Quaternion Support** - Rotation, slerp, and matrix conversion
-- **Utility Functions** - dot, cross, normalize, distance, and more
+```bash
+git clone https://github.com/carloshgsilva/evk
+cd evk
+mkdir build && cd build
+cmake ..
+cmake --build . --config Release
+```
 
-## Quick Start
+To integrate into your project:
 
-### Basic Setup
+```cmake
+add_subdirectory(path/to/evk)
+target_link_libraries(your_target evk)
+```
+
+## Usage
+
+### Initialization
 
 ```cpp
 #include "evk.h"
 
 int main() {
-    // Initialize EVK
     evk::EvkDesc desc = {
-        .applicationName = "My Vulkan App",
+        .applicationName = "MyApp",
         .applicationVersion = 1,
         .engineName = "EVK",
         .engineVersion = 1,
-        .enableSwapchain = true  // Enable for windowed applications
+        .enableSwapchain = true
     };
 
     if (!evk::InitializeEVK(desc)) {
         return -1;
     }
 
-    // Your rendering code here
+    // Application loop
     while (running) {
-        // Begin frame
         evk::CmdBeginPresent();
-
-        // Render commands
-        // ...
-
-        // End frame
+        // ... render commands ...
         evk::CmdEndPresent();
         evk::Submit();
     }
@@ -79,63 +68,59 @@ int main() {
 }
 ```
 
-### Creating Resources
+### Buffers and Images
 
 ```cpp
-// Create a vertex buffer
-evk::BufferDesc bufferDesc = {
+// Create a GPU buffer
+evk::Buffer buffer = evk::CreateBuffer({
     .name = "VertexBuffer",
-    .size = sizeof(vertices),
+    .size = dataSize,
     .usage = evk::BufferUsage::Vertex,
     .memoryType = evk::MemoryType::GPU
-};
-evk::Buffer vertexBuffer = evk::CreateBuffer(bufferDesc);
+});
 
-// Upload data to buffer
-evk::WriteBuffer(vertexBuffer, vertices.data(), sizeof(vertices));
+evk::WriteBuffer(buffer, data, dataSize);
 
-// Create an image/texture
-evk::ImageDesc imageDesc = {
+// Create an image
+evk::Image texture = evk::CreateImage({
     .name = "Texture",
     .extent = {512, 512},
     .format = evk::Format::RGBA8Unorm,
     .usage = evk::ImageUsage::Sampled,
     .filter = evk::Filter::Linear
-};
-evk::Image texture = evk::CreateImage(imageDesc);
+});
 ```
 
 ### Graphics Pipeline
 
 ```cpp
-evk::PipelineDesc pipelineDesc = {
-    .name = "BasicPipeline",
-    .VS = vertexShaderBytecode,
-    .FS = fragmentShaderBytecode,
-    .bindings = {{evk::Format::RGBA32Sfloat}},  // Vertex attributes
-    .attachments = {evk::Format::RGBA8Unorm},   // Color attachments
-    .blends = {evk::Blend::Alpha},             // Blending modes
+evk::Pipeline pipeline = evk::CreatePipeline({
+    .name = "MainPipeline",
+    .VS = evk::loadSpirvFile("shaders/vert.spv"),
+    .FS = evk::loadSpirvFile("shaders/frag.spv"),
+    .bindings = {{evk::Format::RGB32Sfloat, evk::Format::RG32Sfloat}},
+    .attachments = {evk::Format::RGBA8Unorm},
+    .blends = {evk::Blend::Alpha},
     .primitive = evk::Primitive::Triangle,
-    .cull = evk::Cull::Back
-};
-
-evk::Pipeline pipeline = evk::CreatePipeline(pipelineDesc);
-
-// Bind and use the pipeline
-evk::CmdBind(pipeline);
+    .cull = evk::Cull::Back,
+    .depthTest = true,
+    .depthWrite = true,
+    .depthOp = evk::Op::Less
+});
 ```
 
 ### Rendering
 
-```cpp
-// Render to a framebuffer
-evk::Image colorAttachment = /* your render target */;
-evk::Image depthAttachment = /* optional depth buffer */;
+The `CmdRender` function handles image layout transitions automatically:
 
-evk::CmdRender({colorAttachment}, {clearColor}, [&]() {
+```cpp
+evk::CmdRender({colorTarget}, {ClearColor{{0.0f, 0.0f, 0.0f, 1.0f}}}, [&]() {
     evk::CmdBind(pipeline);
     evk::CmdVertex(vertexBuffer);
     evk::CmdIndex(indexBuffer);
+    evk::CmdViewport(0, 0, width, height);
+    evk::CmdScissor(0, 0, width, height);
+    evk::CmdPush(pushConstants);
     evk::CmdDrawIndexed(indexCount);
 });
 ```
@@ -143,182 +128,165 @@ evk::CmdRender({colorAttachment}, {clearColor}, [&]() {
 ### Compute Pipeline
 
 ```cpp
-evk::PipelineDesc computeDesc = {
-    .name = "ComputePipeline",
-    .CS = computeShaderBytecode
+evk::Pipeline compute = evk::CreatePipeline({
+    .name = "ComputeShader",
+    .CS = evk::loadSpirvFile("shaders/compute.spv")
+});
+
+evk::CmdBind(compute);
+evk::CmdDispatch(groupsX, groupsY, groupsZ);
+evk::CmdBarrier();  // Synchronize compute output
+```
+
+### Push Constants
+
+EVK provides a type-safe way to pass push constants:
+
+```cpp
+struct PushData {
+    glsl::mat4 viewProj;
+    glsl::vec4 lightPos;
 };
 
-evk::Pipeline computePipeline = evk::CreatePipeline(computeDesc);
+PushData push = { /* ... */ };
+evk::CmdPush(push);
 
-evk::CmdBind(computePipeline);
-evk::CmdDispatch(groupCountX, groupCountY, groupCountZ);
+// Or using the Constant helper for mixed types:
+evk::CmdPush(evk::Constant(buffer.GetReference(), textureIndex, time));
 ```
 
-## Building
+### Image Operations
 
-### Prerequisites
-- CMake 3.8 or higher
-- Vulkan SDK
-- C++20 compatible compiler
+```cpp
+// Layout transitions
+evk::CmdBarrier(image, evk::ImageLayout::Undefined, evk::ImageLayout::TransferDst);
 
-### Build Steps
+// Copy between images
+evk::CmdCopy(srcImage, dstImage);
 
-```bash
-# Clone the repository
-git clone https://github.com/carloshgsilva/evk
-cd evk
+// Copy buffer to image
+evk::CmdCopy(stagingBuffer, texture);
 
-# Configure and build
-mkdir build && cd build
-cmake ..
-cmake --build . --config Release
-
-# The library will be available as evk.lib (Windows) or libevk.a (Linux/macOS)
+// Blit with scaling
+evk::CmdBlit(src, dst, srcRegion, dstRegion, evk::Filter::Linear);
 ```
-
-### Integration
-
-Add the following to your CMakeLists.txt:
-
-```cmake
-# Add EVK as a subdirectory
-add_subdirectory(path/to/evk)
-
-# Link against EVK
-target_link_libraries(your_target evk)
-
-# Include EVK headers
-target_include_directories(your_target PRIVATE path/to/evk)
-```
-
-## Architecture
-
-EVK is designed with the following principles:
-
-### 🏗️ Clean Architecture
-- **Single Header Interface** - Everything accessible through `evk.h`
-- **Resource IDs** - Efficient resource management with integer IDs
-- **RAII Pattern** - Automatic resource cleanup with smart pointers
-- **Command Buffer Recording** - Vulkan-style command recording for efficiency
-
-### 🔧 Implementation Details
-- **Vulkan Memory Allocator** - Integrated VMA for optimal memory management
-- **Format Conversion** - Automatic conversion between EVK and Vulkan formats
-- **Pipeline State Management** - Cached pipeline states for performance
-- **Synchronization** - Automatic barrier insertion and queue synchronization
-
-### 📊 Performance Features
-- **Memory Pooling** - Efficient memory allocation and reuse
-- **Descriptor Set Management** - Optimized descriptor set updates
-- **Command Buffer Reuse** - Minimizes allocation overhead
-- **GPU Timestamp Queries** - Built-in profiling and performance monitoring
-
-## Advanced Usage
 
 ### Ray Tracing
 
 ```cpp
-// Create Bottom-Level Acceleration Structure
-evk::BLASDesc blasDesc = {
+// Create acceleration structures
+evk::BLAS blas = evk::CreateBLAS({
     .geometry = evk::GeometryType::Triangles,
+    .stride = sizeof(Vertex),
     .vertices = vertexBuffer,
+    .vertexCount = vertexCount,
     .indices = indexBuffer,
     .triangleCount = triangleCount
-};
-evk::BLAS blas = evk::CreateBLAS(blasDesc);
+});
 
-// Create Top-Level Acceleration Structure
-evk::TLAS tlas = evk::CreateTLAS(maxInstanceCount, allowUpdates);
+evk::TLAS tlas = evk::CreateTLAS(maxInstances, allowUpdate);
 
-// Build acceleration structures
-std::vector<evk::BLASInstance> instances = {/* instance data */};
+// Build
 evk::CmdBuildBLAS({blas});
 evk::CmdBuildTLAS(tlas, instances);
 ```
 
-### ImGui Integration
+### GPU Profiling
+
+```cpp
+evk::CmdTimestamp("RenderPass", [&]() {
+    // ... rendering code ...
+});
+
+evk::Submit();
+
+for (const auto& ts : evk::GetTimestamps()) {
+    printf("%s: %.2f ms\n", ts.name, ts.end - ts.start);
+}
+```
+
+### Memory Monitoring
+
+```cpp
+evk::MemoryBudget budget = evk::GetMemoryBudget();
+for (uint32_t i = 0; i < budget.MAX_HEAPS; ++i) {
+    if (budget.heaps[i].budget > 0) {
+        printf("Heap %u: %llu / %llu MB\n", i,
+               budget.heaps[i].usage / (1024*1024),
+               budget.heaps[i].budget / (1024*1024));
+    }
+}
+```
+
+## API Reference
+
+### Core Functions
+
+| Function | Description |
+|----------|-------------|
+| `InitializeEVK(desc)` | Initialize the Vulkan context |
+| `Shutdown()` | Clean up all resources |
+| `Submit()` | Submit command buffer to GPU |
+| `Sync()` | Wait for all GPU work to complete |
+
+### Resource Creation
+
+| Function | Description |
+|----------|-------------|
+| `CreateBuffer(desc)` | Create a buffer (vertex, index, storage, etc.) |
+| `CreateImage(desc)` | Create an image/texture |
+| `CreatePipeline(desc)` | Create a graphics or compute pipeline |
+| `CreateBLAS(desc)` | Create bottom-level acceleration structure |
+| `CreateTLAS(count, update)` | Create top-level acceleration structure |
+
+### Command Recording
+
+| Function | Description |
+|----------|-------------|
+| `CmdBind(pipeline)` | Bind a pipeline for subsequent draw/dispatch calls |
+| `CmdVertex(buffer)` | Bind vertex buffer |
+| `CmdIndex(buffer)` | Bind index buffer |
+| `CmdPush(data)` | Set push constant data |
+| `CmdDraw(...)` | Issue draw call |
+| `CmdDrawIndexed(...)` | Issue indexed draw call |
+| `CmdDispatch(x, y, z)` | Dispatch compute work |
+| `CmdRender(attachments, clears, fn)` | Execute render pass |
+| `CmdBarrier(...)` | Insert pipeline barrier |
+| `CmdCopy(...)` | Copy between buffers/images |
+
+### Enums
+
+**Format**: `R8Uint`, `R16Uint`, `R32Uint`, `RGBA8Unorm`, `RGBA16Sfloat`, `RGBA32Sfloat`, `D32Sfloat`, etc.
+
+**BufferUsage**: `TransferSrc`, `TransferDst`, `Vertex`, `Index`, `Indirect`, `Storage`, `AccelerationStructure`
+
+**ImageUsage**: `TransferSrc`, `TransferDst`, `Sampled`, `Attachment`, `Storage`
+
+**MemoryType**: `GPU`, `CPU_TO_GPU`, `GPU_TO_CPU`
+
+**Blend**: `Disabled`, `Alpha`, `Additive`
+
+**Cull**: `None`, `Front`, `Back`
+
+## ImGui Integration
+
+EVK includes a ready-to-use ImGui backend:
 
 ```cpp
 #include "imgui_impl_evk.h"
 
-// Initialize ImGui
 ImGui::CreateContext();
 ImGui_ImplEvk_Init();
 
-// In your render loop
+// In render loop:
 ImGui_ImplEvk_PrepareRender(ImGui::GetDrawData());
 ImGui_ImplEvk_RenderDrawData(ImGui::GetDrawData());
 ```
 
-### Memory Management
-
-```cpp
-// Get current memory budget
-evk::MemoryBudget budget = evk::GetMemoryBudget();
-
-// Monitor memory usage
-for (int i = 0; i < budget.MAX_HEAPS; ++i) {
-    printf("Heap %d: %llu/%llu bytes used\n",
-           i, budget.heaps[i].usage, budget.heaps[i].budget);
-}
-```
-
-### Profiling
-
-```cpp
-// Profile a section of GPU work
-evk::CmdTimestamp("ComputePass", [&]() {
-    evk::CmdBind(computePipeline);
-    evk::CmdDispatch(workGroups);
-});
-
-// Get timing results
-auto timestamps = evk::GetTimestamps();
-for (const auto& ts : timestamps) {
-    printf("%s: %.3f ms\n", ts.name, ts.end - ts.start);
-}
-```
-
-## Examples
-
-See the `examples/` directory for complete working applications demonstrating:
-- Basic triangle rendering
-- Texture mapping
-- Compute shader usage
-- Ray tracing
-- ImGui integration
-- Performance monitoring
-
-## Contributing
-
-Contributions are welcome! Please see CONTRIBUTING.md for guidelines.
-
-### Development Setup
-
-```bash
-# Enable debug mode for development
-cmake -DEVK_DEBUG=ON ..
-```
-
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT License. See [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
-- Built on top of the excellent [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)
-- Inspired by modern graphics APIs and game engines
-- Thanks to the Vulkan community for documentation and examples
-
-## Roadmap
-
-- [ ] Additional shader stages support
-- [ ] Enhanced debugging features
-- [ ] More examples and tutorials
-- [ ] Performance optimizations
-- [ ] Additional platform support
-- [ ] Extended ray tracing features
-
----
-
-**Note**: This library is currently in active development. APIs may change between versions.
+Built with [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator).
