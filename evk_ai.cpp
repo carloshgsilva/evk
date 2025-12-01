@@ -558,7 +558,7 @@ namespace evk::ai {
             beta1CorrectionInv,
             beta2CorrectionInv,
             epsilon,
-            totalElements,
+            totalElements
         });
 
         const uint32_t WORKGROUP_SIZE = 256u;
