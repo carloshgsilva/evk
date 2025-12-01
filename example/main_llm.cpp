@@ -227,10 +227,7 @@ struct Transformer {
         
         loss->cpu_download();
         float loss_val = float(loss->cpu()[0]);
-        
-        // Clip gradients to prevent explosion in deep networks
-        // model.clip_grad_norm(1.0f);
-        
+
         model.step_adam(learning_rate);
         evk::Sync();
         
@@ -494,10 +491,10 @@ void main_llm() {
     // run_next_token_prediction_attention();  // Comment out for now
 
     auto start = std::chrono::high_resolution_clock::now();
-    run_circle_detection(1);
-    run_circle_detection(2);
+    // run_circle_detection(1);
+    // run_circle_detection(2);
     run_circle_detection(4);
-    run_circle_detection(8);
+    // run_circle_detection(8);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
     printf("run_circle_detection() took %.4f seconds\n", duration.count());
@@ -951,8 +948,8 @@ void run_circle_detection(uint32_t num_layers) {
            detector.input_seq_len, detector.output_seq_len, detector.total_seq_len);
     
     // Training
-    const int EPOCHS = 500;
-    const float LR = 0.003f;
+    const int EPOCHS = 5000;
+    const float LR = 0.0001f;
     
     printf("  Training for %d epochs with LR=%.4f...\n", EPOCHS, LR);
     
@@ -972,7 +969,7 @@ void run_circle_detection(uint32_t num_layers) {
         float epoch_loss = detector.train_batch(dataset, effective_lr);
         loss_history.push_back(epoch_loss);
         
-        if (epoch % 100 == 0 || epoch == EPOCHS - 1) {
+        if (epoch % 50 == 0 || epoch == EPOCHS - 1) {
             printf("  epoch %3d: loss = %.4f\n", epoch, epoch_loss);
             CircleDataset::save_loss_graph("loss_graph.bmp", loss_history);
         }

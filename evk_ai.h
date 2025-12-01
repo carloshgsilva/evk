@@ -501,6 +501,15 @@ namespace evk::ai {
 
     // Sum across batch dimension: out[i] += sum_b(input[b, i])
     void sum_batch(Tensor& input, Tensor& output, uint32_t batch_count, uint32_t size_per_batch);
+
+    // RMS Normalization forward: out = input / sqrt(mean(input^2) + eps)
+    // Normalizes over the last dimension
+    // input, output: same shape (*, D) where D is the dimension to normalize
+    void rms_norm(Tensor& input, Tensor& output, float eps = 1e-4f);
+
+    // RMS Normalization backward
+    // Accumulates gradient into grad_input
+    void rms_norm_backward(Tensor& input, Tensor& grad_out, Tensor& grad_input, float eps = 1e-4f);
 }
 
 struct Graph {
@@ -659,93 +668,17 @@ struct Graph {
     // input: (B, N, D)
     // out = input / rms, where rms = sqrt(mean(x^2) + eps) per (b, n).
     Tensor& rms_norm(Tensor& input, float eps = 1e-4f) {  // Larger eps for fp16 stability
-        assert(input.shape.rank() == 3 && "rms_norm expects (B, N, D)");
-        uint32_t B = input.shape[0];
-        uint32_t N = input.shape[1];
-        uint32_t D = input.shape[2];
+        assert(input.shape.rank() >= 2 && "rms_norm expects at least 2D tensor");
 
         nodes.push_back(std::make_unique<Tensor>(input.shape));
         Tensor& out = *nodes.back();
 
-        out.forward_fn = [&input, &out, B, N, D, eps]() {
-            // Bring input to CPU, compute normalized output, then upload.
-            input.cpu_download();
-            float16_t* in_ptr = input.cpu();
-            float16_t* out_ptr = out.cpu();
-
-            for (uint32_t b = 0; b < B; ++b) {
-                for (uint32_t n = 0; n < N; ++n) {
-                    uint32_t base = (b * N + n) * D;
-                    float sum_sq = 0.0f;
-                    for (uint32_t d = 0; d < D; ++d) {
-                        float v = float(in_ptr[base + d]);
-                        // Clamp extreme values for fp16 stability
-                        v = std::max(-65504.0f, std::min(65504.0f, v));
-                        if (std::isfinite(v)) {
-                            sum_sq += v * v;
-                        }
-                    }
-                    float s = sum_sq / float(D) + eps;
-                    float inv_r = 1.0f / std::sqrt(s);
-                    for (uint32_t d = 0; d < D; ++d) {
-                        float v = float(in_ptr[base + d]);
-                        v = std::max(-65504.0f, std::min(65504.0f, v));
-                        out_ptr[base + d] = float16_t(v * inv_r);
-                    }
-                }
-            }
-
-            out.cpu_upload();
+        out.forward_fn = [&input, &out, eps]() {
+            evk::ai::rms_norm(input, out, eps);
         };
 
-        out.backward_fn = [&input, &out, B, N, D, eps]() {
-            // dL/dx_i = g_i / r - x_i * (1/(D * r^3)) * sum_j g_j * x_j
-            input.cpu_download();
-            out.grad().cpu_download();
-
-            Tensor& grad_in = input.grad();
-            grad_in.cpu_download(); // starts from zeros (GPU was zeroed in eval())
-
-            float16_t* x_ptr = input.cpu();
-            float16_t* gy_ptr = out.grad().cpu();
-            float16_t* gx_ptr = grad_in.cpu();
-
-            for (uint32_t b = 0; b < B; ++b) {
-                for (uint32_t n = 0; n < N; ++n) {
-                    uint32_t base = (b * N + n) * D;
-                    float sum_sq = 0.0f;
-                    float sum_gx = 0.0f;
-                    for (uint32_t d = 0; d < D; ++d) {
-                        float x = float(x_ptr[base + d]);
-                        float g = float(gy_ptr[base + d]);
-                        // Skip NaN/Inf values
-                        if (std::isfinite(x) && std::isfinite(g)) {
-                            sum_sq += x * x;
-                            sum_gx += g * x;
-                        }
-                    }
-                    float s = sum_sq / float(D) + eps;
-                    float r = std::sqrt(s);
-                    float inv_r = 1.0f / r;
-                    float inv_r3 = inv_r / s; // 1/r^3 = 1/(s * sqrt(s))
-
-                    for (uint32_t d = 0; d < D; ++d) {
-                        float x = float(x_ptr[base + d]);
-                        float g = float(gy_ptr[base + d]);
-                        float acc = float(gx_ptr[base + d]);
-                        
-                        // Handle NaN/Inf gracefully
-                        if (!std::isfinite(x) || !std::isfinite(g)) {
-                            gx_ptr[base + d] = float16_t(0.0f);
-                        } else {
-                            float dx = g * inv_r - x * sum_gx * inv_r3 / float(D);
-                            gx_ptr[base + d] = float16_t(acc + dx);
-                        }
-                    }
-                }
-            }
-
-            grad_in.cpu_upload();
+        out.backward_fn = [&input, &out, eps]() {
+            evk::ai::rms_norm_backward(input, out.grad(), input.grad(), eps);
         };
 
         return out;
@@ -973,44 +906,6 @@ struct Graph {
             assert(param->grad_tensor);
             evk::ai::sgd(*param, param->grad(), -lr);
         }
-    }
-
-    // Clip gradient norm in-place (on CPU for simplicity)
-    // Returns the original gradient norm before clipping
-    float clip_grad_norm(float max_norm = 1.0f) {
-        // First, compute total gradient norm
-        float total_norm_sq = 0.0f;
-        for (auto& param : params) {
-            if (!param->grad_tensor) continue;
-            param->grad().cpu_download();
-            float16_t* ptr = param->grad().cpu();
-            uint32_t count = param->shape.count();
-            for (uint32_t i = 0; i < count; ++i) {
-                float v = float(ptr[i]);
-                total_norm_sq += v * v;
-            }
-        }
-        float total_norm = std::sqrt(total_norm_sq);
-        
-        // If norm exceeds max, scale all gradients down
-        if (total_norm > max_norm || !std::isfinite(total_norm)) {
-            printf("Clipping gradients: original norm = %g, max norm = %g\n", total_norm, max_norm);
-            // If NaN/Inf, just zero out all gradients
-            // Otherwise scale down to max_norm
-            float scale = std::isfinite(total_norm) ? (max_norm / total_norm) : 0.0f;
-            for (auto& param : params) {
-                if (!param->grad_tensor) continue;
-                float16_t* ptr = param->grad().cpu();
-                uint32_t count = param->shape.count();
-                for (uint32_t i = 0; i < count; ++i) {
-                    float v = float(ptr[i]);
-                    if (!std::isfinite(v)) v = 0.0f;
-                    ptr[i] = float16_t(v * scale);
-                }
-                param->grad().cpu_upload();
-            }
-        }
-        return total_norm;
     }
 
     // apply the gradient update using Adam optimizer

@@ -1,0 +1,74 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 inputBuffer;   // original input (x)
+    BufferFp16 gradOutBuffer; // gradient from upstream (dL/dy)
+    BufferFp16 gradInBuffer;  // gradient to input (dL/dx), accumulated
+    float eps;                // epsilon for numerical stability
+    uint D;                   // dimension (last dim size)
+    uint outerCount;          // B * N (number of rows)
+)
+
+// RMS Normalization backward:
+// Given: y = x / rms, where rms = sqrt(mean(x^2) + eps)
+// Gradient: dL/dx_i = (dL/dy_i - x_i * (sum_j dL/dy_j * x_j) / (D * rms^2)) / rms
+//                   = (dL/dy_i / rms) - (x_i / rms) * (sum_j dL/dy_j * x_j / rms) / (D * rms)
+//                   = (g_i - y_i * dot(g, y) / D) / rms
+// where g = dL/dy and y = x/rms
+//
+// One workgroup per row, single subgroup (size 32)
+COMPUTE(32, 1, 1)
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= outerCount) return;
+
+    uint lid = gl_LocalInvocationID.x; // 0..31
+    uint rowStart = row * D;
+
+    // 1) Compute sum of squares for input (to get rms)
+    float localSumSq = 0.0;
+    for (uint j = lid; j < D; j += 32) {
+        float v = float(inputBuffer.x[rowStart + j]);
+        v = clamp(v, -65504.0, 65504.0);
+        localSumSq += v * v;
+    }
+    float sumSq = subgroupAdd(localSumSq);
+    float meanSq = sumSq / float(D);
+    float rms = sqrt(meanSq + eps);
+    float invRms = 1.0 / rms;
+
+    // 2) Compute dot product: sum(grad_out * x / rms) = sum(g * y)
+    //    which is sum(grad_out * normalized_output)
+    float localDot = 0.0;
+    for (uint j = lid; j < D; j += 32) {
+        float x = float(inputBuffer.x[rowStart + j]);
+        x = clamp(x, -65504.0, 65504.0);
+        float g = float(gradOutBuffer.x[rowStart + j]);
+        float y = x * invRms; // normalized value
+        localDot += g * y;
+    }
+    float dotGY = subgroupAdd(localDot);
+
+    // 3) Compute gradient: dL/dx_i = (g_i - y_i * dot(g,y) / D) / rms
+    //                              = (g_i / rms) - (x_i / rms^2) * (dot(g,y) / D)
+    float scale = dotGY / float(D);
+    for (uint j = lid; j < D; j += 32) {
+        float x = float(inputBuffer.x[rowStart + j]);
+        x = clamp(x, -65504.0, 65504.0);
+        float g = float(gradOutBuffer.x[rowStart + j]);
+        float existing = float(gradInBuffer.x[rowStart + j]);
+        
+        // dL/dx = (g - y * scale) / rms = (g - x * invRms * scale) / rms
+        //       = g * invRms - x * invRms^2 * scale
+        float dx = g * invRms - x * invRms * invRms * scale;
+        gradInBuffer.x[rowStart + j] = float16_t(existing + dx);
+    }
+}

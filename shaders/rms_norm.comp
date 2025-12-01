@@ -1,0 +1,49 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 inputBuffer;
+    BufferFp16 outputBuffer;
+    float eps;           // epsilon for numerical stability
+    uint D;              // dimension (last dim size)
+    uint outerCount;     // B * N (number of rows to normalize)
+)
+
+// RMS Normalization: out = input / sqrt(mean(input^2) + eps)
+// One workgroup per row, single subgroup (size 32)
+COMPUTE(32, 1, 1)
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= outerCount) return;
+
+    uint lid = gl_LocalInvocationID.x; // 0..31
+    uint rowStart = row * D;
+
+    // 1) Compute sum of squares
+    float localSumSq = 0.0;
+    for (uint j = lid; j < D; j += 32) {
+        float v = float(inputBuffer.x[rowStart + j]);
+        // Clamp extreme values for fp16 stability
+        v = clamp(v, -65504.0, 65504.0);
+        localSumSq += v * v;
+    }
+    float sumSq = subgroupAdd(localSumSq);
+
+    // 2) Compute inverse RMS: 1 / sqrt(mean(x^2) + eps)
+    float meanSq = sumSq / float(D);
+    float invRms = inversesqrt(meanSq + eps);
+
+    // 3) Normalize: out = input * invRms
+    for (uint j = lid; j < D; j += 32) {
+        float v = float(inputBuffer.x[rowStart + j]);
+        v = clamp(v, -65504.0, 65504.0);
+        outputBuffer.x[rowStart + j] = float16_t(v * invRms);
+    }
+}
