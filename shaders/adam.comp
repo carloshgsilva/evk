@@ -39,9 +39,6 @@ void main() {
         float m = float(mBuffer.x[gid]);
         float v = float(vBuffer.x[gid]);
 
-        // Gradient clipping to prevent NaN from exploding gradients
-        grad = clamp(grad, -65504.0, 65504.0);  // fp16 max
-        
         // Skip update if gradient is NaN or Inf
         if (isnan(grad) || isinf(grad)) {
             return;
@@ -74,8 +71,3 @@ void main() {
         }
     }
 }
-
-
-
-
-

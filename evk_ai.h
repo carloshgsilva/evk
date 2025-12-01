@@ -213,6 +213,21 @@ struct Shape {
     }
 };
 
+struct GradStats {
+    float min_val = 1e9f;
+    float max_val = -1e9f;
+    float mean = 0.0f;
+    float rms = 0.0f;
+    uint32_t nan_count = 0;
+    uint32_t inf_count = 0;
+    uint32_t zero_count = 0;
+    
+    void print(const char* name) const {
+        printf("    %s: min=%.6f, max=%.6f, mean=%.6f, rms=%.6f, nan=%u, inf=%u, zero=%u\n",
+               name, min_val, max_val, mean, rms, nan_count, inf_count, zero_count);
+    }
+};
+
 struct Tensor {
     evk::Buffer buffer;
     evk::Buffer cpu_buffer;
@@ -391,6 +406,40 @@ struct Tensor {
         else printf("\n");
 
         printf("]\n");
+    }
+
+    GradStats stats() {
+        cpu_download();
+        float16_t* data = cpu();
+        uint32_t count = shape.count();
+
+        GradStats stats;
+        float sum = 0.0f;
+        float sum_sq = 0.0f;
+        uint32_t valid_count = 0;
+
+        for (uint32_t i = 0; i < count; ++i) {
+            float v = float(data[i]);
+            if (std::isnan(v)) {
+                stats.nan_count++;
+            } else if (std::isinf(v)) {
+                stats.inf_count++;
+            } else {
+                if (v == 0.0f) stats.zero_count++;
+                stats.min_val = std::min(stats.min_val, v);
+                stats.max_val = std::max(stats.max_val, v);
+                sum += v;
+                sum_sq += v * v;
+                valid_count++;
+            }
+        }
+
+        if (valid_count > 0) {
+            stats.mean = sum / float(valid_count);
+            stats.rms = sqrtf(sum_sq / float(valid_count));
+        }
+
+        return stats;
     }
 
     private:

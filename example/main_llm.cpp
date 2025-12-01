@@ -20,33 +20,47 @@ struct AttentionBlock {
     // Dimensions
     uint32_t embed_dim;
     uint32_t hidden_dim;
+    uint32_t layer_idx;
+    uint32_t total_layers;
     
-    AttentionBlock() : embed_dim(0), hidden_dim(0) {}
+    AttentionBlock() : embed_dim(0), hidden_dim(0), layer_idx(0), total_layers(1) {}
     
     // Initialize weights in the given graph
-    void init(Graph& graph, uint32_t embed_dim_, uint32_t hidden_dim_) {
+    void init(Graph& graph, uint32_t embed_dim_, uint32_t hidden_dim_, uint32_t layer_idx_ = 0, uint32_t total_layers_ = 1) {
         embed_dim = embed_dim_;
         hidden_dim = hidden_dim_;
+        layer_idx = layer_idx_;
+        total_layers = total_layers_;
         
         w_q = &graph.tensor({embed_dim, embed_dim}, true);
         w1 = &graph.tensor({embed_dim, hidden_dim}, true);
         w2 = &graph.tensor({hidden_dim, embed_dim}, true);
     }
     
-    // Initialize weights with random values
-    void init_weights(float scale) {
-        w_q->random_init(scale);
-        w1->random_init(scale);
-        w2->random_init(scale);
+    // Initialize weights with random values using proper scaling for deep networks
+    // Uses a combination of He initialization with residual scaling
+    void init_weights(float base_scale, bool use_residual_scaling = true) {
+        // He initialization: scale by sqrt(2/fan_in)
+        float w_q_scale = base_scale * sqrtf(2.0f / float(embed_dim));
+        float w1_scale = base_scale * sqrtf(2.0f / float(embed_dim));
+        
+        // For the last projection in residual path, scale down to prevent growth
+        // This is the "residual scaling" technique from GPT-2 / muP
+        float residual_scale = use_residual_scaling ? (1.0f / sqrtf(float(2 * total_layers))) : 1.0f;
+        float w2_scale = base_scale * sqrtf(2.0f / float(hidden_dim)) * residual_scale;
+        
+        w_q->random_init(w_q_scale);
+        w1->random_init(w1_scale);
+        w2->random_init(w2_scale);
     }
     
     // Forward pass through this block
     // input: (B, N, embed_dim)
     // Returns: (B, N, embed_dim) output with residual connections
-    Tensor& forward(Graph& graph, Tensor& input) {
+    Tensor& forward(Graph& graph, Tensor& input, float residual_scale = 1.0f) {
         // Pre-norm Transformer block:
-        //   y = x + Attn(RMSNorm(x))
-        //   z = y + FFN(RMSNorm(y))
+        //   y = x + scale * Attn(RMSNorm(x))
+        //   z = y + scale * FFN(RMSNorm(y))
 
         // 1) Pre-norm attention block
         Tensor& norm1 = graph.rms_norm(input);
@@ -58,14 +72,26 @@ struct AttentionBlock {
         
         // Causal self-attention with residual
         Tensor& attn_out = graph.causal_attention(q, k, v);
-        Tensor& attn_residual = graph.add(input, attn_out);
+        
+        // Optional: scale the attention output before residual (helps with deep networks)
+        Tensor* attn_scaled = &attn_out;
+        if (residual_scale != 1.0f) {
+            attn_scaled = &graph.scale(attn_out, residual_scale);
+        }
+        Tensor& attn_residual = graph.add(input, *attn_scaled);
         
         // 2) Pre-norm FFN block
         Tensor& norm2 = graph.rms_norm(attn_residual);
         Tensor& hidden = graph.matmul(norm2, *w1);
         Tensor& hidden_relu = graph.relu(hidden);
         Tensor& hidden_proj = graph.matmul(hidden_relu, *w2);
-        Tensor& output = graph.add(attn_residual, hidden_proj);
+        
+        // Optional: scale the FFN output before residual
+        Tensor* ffn_scaled = &hidden_proj;
+        if (residual_scale != 1.0f) {
+            ffn_scaled = &graph.scale(hidden_proj, residual_scale);
+        }
+        Tensor& output = graph.add(attn_residual, *ffn_scaled);
         
         return output;
     }
@@ -128,20 +154,28 @@ struct Transformer {
         pos_emb = &model.tensor({seq_len, embed_dim}, true);
         w_out = &model.tensor({embed_dim, vocab_size}, true);
         
-        // Initialize attention blocks
+        // Initialize attention blocks with layer indices for proper scaling
         blocks.resize(num_layers);
         for (uint32_t i = 0; i < num_layers; ++i) {
-            blocks[i].init(model, embed_dim, hidden_dim);
+            blocks[i].init(model, embed_dim, hidden_dim, i, num_layers);
         }
         
         // Forward pass
         Tensor& embedded = model.embed(*token_emb, *input_tokens);
         Tensor& input_with_pos = model.add_position_embedding(embedded, *pos_emb, batch_size, seq_len);
         
+        // Compute residual scale for deep networks (prevents gradient explosion/vanishing)
+        // This scales down each residual contribution so total variance stays bounded
+        float residual_scale = 1.0f;
+        if (num_layers > 2) {
+            // Use alpha = 1/sqrt(2*num_layers) as suggested by various papers on deep transformers
+            residual_scale = 1.0f / sqrtf(float(num_layers));
+        }
+        
         // Pass through N attention blocks
         Tensor* x = &input_with_pos;
         for (uint32_t i = 0; i < num_layers; ++i) {
-            x = &blocks[i].forward(model, *x);
+            x = &blocks[i].forward(model, *x, residual_scale);
         }
 
         // Output projection and loss
@@ -161,37 +195,48 @@ struct Transformer {
         // Initialize inference attention blocks
         inf_blocks.resize(num_layers);
         for (uint32_t i = 0; i < num_layers; ++i) {
-            inf_blocks[i].init(inference, embed_dim, hidden_dim);
+            inf_blocks[i].init(inference, embed_dim, hidden_dim, i, num_layers);
+        }
+        
+        // Compute same residual scale as training
+        float residual_scale = 1.0f;
+        if (num_layers > 2) {
+            residual_scale = 1.0f / sqrtf(float(num_layers));
         }
         
         // Forward pass (same architecture as training)
         Tensor& embedded = inference.embed(*inf_token_emb, *inf_input);
         Tensor& input_with_pos = inference.add_position_embedding(embedded, *inf_pos_emb, 1, seq_len);
         
-        // Pass through N attention blocks
+        // Pass through N attention blocks (use same residual_scale as training)
         Tensor* x = &input_with_pos;
         for (uint32_t i = 0; i < num_layers; ++i) {
-            x = &inf_blocks[i].forward(inference, *x);
+            x = &inf_blocks[i].forward(inference, *x, residual_scale);
         }
-        
-        // Final RMSNorm before output projection
-        Tensor& final_norm = inference.rms_norm(*x);
-        
-        inf_logits = &inference.matmul(final_norm, *inf_w_out);
+
+        inf_logits = &inference.matmul(*x, *inf_w_out);
     }
     
     void init_weights(uint32_t seed = 42) {
         srand(seed);
-        float scale = 0.1f / sqrtf(float(embed_dim));
-        token_emb->random_init(0.1f);
-        pos_emb->random_init(0.1f);
         
-        // Initialize all attention block weights
+        // Proper initialization for deep transformers:
+        // - Embeddings: use small values to keep activations bounded
+        // - Weights: use He-like scaling with residual compensation
+        float emb_scale = 0.02f;  // Small embedding init
+        float base_scale = 1.0f;  // Base scale for weights (blocks will apply He scaling)
+        
+        token_emb->random_init(emb_scale);
+        pos_emb->random_init(emb_scale);
+        
+        // Initialize all attention block weights with proper scaling
         for (uint32_t i = 0; i < num_layers; ++i) {
-            blocks[i].init_weights(scale);
+            blocks[i].init_weights(base_scale, true);  // Use residual scaling
         }
         
-        w_out->random_init(scale);
+        // Output projection: use smaller init to prevent large initial logits
+        float w_out_scale = 0.02f / sqrtf(float(embed_dim));
+        w_out->random_init(w_out_scale);
     }
     
     void copy_weights_to_inference() {
@@ -228,7 +273,8 @@ struct Transformer {
         loss->cpu_download();
         float loss_val = float(loss->cpu()[0]);
 
-        model.step_adam(learning_rate);
+        model.step_adam(learning_rate, 0.9f, 0.999f, 1e-4f);
+        // model.step(-learning_rate*0.1f);
         evk::Sync();
         
         return loss_val;
@@ -493,8 +539,8 @@ void main_llm() {
     auto start = std::chrono::high_resolution_clock::now();
     // run_circle_detection(1);
     // run_circle_detection(2);
+    // run_circle_detection(4);
     run_circle_detection(4);
-    // run_circle_detection(8);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
     printf("run_circle_detection() took %.4f seconds\n", duration.count());
@@ -921,17 +967,53 @@ struct CircleDetector {
     }
 };
 
+void debug_gradients(Transformer& transformer, const char* label) {
+    printf("  [%s] Gradient Statistics:\n", label);
+    
+    // Token embedding gradients
+    if (transformer.token_emb->grad_tensor) {
+        transformer.token_emb->grad().stats().print("token_emb.grad");
+    }
+    
+    // Positional embedding gradients
+    if (transformer.pos_emb->grad_tensor) {
+        transformer.pos_emb->grad().stats().print("pos_emb.grad");
+    }
+    
+    // Output projection gradients
+    if (transformer.w_out->grad_tensor) {
+        transformer.w_out->grad().stats().print("w_out.grad");
+    }
+    
+    // First block's weights
+    for( size_t i = 0; i < transformer.blocks.size(); ++i) {
+        auto& block = transformer.blocks[i];
+        printf("  -- Block %zu --\n", i);
+        if (block.w_q->grad_tensor) {
+            block.w_q->grad().stats().print("w_q.grad");
+        }
+        if (block.w1->grad_tensor) {
+            block.w1->grad().stats().print("w1.grad");
+        }
+        if (block.w2->grad_tensor) {
+            block.w2->grad().stats().print("w2.grad");
+        }
+    }
+    
+    printf("\n");
+}
+
 // Main function for circle detection demo
 void run_circle_detection(uint32_t num_layers) {
     printf("\n=== Circle Detection Transformer ===\n");
     
     // Hyperparameters
     constexpr uint32_t N_POINTS = 16;       // Number of input points
-    constexpr uint32_t N_MAX_PRIMS = 1;     // Detect 1 circle
+    constexpr uint32_t N_MAX_PRIMS = 2;     // Detect 1 circle
     constexpr uint32_t GRID_SIZE = 64;      // Discrete coordinate space
     constexpr uint32_t EMBED_DIM = 64;
     constexpr uint32_t HIDDEN_DIM = 128;
-    constexpr uint32_t BATCH_SIZE = 16;
+    constexpr uint32_t BATCH_SIZE = 64;
     uint32_t NUM_LAYERS = num_layers;
     
     printf("  Config: n_points=%u, n_max_prims=%u, grid=%u, embed=%u, hidden=%u, layers=%u\n",
@@ -947,17 +1029,15 @@ void run_circle_detection(uint32_t num_layers) {
     printf("  Input seq len: %u, Output seq len: %u, Total: %u\n",
            detector.input_seq_len, detector.output_seq_len, detector.total_seq_len);
     
-    // Training
-    const int EPOCHS = 5000;
-    const float LR = 0.0001f;
+    // Training hyperparameters - tuned for fp16
+    const int EPOCHS = 2000;
+    const float LR = 0.001f;
+    const int WARMUP_EPOCHS = 50;
     
-    printf("  Training for %d epochs with LR=%.4f...\n", EPOCHS, LR);
+    printf("  Training for %d epochs with LR=%.4f, warmup=%d...\n", EPOCHS, LR, WARMUP_EPOCHS);
     
     std::vector<float> loss_history;
     loss_history.reserve(EPOCHS);
-    
-    // Warmup period: use small learning rate for first few epochs
-    const int WARMUP_EPOCHS = 10;
     
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
         // Linear warmup from 0.1*LR to LR over warmup period
@@ -969,9 +1049,14 @@ void run_circle_detection(uint32_t num_layers) {
         float epoch_loss = detector.train_batch(dataset, effective_lr);
         loss_history.push_back(epoch_loss);
         
-        if (epoch % 50 == 0 || epoch == EPOCHS - 1) {
+        if (epoch % 200 == 0 || epoch == EPOCHS - 1) {
             printf("  epoch %3d: loss = %.4f\n", epoch, epoch_loss);
             CircleDataset::save_loss_graph("loss_graph.bmp", loss_history);
+        }
+        
+        // Debug gradients (uncomment to debug gradient issues)
+        if (epoch == 0 || (epoch % 1 == 0) || epoch == EPOCHS - 1) {
+            // debug_gradients(detector.transformer, ("epoch " + std::to_string(epoch)).c_str());
         }
     }
     
