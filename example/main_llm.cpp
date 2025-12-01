@@ -44,17 +44,25 @@ struct AttentionBlock {
     // input: (B, N, embed_dim)
     // Returns: (B, N, embed_dim) output with residual connections
     Tensor& forward(Graph& graph, Tensor& input) {
-        // Attention projections (Query-Only: K and V are just input)
-        Tensor& q = graph.matmul(input, *w_q);
-        Tensor& k = input;
-        Tensor& v = input;
+        // Pre-norm Transformer block:
+        //   y = x + Attn(RMSNorm(x))
+        //   z = y + FFN(RMSNorm(y))
+
+        // 1) Pre-norm attention block
+        Tensor& norm1 = graph.rms_norm(input);
+        
+        // Attention projections (Query-Only: K and V use the same input)
+        Tensor& q = graph.matmul(norm1, *w_q);
+        Tensor& k = norm1;
+        Tensor& v = norm1;
         
         // Causal self-attention with residual
         Tensor& attn_out = graph.causal_attention(q, k, v);
         Tensor& attn_residual = graph.add(input, attn_out);
         
-        // FFN with residual
-        Tensor& hidden = graph.matmul(attn_residual, *w1);
+        // 2) Pre-norm FFN block
+        Tensor& norm2 = graph.rms_norm(attn_residual);
+        Tensor& hidden = graph.matmul(norm2, *w1);
         Tensor& hidden_relu = graph.relu(hidden);
         Tensor& hidden_proj = graph.matmul(hidden_relu, *w2);
         Tensor& output = graph.add(attn_residual, hidden_proj);
@@ -135,7 +143,7 @@ struct Transformer {
         for (uint32_t i = 0; i < num_layers; ++i) {
             x = &blocks[i].forward(model, *x);
         }
-        
+
         // Output projection and loss
         Tensor& logits = model.matmul(*x, *w_out);
         loss = &model.cross_entropy_loss(logits, *targets);
@@ -166,7 +174,10 @@ struct Transformer {
             x = &inf_blocks[i].forward(inference, *x);
         }
         
-        inf_logits = &inference.matmul(*x, *inf_w_out);
+        // Final RMSNorm before output projection
+        Tensor& final_norm = inference.rms_norm(*x);
+        
+        inf_logits = &inference.matmul(final_norm, *inf_w_out);
     }
     
     void init_weights(uint32_t seed = 42) {
@@ -175,7 +186,7 @@ struct Transformer {
         token_emb->random_init(0.1f);
         pos_emb->random_init(0.1f);
         
-        // Initialize all attention block weights (must be before w_out to match original order)
+        // Initialize all attention block weights
         for (uint32_t i = 0; i < num_layers; ++i) {
             blocks[i].init_weights(scale);
         }
@@ -216,6 +227,9 @@ struct Transformer {
         
         loss->cpu_download();
         float loss_val = float(loss->cpu()[0]);
+        
+        // Clip gradients to prevent explosion in deep networks
+        // model.clip_grad_norm(1.0f);
         
         model.step_adam(learning_rate);
         evk::Sync();
@@ -472,7 +486,7 @@ float run_next_token_prediction_attention() {
 }
 
 // Forward declaration
-void run_circle_detection();
+void run_circle_detection(uint32_t num_layers);
 
 #include <chrono>
 void main_llm() {
@@ -480,7 +494,10 @@ void main_llm() {
     // run_next_token_prediction_attention();  // Comment out for now
 
     auto start = std::chrono::high_resolution_clock::now();
-    run_circle_detection();
+    run_circle_detection(1);
+    run_circle_detection(2);
+    run_circle_detection(4);
+    run_circle_detection(8);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
     printf("run_circle_detection() took %.4f seconds\n", duration.count());
@@ -908,17 +925,17 @@ struct CircleDetector {
 };
 
 // Main function for circle detection demo
-void run_circle_detection() {
+void run_circle_detection(uint32_t num_layers) {
     printf("\n=== Circle Detection Transformer ===\n");
     
-    // Hyperparameters - start with single circle for simpler task
+    // Hyperparameters
     constexpr uint32_t N_POINTS = 16;       // Number of input points
-    constexpr uint32_t N_MAX_PRIMS = 1;     // Start with just 1 circle
-    constexpr uint32_t GRID_SIZE = 64;      // Smaller discrete coordinate space
+    constexpr uint32_t N_MAX_PRIMS = 1;     // Detect 1 circle
+    constexpr uint32_t GRID_SIZE = 64;      // Discrete coordinate space
     constexpr uint32_t EMBED_DIM = 64;
     constexpr uint32_t HIDDEN_DIM = 128;
     constexpr uint32_t BATCH_SIZE = 16;
-    constexpr uint32_t NUM_LAYERS = 4;
+    uint32_t NUM_LAYERS = num_layers;
     
     printf("  Config: n_points=%u, n_max_prims=%u, grid=%u, embed=%u, hidden=%u, layers=%u\n",
            N_POINTS, N_MAX_PRIMS, GRID_SIZE, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS);
@@ -934,19 +951,28 @@ void run_circle_detection() {
            detector.input_seq_len, detector.output_seq_len, detector.total_seq_len);
     
     // Training
-    const int EPOCHS = 15000;
-    const float LR = 0.001f;
+    const int EPOCHS = 500;
+    const float LR = 0.003f;
     
-    printf("  Training for %d epochs...\n", EPOCHS);
+    printf("  Training for %d epochs with LR=%.4f...\n", EPOCHS, LR);
     
     std::vector<float> loss_history;
     loss_history.reserve(EPOCHS);
     
+    // Warmup period: use small learning rate for first few epochs
+    const int WARMUP_EPOCHS = 10;
+    
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
-        float epoch_loss = detector.train_batch(dataset, LR);
+        // Linear warmup from 0.1*LR to LR over warmup period
+        float effective_lr = LR;
+        if (epoch < WARMUP_EPOCHS) {
+            effective_lr = LR * (0.1f + 0.9f * float(epoch) / float(WARMUP_EPOCHS));
+        }
+        
+        float epoch_loss = detector.train_batch(dataset, effective_lr);
         loss_history.push_back(epoch_loss);
         
-        if (epoch % 50 == 0 || epoch == EPOCHS - 1) {
+        if (epoch % 100 == 0 || epoch == EPOCHS - 1) {
             printf("  epoch %3d: loss = %.4f\n", epoch, epoch_loss);
             CircleDataset::save_loss_graph("loss_graph.bmp", loss_history);
         }
@@ -987,6 +1013,5 @@ void run_circle_detection() {
         dataset.save_sample_bmp(filename, gt_circles.data(), num_gt, 
                                points.data(), N_POINTS,
                                pred_circles.data(), N_MAX_PRIMS);
-        printf("          Saved: %s\n", filename);
     }
 }
