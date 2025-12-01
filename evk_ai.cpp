@@ -21,6 +21,8 @@ namespace evk::ai {
         evk::Pipeline scale;
         evk::Pipeline zero;
         evk::Pipeline sum_batch;
+        evk::Pipeline rms_norm;
+        evk::Pipeline rms_norm_bwd;
         evk::Buffer flash_scratch;
         uint32_t flash_scratch_elems = 0;
     };
@@ -222,6 +224,14 @@ namespace evk::ai {
         pipelines->sum_batch = evk::CreatePipeline({
             .name = "sum_batch",
             .CS = evk::loadSpirvFile("shaders/bin/sum_batch.comp.spv"),
+        });
+        pipelines->rms_norm = evk::CreatePipeline({
+            .name = "rms_norm",
+            .CS = evk::loadSpirvFile("shaders/bin/rms_norm.comp.spv"),
+        });
+        pipelines->rms_norm_bwd = evk::CreatePipeline({
+            .name = "rms_norm_bwd",
+            .CS = evk::loadSpirvFile("shaders/bin/rms_norm_bwd.comp.spv"),
         });
         pipelines->flash_scratch = {};
         pipelines->flash_scratch_elems = 0;
@@ -862,6 +872,56 @@ namespace evk::ai {
         const uint32_t WORKGROUP_SIZE = 256u;
         uint32_t groupsX = (size_per_batch + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         evk::CmdDispatch(groupsX, 1, 1);
+        evk::CmdBarrier();
+    }
+
+    // RMS Normalization forward: out = input / sqrt(mean(input^2) + eps)
+    // input: (*, D) where * is any batch dimensions, D is the last dimension to normalize
+    void rms_norm(Tensor& input, Tensor& output, float eps) {
+        assert(input.shape.rank() == output.shape.rank());
+        for (uint32_t i = 0; i < input.shape.rank(); ++i) {
+            assert(input.shape[i] == output.shape[i]);
+        }
+
+        uint32_t D = input.shape[-1];
+        uint32_t outerCount = input.shape.count() / D;
+
+        evk::CmdBind(pipelines->rms_norm);
+        evk::CmdPush(evk::Constant{
+            input.buffer.GetReference(),
+            output.buffer.GetReference(),
+            eps,
+            D,
+            outerCount,
+        });
+
+        // One workgroup per row
+        evk::CmdDispatch(outerCount, 1, 1);
+        evk::CmdBarrier();
+    }
+
+    // RMS Normalization backward
+    // Gradient: dL/dx_i = (g_i - y_i * dot(g,y) / D) / rms
+    // Accumulates into grad_input
+    void rms_norm_backward(Tensor& input, Tensor& grad_out, Tensor& grad_input, float eps) {
+        assert(input.shape.rank() == grad_out.shape.rank());
+        assert(input.shape.rank() == grad_input.shape.rank());
+
+        uint32_t D = input.shape[-1];
+        uint32_t outerCount = input.shape.count() / D;
+
+        evk::CmdBind(pipelines->rms_norm_bwd);
+        evk::CmdPush(evk::Constant{
+            input.buffer.GetReference(),
+            grad_out.buffer.GetReference(),
+            grad_input.buffer.GetReference(),
+            eps,
+            D,
+            outerCount,
+        });
+
+        // One workgroup per row
+        evk::CmdDispatch(outerCount, 1, 1);
         evk::CmdBarrier();
     }
 }
