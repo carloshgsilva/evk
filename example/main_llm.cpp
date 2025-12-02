@@ -540,7 +540,7 @@ void main_llm() {
     // run_circle_detection(1);
     // run_circle_detection(2);
     // run_circle_detection(4);
-    run_circle_detection(4);
+    run_circle_detection(8);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
     printf("run_circle_detection() took %.4f seconds\n", duration.count());
@@ -584,8 +584,11 @@ struct CircleDataset {
     // Generate a single sample: random circles + sampled points
     // Returns the number of circles generated (1 to n_max_prims)
     uint32_t generate_sample(CircleData* circles_out, PointData* points_out) {
-        // Random number of circles (1 to n_max_prims)
+#if 0 // Enable variable number of circles for more variety
         uint32_t num_circles = 1 + (rand() % n_max_prims);
+#else // Fixed number of circles
+        uint32_t num_circles = n_max_prims;
+#endif
         
         // Generate random circles (ensuring they fit in grid)
         for (uint32_t c = 0; c < num_circles; ++c) {
@@ -595,6 +598,20 @@ struct CircleDataset {
             circles_out[c].x = uint16_t(x);
             circles_out[c].y = uint16_t(y);
             circles_out[c].r = uint16_t(r);
+        }
+        
+        // Sort circles by (x + y) for simple consistent ordering
+        // This gives a clean diagonal sweep ordering that's easier to learn
+        for (uint32_t i = 0; i < num_circles; ++i) {
+            for (uint32_t j = i + 1; j < num_circles; ++j) {
+                uint32_t sum_i = circles_out[i].x + circles_out[i].y;
+                uint32_t sum_j = circles_out[j].x + circles_out[j].y;
+                if (sum_j < sum_i) {
+                    CircleData tmp = circles_out[i];
+                    circles_out[i] = circles_out[j];
+                    circles_out[j] = tmp;
+                }
+            }
         }
         
         // Pad unused circles with zeros (special "no circle" token)
@@ -619,7 +636,7 @@ struct CircleDataset {
                 // Sample angle uniformly
                 float angle = 2.0f * 3.14159265f * float(rand()) / float(RAND_MAX);
                 // Add small noise to radius
-                float noise = 0.9f + 0.2f * float(rand()) / float(RAND_MAX);
+                float noise = 0.95f + 0.01f * float(rand()) / float(RAND_MAX);
                 float px = cx + cr * noise * cosf(angle);
                 float py = cy + cr * noise * sinf(angle);
                 
@@ -657,22 +674,23 @@ struct CircleDataset {
         // Draw grid
         bmp.draw_grid(int(SCALE * 8), 48, 48, 48);
         
-        // Draw ground truth circles (green outline)
-        for (uint32_t c = 0; c < num_circles; ++c) {
-            if (circles[c].r == 0) continue;  // Skip "no circle" tokens
-            int cx = int(circles[c].x * SCALE);
-            int cy = int(circles[c].y * SCALE);
-            int cr = int(circles[c].r * SCALE);
-            bmp.draw_circle(cx, IMG_SIZE - 1 - cy, cr, 0, 200, 0, 2);
-        }
         
-        // Draw predicted circles (red outline, if provided)
+        // Draw predicted circles (green outline, if provided)
         for (uint32_t c = 0; c < num_predicted; ++c) {
             if (predicted[c].r == 0) continue;
             int cx = int(predicted[c].x * SCALE);
             int cy = int(predicted[c].y * SCALE);
             int cr = int(predicted[c].r * SCALE);
-            bmp.draw_circle(cx, IMG_SIZE - 1 - cy, cr, 200, 50, 50, 2);
+            bmp.draw_circle(cx, IMG_SIZE - 1 - cy, cr, 0, 200, 0, 2);
+        }
+
+        // Draw ground truth circles (white thin outline)
+        for (uint32_t c = 0; c < num_circles; ++c) {
+            if (circles[c].r == 0) continue;  // Skip "no circle" tokens
+            int cx = int(circles[c].x * SCALE);
+            int cy = int(circles[c].y * SCALE);
+            int cr = int(circles[c].r * SCALE);
+            bmp.draw_circle(cx, IMG_SIZE - 1 - cy, cr, 150, 150, 150, 1);
         }
         
         // Draw input points (white)
@@ -1007,14 +1025,14 @@ void debug_gradients(Transformer& transformer, const char* label) {
 void run_circle_detection(uint32_t num_layers) {
     printf("\n=== Circle Detection Transformer ===\n");
     
-    // Hyperparameters
-    constexpr uint32_t N_POINTS = 16;       // Number of input points
-    constexpr uint32_t N_MAX_PRIMS = 2;     // Detect 1 circle
+    // Hyperparameters - optimized for 2-circle detection
+    constexpr uint32_t N_POINTS = 32;       // Points sampled from circles
+    constexpr uint32_t N_MAX_PRIMS = 1;     // Detect up to 1 circle
     constexpr uint32_t GRID_SIZE = 64;      // Discrete coordinate space
-    constexpr uint32_t EMBED_DIM = 64;
-    constexpr uint32_t HIDDEN_DIM = 128;
-    constexpr uint32_t BATCH_SIZE = 64;
-    uint32_t NUM_LAYERS = num_layers;
+    constexpr uint32_t EMBED_DIM = 192;     // Embedding dimension
+    constexpr uint32_t HIDDEN_DIM = 384;    // FFN hidden dimension
+    constexpr uint32_t BATCH_SIZE = 128;    // Batch size
+    uint32_t NUM_LAYERS = 4;                // Number of transformer layers
     
     printf("  Config: n_points=%u, n_max_prims=%u, grid=%u, embed=%u, hidden=%u, layers=%u\n",
            N_POINTS, N_MAX_PRIMS, GRID_SIZE, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS);
@@ -1029,10 +1047,10 @@ void run_circle_detection(uint32_t num_layers) {
     printf("  Input seq len: %u, Output seq len: %u, Total: %u\n",
            detector.input_seq_len, detector.output_seq_len, detector.total_seq_len);
     
-    // Training hyperparameters - tuned for fp16
-    const int EPOCHS = 2000;
-    const float LR = 0.001f;
-    const int WARMUP_EPOCHS = 50;
+    // Training hyperparameters
+    const int EPOCHS = 100;
+    const float LR = 0.003f;
+    const int WARMUP_EPOCHS = 2000;
     
     printf("  Training for %d epochs with LR=%.4f, warmup=%d...\n", EPOCHS, LR, WARMUP_EPOCHS);
     
@@ -1040,16 +1058,21 @@ void run_circle_detection(uint32_t num_layers) {
     loss_history.reserve(EPOCHS);
     
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
-        // Linear warmup from 0.1*LR to LR over warmup period
+        // Learning rate schedule: linear warmup then cosine decay
         float effective_lr = LR;
         if (epoch < WARMUP_EPOCHS) {
+            // Linear warmup from 0.1*LR to LR
             effective_lr = LR * (0.1f + 0.9f * float(epoch) / float(WARMUP_EPOCHS));
+        } else {
+            // Cosine decay from LR to 0.1*LR
+            float progress = float(epoch - WARMUP_EPOCHS) / float(EPOCHS - WARMUP_EPOCHS);
+            effective_lr = LR * (0.1f + 0.9f * 0.5f * (1.0f + cosf(3.14159265f * progress)));
         }
         
         float epoch_loss = detector.train_batch(dataset, effective_lr);
         loss_history.push_back(epoch_loss);
         
-        if (epoch % 200 == 0 || epoch == EPOCHS - 1) {
+        if (epoch % 5000 == 0 || epoch == EPOCHS - 1) {
             printf("  epoch %3d: loss = %.4f\n", epoch, epoch_loss);
             CircleDataset::save_loss_graph("loss_graph.bmp", loss_history);
         }
@@ -1063,6 +1086,7 @@ void run_circle_detection(uint32_t num_layers) {
     
     // Evaluation and visualization
     printf("\n  === Evaluation ===\n");
+    printf("  error must be zero to match exactly the validation\n");
     
     // Generate test samples and visualize predictions
     const int NUM_TEST = 5;
@@ -1074,21 +1098,27 @@ void run_circle_detection(uint32_t num_layers) {
     
     for (int t = 0; t < NUM_TEST; ++t) {
         uint32_t num_gt = dataset.generate_sample(gt_circles.data(), points.data());
+        
+        printf("  Test %d (num_circles=%u): \n", t, num_gt);
         detector.predict(points.data(), pred_circles.data());
         
-        // Print results
-        printf("  Test %d: GT circles: ", t);
+        // Print validation with detailed debug info
         for (uint32_t c = 0; c < num_gt; ++c) {
-            printf("(%d,%d,r=%d) ", gt_circles[c].x, gt_circles[c].y, gt_circles[c].r);
+            int err = abs(gt_circles[c].x - pred_circles[c].x) + 
+                      abs(gt_circles[c].y - pred_circles[c].y) + 
+                      abs(gt_circles[c].r - pred_circles[c].r);
+            printf("    Circle %d: GT=(%d,%d,r=%d) Pred=(%d,%d,r=%d) error=%d\n", 
+                   c, gt_circles[c].x, gt_circles[c].y, gt_circles[c].r,
+                   pred_circles[c].x, pred_circles[c].y, pred_circles[c].r, err);
         }
-        printf("\n          Predicted:  ");
-        for (uint32_t c = 0; c < N_MAX_PRIMS; ++c) {
+        // Also show any extra predicted circles
+        for (uint32_t c = num_gt; c < N_MAX_PRIMS; ++c) {
             if (pred_circles[c].r > 0) {
-                printf("(%d,%d,r=%d) ", pred_circles[c].x, pred_circles[c].y, pred_circles[c].r);
+                printf("    Circle %d (extra): Pred=(%d,%d,r=%d)\n",
+                       c, pred_circles[c].x, pred_circles[c].y, pred_circles[c].r);
             }
         }
-        printf("\n");
-        
+
         // Save visualization
         char filename[64];
         snprintf(filename, sizeof(filename), "circle_test_%d.bmp", t);
