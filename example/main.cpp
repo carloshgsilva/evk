@@ -7,7 +7,7 @@
 #define TEST(expr) if((expr)) { printf(" TEST(" #expr ") [PASS]\n"); } else { printf(" TEST(" #expr ") [FAIL] [%s:%d]\n", __FILE__, __LINE__); exit(1); }
 
 void benchmark_matmul() {
-    printf("benchmark_matmul()");
+    printf("benchmark_matmul()\n");
     const uint32_t SIZE = 4096u;
     for (uint32_t tile_m = 48; tile_m <= 224; tile_m += 16) {
         for (uint32_t tile_n = 48; tile_n <= 224; tile_n += 16) {
@@ -56,6 +56,48 @@ void benchmark_matmul() {
         }
     }
 }
+
+void benchmark_matmul_broadcast() {
+    printf("benchmark_matmul_broadcast()\n");
+    const uint32_t BATCH = 32u;
+    const uint32_t SIZE = 2048u;
+    const uint32_t TILE = 64u;
+    Tensor* a = new Tensor({BATCH, SIZE, SIZE});
+    Tensor* b = new Tensor({SIZE, SIZE});
+    Tensor* c = new Tensor({BATCH, SIZE, SIZE});
+
+    a->identity(2.0f);
+    b->identity(3.0f);
+
+    // warm up
+    for (uint32_t i = 0; i < 4; ++i) {
+        evk::ai::matmul(*a, *b, *c, false, false, false, TILE, TILE);
+    }
+
+    float min_ms = 1e9f;
+    for(int it = 0; it < 16; ++it) {
+        const uint32_t subIter = 16;
+        for (uint32_t i = 0; i < subIter; ++i) {
+            evk::CmdTimestamp("matmul_broadcast", [&]() {
+                evk::ai::matmul(*a, *b, *c, false, false, false, TILE, TILE);
+            });
+        }
+        
+        evk::Sync();
+        for(auto ts: evk::GetTimestamps()) {
+            min_ms = fminf(min_ms, float(ts.end - ts.start));
+        }
+    }
+    float tflops = float(2 * uint64_t(BATCH) * uint64_t(SIZE) * uint64_t(SIZE) * uint64_t(SIZE)) / (min_ms / 1000.0f) / 1e12f;
+    printf("matmul_batched: %5.3fms (%7.3ftflops)", min_ms, tflops);
+    printf(" BATCH = %d, SIZE = %d\n", BATCH, SIZE);
+
+    delete a;
+    delete b;
+    delete c;
+    evk::Sync();
+}
+
 
 void test_add() {
     printf("test_add()\n");
@@ -396,135 +438,6 @@ float randn() {
     has_spare = true;
     return u * s;
 }
-
-enum class PrimitiveType { Circle, Square };
-
-struct Circle {
-    float cx, cy;
-    float radius;
-};
-
-struct Square {
-    float cx, cy;
-    float size;
-    float rotation;
-};
-
-struct Primitive {
-    PrimitiveType type;
-    union {
-        Circle circle;
-        Square square;
-    };
-    
-    static Primitive make_circle(float cx, float cy, float radius) {
-        Primitive p;
-        p.type = PrimitiveType::Circle;
-        p.circle = {cx, cy, radius};
-        return p;
-    }
-    
-    static Primitive make_square(float cx, float cy, float size, float rotation) {
-        Primitive p;
-        p.type = PrimitiveType::Square;
-        p.square = {cx, cy, size, rotation};
-        return p;
-    }
-    
-    uint32_t param_count() const {
-        return (type == PrimitiveType::Circle) ? 3 : 4;
-    }
-    
-    void get_params(float* out) const {
-        if (type == PrimitiveType::Circle) {
-            out[0] = circle.cx;
-            out[1] = circle.cy;
-            out[2] = circle.radius;
-        } else {
-            out[0] = square.cx;
-            out[1] = square.cy;
-            out[2] = square.size;
-            out[3] = square.rotation;
-        }
-    }
-    
-    void set_params(const float* in) {
-        if (type == PrimitiveType::Circle) {
-            circle.cx = in[0];
-            circle.cy = in[1];
-            circle.radius = fmaxf(0.5f, in[2]);
-        } else {
-            square.cx = in[0];
-            square.cy = in[1];
-            square.size = fmaxf(0.5f, in[2]);
-            square.rotation = in[3];
-        }
-    }
-    
-    float sdf(float px, float py) const {
-        if (type == PrimitiveType::Circle) {
-            float dx = px - circle.cx;
-            float dy = py - circle.cy;
-            return sqrtf(dx*dx + dy*dy) - circle.radius;
-        } else {
-            float cos_r = cosf(-square.rotation);
-            float sin_r = sinf(-square.rotation);
-            float dx = px - square.cx;
-            float dy = py - square.cy;
-            float lx = dx * cos_r - dy * sin_r;
-            float ly = dx * sin_r + dy * cos_r;
-            float half = square.size * 0.5f;
-            float qx = fabsf(lx) - half;
-            float qy = fabsf(ly) - half;
-            float outside = sqrtf(fmaxf(qx, 0.0f) * fmaxf(qx, 0.0f) + fmaxf(qy, 0.0f) * fmaxf(qy, 0.0f));
-            float inside = fminf(fmaxf(qx, qy), 0.0f);
-            return outside + inside;
-        }
-    }
-    
-    void generate_points(float* out_x, float* out_y, uint32_t count, float noise) const {
-        if (type == PrimitiveType::Circle) {
-            for (uint32_t i = 0; i < count; ++i) {
-                float angle = 2.0f * 3.14159265f * float(i) / float(count);
-                float r_noise = circle.radius + randn() * noise;
-                out_x[i] = circle.cx + r_noise * cosf(angle) + randn() * noise * 0.5f;
-                out_y[i] = circle.cy + r_noise * sinf(angle) + randn() * noise * 0.5f;
-            }
-        } else {
-            float half = square.size * 0.5f;
-            float cos_r = cosf(square.rotation);
-            float sin_r = sinf(square.rotation);
-            uint32_t per_side = count / 4;
-            uint32_t idx = 0;
-            for (int side = 0; side < 4 && idx < count; ++side) {
-                for (uint32_t i = 0; i < per_side && idx < count; ++i, ++idx) {
-                    float t = -1.0f + 2.0f * float(i) / float(per_side);
-                    float lx, ly;
-                    switch (side) {
-                        case 0: lx = t * half; ly = -half; break;
-                        case 1: lx = half; ly = t * half; break;
-                        case 2: lx = -t * half; ly = half; break;
-                        default: lx = -half; ly = -t * half; break;
-                    }
-                    lx += randn() * noise;
-                    ly += randn() * noise;
-                    out_x[idx] = square.cx + lx * cos_r - ly * sin_r;
-                    out_y[idx] = square.cy + lx * sin_r + ly * cos_r;
-                }
-            }
-        }
-    }
-    
-    void print(const char* prefix) const {
-        if (type == PrimitiveType::Circle) {
-            printf("%sCircle: center=(%.2f, %.2f), radius=%.2f\n", 
-                   prefix, circle.cx, circle.cy, circle.radius);
-        } else {
-            printf("%sSquare: center=(%.2f, %.2f), size=%.2f, rot=%.2f\n", 
-                   prefix, square.cx, square.cy, square.size, square.rotation);
-        }
-    }
-};
 
 void test_softmax() {
     printf("test_softmax()\n");
@@ -895,11 +808,11 @@ int main() {
 
     evk::ai::initialize();
 
-    main_llm();
+    // main_llm();
 
     // test_add();
-    // test_matmul();
-    // test_matmul_broadcast();
+    test_matmul();
+    test_matmul_broadcast();
     // test_mse_loss();
     // test_flash_attention_backward();
     // test_flash_attention_cmp_softmax();
@@ -912,8 +825,10 @@ int main() {
     // test_adam_batched_matmul();
 
     // benchmark_matmul();
+    bencmark_matmul_broadcast();
 
     evk::ai::shutdown();
     evk::Shutdown();
+    printf("Successfully completed all tests\n");
     return 0;
 }
