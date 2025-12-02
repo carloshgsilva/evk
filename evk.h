@@ -11,7 +11,7 @@ namespace evk {
 
     using RID = int;
     enum class Stage { TopOfPipe, Host, Transfer, Compute, DrawIndirect, VertexInput, VertexShader, EarlyFragmentTest, FragmentShader, LateFragmentTest, ColorAttachmentOutput, BottomOfPipe, AllGraphics, AllCommands };
-    enum class Format { Undefined, R8Uint, R16Uint, R32Uint, R64Uint, BGRA8Unorm, BGRA8Snorm, RGBA8Unorm, RGBA8Snorm, RG16Sfloat, RGBA16Sfloat, RGBA16Unorm, RGBA16Snorm, R32Sfloat, RG32Sfloat, RGB32Sfloat, RGBA32Sfloat, RGBA32Sint, RGBA32Uint, D24UnormS8Uint, D32Sfloat };
+    enum class Format { Undefined, R8Unorm, R8Uint, R16Uint, R32Uint, R64Uint, BGRA8Unorm, BGRA8Snorm, RGBA8Unorm, RGBA8Snorm, RG16Sfloat, RGBA16Sfloat, RGBA16Unorm, RGBA16Snorm, R32Sfloat, RG32Sfloat, RGB32Sfloat, RGBA32Sfloat, RGBA32Sint, RGBA32Uint, D24UnormS8Uint, D32Sfloat };
     enum class Primitive { Triangle, Line };
     enum class Blend { Disabled, Alpha, Additive };
     enum class BufferUsage {
@@ -256,6 +256,8 @@ namespace evk {
         // AABBs
         Buffer aabbs;
         uint32_t aabbsCount;
+        // Allow to update this BLAS after build (VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
+        bool allowUpdate = false;
     };
     struct BLAS : ResourceRef {
         BLAS(Resource* res = nullptr) : ResourceRef(res) {

@@ -25,6 +25,7 @@ namespace evk {
     }
     const FormatConversion FORMAT_VK[] = {
         FMT_C(Undefined, VK_FORMAT_UNDEFINED, 1),
+        FMT_C(R8Unorm, VK_FORMAT_R8_UNORM, 1),
         FMT_C(R8Uint, VK_FORMAT_R8_UINT, 1),
         FMT_C(R16Uint, VK_FORMAT_R16_UINT, 2),
         FMT_C(R32Uint, VK_FORMAT_R32_UINT, 4),
@@ -1902,14 +1903,19 @@ namespace evk {
             res->primCounts.push_back(desc.aabbsCount);
         }
 
+        VkBuildAccelerationStructureFlagsKHR flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR;
+        if (desc.allowUpdate) {
+            flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+        }
         res->buildInfo = VkAccelerationStructureBuildGeometryInfoKHR{
             .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
             .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-            .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR|VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR,
+            .flags = flags,
             .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
             .geometryCount = static_cast<uint32_t>(res->geometries.size()),
             .pGeometries = res->geometries.data(),
         };
+        res->flags = flags;
 
         res->sizeInfo = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
         S.vkGetAccelerationStructureBuildSizesKHR(S.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &res->buildInfo, res->primCounts.data(), &res->sizeInfo);
@@ -2042,7 +2048,13 @@ namespace evk {
             Internal_BLAS& blas = ToInternal(blasRes);
             batchSize += blas.sizeInfo.accelerationStructureSize;
 
-            EVK_ASSERT(update == false && blas.buildInfo.dstAccelerationStructure == VK_NULL_HANDLE, "BLAS is already built, did you meant to build with update == true?");
+            if (update) {
+                EVK_ASSERT((blas.flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0,
+                           "BLAS wasn't created with allowUpdate flag and can't be updated");
+                EVK_ASSERT(blas.accStructureDeviceAddress != 0u, "BLAS has not been built yet, cannot update");
+            } else {
+                EVK_ASSERT(blas.buildInfo.dstAccelerationStructure == VK_NULL_HANDLE, "BLAS is already built, did you mean to build with update == true?");
+            }
 
             blas.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
             blas.buildInfo.scratchData = {ToInternal(scratchBuffer).deviceAddress};
@@ -2077,12 +2089,12 @@ namespace evk {
             //    batchSize = 0;
             //}
             i++;
-            // Cleanup not used resources
-            // TODO: if (desc.allowUpdate == false) {
+            // Cleanup not used resources (keep vertex/index/aabbs if allow update)
+            if (!(blas.flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)) {
                 blas.aabbsBuffer = {};
                 blas.indexBuffer = {};
                 blas.vertexBuffer = {};
-            //}
+            }
         }
     }
     void CmdBuildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update) {
