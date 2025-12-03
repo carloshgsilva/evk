@@ -3,6 +3,7 @@
 #include "evk.h"
 
 #include <vulkan/vulkan.h>
+// #define VMA_DEBUG_LOG(format, ...) printf(format "\n", ##__VA_ARGS__)
 #include <vk_mem_alloc.h>
 
 #if defined(_DEBUG) || defined(EVK_DEBUG)
@@ -133,6 +134,9 @@ namespace evk {
         PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT;
 
         std::vector<VkSemaphore> presentSemaphores;
+
+        Buffer blasScratchBuffer;
+        VkDeviceSize blasScratchBufferSize = 0;
     };
     State& GetState();
     FrameData& GetFrame();
@@ -149,8 +153,8 @@ namespace evk {
         VkDeviceAddress deviceAddress = {};
         void* mappedData = {};
         ~Internal_Buffer() {
+            // printf("[evk] Destroying Buffer: name=%s size=%llu allocation=%llu res=%p\n", desc.name.c_str(), (unsigned long long)desc.size, (unsigned long long)allocation, this);
             vmaDestroyBuffer(GetState().allocator, buffer, allocation);
-            // Free descriptor index
             EVK_ASSERT(resourceid != -1, "destroying buffer '%s' with RID = -1", desc.name.c_str());
             GetState().bufferSlots.free(resourceid);
         }

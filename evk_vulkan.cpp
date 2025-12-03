@@ -164,6 +164,10 @@ namespace evk {
         VmaAllocationInfo allocInfo;
 
         vmaCreateBuffer(S.allocator, &buffci, &allocCreateInfo, (VkBuffer*)&res->buffer, &res->allocation, &allocInfo);
+        // printf("[evk] Created Buffer: name=%s size=%llu allocation=%llu res=%p\n", desc.name.c_str(), (unsigned long long)desc.size, (unsigned long long)res->allocation, res);
+        if (!desc.name.empty()) {
+            vmaSetAllocationName(S.allocator, res->allocation, desc.name.c_str());
+        }
         res->mappedData = allocInfo.pMappedData;
 
         if (desc.memoryType == MemoryType::GPU || desc.memoryType == MemoryType::CPU_TO_GPU) {
@@ -309,6 +313,9 @@ namespace evk {
 
         if (vmaCreateImage(S.allocator, &imageci, &allocCreateInfo, (VkImage*)&res->image, &res->allocation, &allocInfo) != VK_SUCCESS) {
             EVK_ASSERT(false, "Failed to create image '%s'!", desc.name.c_str());
+        }
+        if (!desc.name.empty()) {
+            vmaSetAllocationName(S.allocator, res->allocation, desc.name.c_str());
         }
 
 #if EVK_DEBUG
@@ -708,6 +715,19 @@ namespace evk {
         auto& F = GetFrame();
 
         for (int i = 0; i < F.toDelete.size(); i++) {
+            Resource* r = F.toDelete[i];
+            if (dynamic_cast<Internal_Buffer*>(r)) {
+                Internal_Buffer* b = dynamic_cast<Internal_Buffer*>(r);
+                // printf("[evk] Releasing Internal_Buffer name=%s size=%llu refCount=%u\n", b->desc.name.c_str(), (unsigned long long)b->desc.size, b->refCount);
+            } else if (dynamic_cast<Internal_Image*>(r)) {
+                Internal_Image* im = dynamic_cast<Internal_Image*>(r);
+                // printf("[evk] Releasing Internal_Image name=%s extent=%u,%u,%u refCount=%u\n", im->desc.name.c_str(), im->desc.extent.width, im->desc.extent.height, im->desc.extent.depth, im->refCount);
+            } else if (dynamic_cast<Internal_BLAS*>(r)) {
+                Internal_BLAS* blas = dynamic_cast<Internal_BLAS*>(r);
+                // printf("[evk] Releasing Internal_BLAS refCount=%u accel=%llu\n", blas->refCount, (unsigned long long)blas->accel);
+            } else {
+                // printf("[evk] Releasing Resource type=%s refCount=%u\n", typeid(*r).name(), r->refCount);
+            }
             delete F.toDelete[i];
         }
         F.toDelete.clear();
@@ -1185,11 +1205,19 @@ namespace evk {
                 f.image.release();
                 f.stagingBuffer.release();
             }
+            S.blasScratchBuffer.release();
+            S.blasScratchBufferSize = 0;
         }
 
         _EndFrame();
-        _WaitFrameCompletion();
-        _ReleaseResources();
+        for (auto& f : S.frames) {
+            CHECK_VK(vkWaitForFences(S.device, 1, &f.fence, true, std::numeric_limits<uint64_t>::max()));
+        }
+        for (int i = 0; i < (int)S.frames.size(); i++) {
+            S.frame = i;
+            _ReleaseResources();
+        }
+        S.frame = 0;
 
         for (auto sem : S.presentSemaphores) {
             vkDestroySemaphore(S.device, sem, nullptr);
@@ -1629,6 +1657,7 @@ namespace evk {
         if (F.stagingOffset + size >= 64'000'000) {
             printf("[evk] [warn] Creating extra staging buffer of size %llu!!! FIXME\n", size);
             Buffer tempStaging = CreateBuffer({
+                .name = "temp_staging",
                 .size = size,
                 .usage = BufferUsage::TransferSrc,
                 .memoryType = MemoryType::CPU,
@@ -2026,15 +2055,21 @@ namespace evk {
             scratchSize = std::max(scratchSize, ToInternal(blasRes).sizeInfo.buildScratchSize);
         }
 
-        if(scratchSize == 0u)
+        if (scratchSize == 0u)
             return;
 
-        Buffer scratchBuffer = CreateBuffer({
-            .name = "BLAS Build Scratch Buffer",
-            .size = scratchSize,
-            .usage = BufferUsage::Storage,
-            .memoryType = MemoryType::GPU,
-        });
+        if (!S.blasScratchBuffer || GetDesc(S.blasScratchBuffer).size < scratchSize) {
+            S.blasScratchBuffer.release();
+            S.blasScratchBuffer = CreateBuffer({
+                .name = "BLAS Build Scratch Buffer",
+                .size = scratchSize,
+                .usage = BufferUsage::Storage,
+                .memoryType = MemoryType::GPU,
+            });
+            S.blasScratchBufferSize = scratchSize;
+        }
+
+        Buffer scratchBuffer = S.blasScratchBuffer;
 
         std::vector<VkAccelerationStructureBuildGeometryInfoKHR> buildInfos = {};
         std::vector<VkAccelerationStructureBuildRangeInfoKHR*> buildRanges = {};
