@@ -37,6 +37,12 @@ namespace evk {
     const uint32_t PERF_QUERY_COUNT = 64;
     const uint32_t MAX_COMMAND_BUFFERS = 4;
 
+    enum class CmdState : uint8_t {
+        Ready = 0,
+        InUse = 1,
+        Submitted = 2
+    };
+
     // Forward declarations
     struct CommandBufferData;
 
@@ -45,8 +51,7 @@ namespace evk {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         uint64_t submissionIndex = 0;
-        bool inUse = false;
-        bool submitted = false;
+        CmdState state = CmdState::Ready;
         bool insideRenderPass = false;
         bool doingPresent = false;
 
