@@ -649,15 +649,18 @@ struct CircleDataset {
                 point_idx++;
             }
         }
-        
-        // Shuffle points to remove ordering information
-        for (uint32_t i = n_points - 1; i > 0; --i) {
-            uint32_t j = rand() % (i + 1);
-            PointData temp = points_out[i];
-            points_out[i] = points_out[j];
-            points_out[j] = temp;
+
+        // TODO: sort the points by x axis
+        for (uint32_t i = 0; i < n_points; ++i) {
+            for (uint32_t j = i + 1; j < n_points; ++j) {
+                if (points_out[i].x > points_out[j].x) {
+                    PointData temp = points_out[i];
+                    points_out[i] = points_out[j];
+                    points_out[j] = temp;
+                }
+            }
         }
-        
+
         return num_circles;
     }
     
@@ -1026,12 +1029,12 @@ void run_circle_detection(uint32_t num_layers) {
     
     // Hyperparameters - optimized for 2-circle detection
     constexpr uint32_t N_POINTS = 32;       // Points sampled from circles
-    constexpr uint32_t N_MAX_PRIMS = 1;     // Detect up to 1 circle
+    constexpr uint32_t N_MAX_PRIMS = 2;     // Detect up to 1 circle
     constexpr uint32_t GRID_SIZE = 64;      // Discrete coordinate space
-    constexpr uint32_t EMBED_DIM = 192;     // Embedding dimension
-    constexpr uint32_t HIDDEN_DIM = 384;    // FFN hidden dimension
-    constexpr uint32_t BATCH_SIZE = 128;    // Batch size
-    uint32_t NUM_LAYERS = 4;                // Number of transformer layers
+    constexpr uint32_t EMBED_DIM = 160;     // Embedding dimension
+    constexpr uint32_t HIDDEN_DIM = 320;    // FFN hidden dimension
+    constexpr uint32_t BATCH_SIZE = 96;     // Batch size
+    uint32_t NUM_LAYERS = 8;                // Number of transformer layers
     
     printf("  Config: n_points=%u, n_max_prims=%u, grid=%u, embed=%u, hidden=%u, layers=%u\n",
            N_POINTS, N_MAX_PRIMS, GRID_SIZE, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS);
@@ -1047,9 +1050,9 @@ void run_circle_detection(uint32_t num_layers) {
            detector.input_seq_len, detector.output_seq_len, detector.total_seq_len);
     
     // Training hyperparameters
-    const int EPOCHS = 100;
-    const float LR = 0.003f;
-    const int WARMUP_EPOCHS = 2000;
+    const int EPOCHS = 1000;
+    const float LR = 0.010f;
+    const int WARMUP_EPOCHS = 100;
     
     printf("  Training for %d epochs with LR=%.4f, warmup=%d...\n", EPOCHS, LR, WARMUP_EPOCHS);
     
@@ -1058,20 +1061,19 @@ void run_circle_detection(uint32_t num_layers) {
     
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
         // Learning rate schedule: linear warmup then cosine decay
+        float min_lr = LR * 0.05f;
         float effective_lr = LR;
         if (epoch < WARMUP_EPOCHS) {
-            // Linear warmup from 0.1*LR to LR
-            effective_lr = LR * (0.1f + 0.9f * float(epoch) / float(WARMUP_EPOCHS));
+            effective_lr = LR * float(epoch + 1) / float(WARMUP_EPOCHS);
         } else {
-            // Cosine decay from LR to 0.1*LR
             float progress = float(epoch - WARMUP_EPOCHS) / float(EPOCHS - WARMUP_EPOCHS);
-            effective_lr = LR * (0.1f + 0.9f * 0.5f * (1.0f + cosf(3.14159265f * progress)));
+            effective_lr = min_lr + (LR - min_lr) * 0.5f * (1.0f + cosf(3.14159265f * progress));
         }
         
         float epoch_loss = detector.train_batch(dataset, effective_lr);
         loss_history.push_back(epoch_loss);
         
-        if (epoch % 5000 == 0 || epoch == EPOCHS - 1) {
+        if (epoch % 100 == 0 || epoch == EPOCHS - 1) {
             printf("  epoch %3d: loss = %.4f\n", epoch, epoch_loss);
             CircleDataset::save_loss_graph("loss_graph.bmp", loss_history);
         }
@@ -1094,7 +1096,8 @@ void run_circle_detection(uint32_t num_layers) {
     std::vector<PointData> points(N_POINTS);
     
     srand(12345);  // Different seed for test samples
-    
+
+    int total_error = 0;
     for (int t = 0; t < NUM_TEST; ++t) {
         uint32_t num_gt = dataset.generate_sample(gt_circles.data(), points.data());
         
@@ -1109,6 +1112,7 @@ void run_circle_detection(uint32_t num_layers) {
             printf("    Circle %d: GT=(%d,%d,r=%d) Pred=(%d,%d,r=%d) error=%d\n", 
                    c, gt_circles[c].x, gt_circles[c].y, gt_circles[c].r,
                    pred_circles[c].x, pred_circles[c].y, pred_circles[c].r, err);
+            total_error += err;
         }
         // Also show any extra predicted circles
         for (uint32_t c = num_gt; c < N_MAX_PRIMS; ++c) {
@@ -1125,4 +1129,5 @@ void run_circle_detection(uint32_t num_layers) {
                                points.data(), N_POINTS,
                                pred_circles.data(), N_MAX_PRIMS);
     }
+    printf("  Total error: %d\n", total_error);
 }
