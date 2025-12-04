@@ -1171,10 +1171,13 @@ namespace evk {
         }
 
         // Clean up pending deletions first
-        for (auto& [idx, res] : S.pendingDeletions) {
-            delete res;
+        {
+            auto pending = std::move(S.pendingDeletions);
+            for (auto& [idx, res] : pending) {
+                delete res;
+            }
+            // pending destructs here
         }
-        S.pendingDeletions.clear();
 
         // Release staging buffers - directly delete rather than deferring
         for (auto& cb : S.commandBuffers) {
@@ -1184,12 +1187,6 @@ namespace evk {
                 cb.stagingBuffer.res = nullptr;
             }
         }
-        
-        // Now clean up the pending deletions that were created by releasing staging buffers
-        for (auto& [idx, res] : S.pendingDeletions) {
-            delete res;
-        }
-        S.pendingDeletions.clear();
 
         // Clean up swapchain images
         for (auto& img : S.swapchainImages) {
@@ -1201,10 +1198,10 @@ namespace evk {
         S.swapchainImages.clear();
 
         // Final cleanup of any remaining pending deletions
-        for (auto& [idx, res] : S.pendingDeletions) {
+        auto pending = std::move(S.pendingDeletions);
+        for (auto& [idx, res] : pending) {
             delete res;
         }
-        S.pendingDeletions.clear();
 
         // Now destroy command buffer Vulkan resources (including semaphores)
         for (auto& cb : S.commandBuffers) {
