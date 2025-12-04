@@ -18,8 +18,8 @@ target_compile_definitions(evk PUBLIC "EVK_VULKAN=1")
 
 add_executable(evk_example 
     "${CMAKE_CURRENT_SOURCE_DIR}/example/main.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/example/main_llm.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/evk_ai.cpp"
+    # "${CMAKE_CURRENT_SOURCE_DIR}/example/main_llm.cpp"
+    # "${CMAKE_CURRENT_SOURCE_DIR}/evk_ai.cpp"
 )
 target_link_libraries(evk_example PRIVATE evk)
 set_target_properties(evk_example PROPERTIES CXX_STANDARD 20)

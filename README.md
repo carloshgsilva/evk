@@ -57,10 +57,12 @@ int main() {
 
     // Application loop
     while (running) {
-        evk::CmdBeginPresent();
-        // ... render commands ...
-        evk::CmdEndPresent();
-        evk::Submit();
+        auto& cmd = evk::CmdBegin(evk::Queue::Graphics);
+        cmd.present([&]() {
+            // ... render commands using cmd.bind(), cmd.draw(), etc ...
+        });
+        uint64_t idx = cmd.submit();
+        // evk::CmdWait(idx); // wait for GPU to finish (optional)
     }
 
     evk::Shutdown();
@@ -114,15 +116,18 @@ evk::Pipeline pipeline = evk::CreatePipeline({
 The `CmdRender` function handles image layout transitions automatically:
 
 ```cpp
-evk::CmdRender({colorTarget}, {ClearColor{{0.0f, 0.0f, 0.0f, 1.0f}}}, [&]() {
-    evk::CmdBind(pipeline);
-    evk::CmdVertex(vertexBuffer);
-    evk::CmdIndex(indexBuffer);
-    evk::CmdViewport(0, 0, width, height);
-    evk::CmdScissor(0, 0, width, height);
-    evk::CmdPush(pushConstants);
-    evk::CmdDrawIndexed(indexCount);
+auto& cmd = evk::CmdBegin(evk::Queue::Graphics);
+cmd.render({colorTarget}, {ClearColor{{0.0f, 0.0f, 0.0f, 1.0f}}}, [&]() {
+    cmd.bind(pipeline);
+    cmd.vertex(vertexBuffer);
+    cmd.index(indexBuffer);
+    cmd.viewport(0, 0, width, height);
+    cmd.scissor(0, 0, width, height);
+    cmd.push(pushConstants);
+    cmd.drawIndexed(indexCount);
 });
+uint64_t idx = cmd.submit();
+evk::CmdWait(idx);
 ```
 
 ### Compute Pipeline
@@ -133,9 +138,12 @@ evk::Pipeline compute = evk::CreatePipeline({
     .CS = evk::loadSpirvFile("shaders/compute.spv")
 });
 
-evk::CmdBind(compute);
-evk::CmdDispatch(groupsX, groupsY, groupsZ);
-evk::CmdBarrier();  // Synchronize compute output
+auto& cmd = evk::CmdBegin(evk::Queue::Graphics);
+cmd.bind(compute);
+cmd.dispatch(groupsX, groupsY, groupsZ);
+cmd.barrier();  // Synchronize compute output
+uint64_t idx = cmd.submit();
+evk::CmdWait(idx);
 ```
 
 ### Push Constants
@@ -149,26 +157,44 @@ struct PushData {
 };
 
 PushData push = { /* ... */ };
-evk::CmdPush(push);
+{
+    auto& cmd = evk::CmdBegin(evk::Queue::Graphics);
+    cmd.push(push);
+    uint64_t idx = cmd.submit();
+    evk::CmdWait(idx);
+}
 
 // Or using the Constant helper for mixed types:
-evk::CmdPush(evk::Constant(buffer.GetReference(), textureIndex, time));
+{
+    auto& cmd2 = evk::CmdBegin(evk::Queue::Graphics);
+    cmd2.push(evk::Constant{
+        buffer.GetReference(),
+        textureIndex,
+        time
+    });
+    uint64_t idx2 = cmd2.submit();
+    evk::CmdWait(idx2);
+}
 ```
 
 ### Image Operations
 
 ```cpp
+auto& cmd = evk::CmdBegin(evk::Queue::Graphics);
 // Layout transitions
-evk::CmdBarrier(image, evk::ImageLayout::Undefined, evk::ImageLayout::TransferDst);
+cmd.barrier(image, evk::ImageLayout::Undefined, evk::ImageLayout::TransferDst);
 
 // Copy between images
-evk::CmdCopy(srcImage, dstImage);
+cmd.copy(srcImage, dstImage);
 
 // Copy buffer to image
-evk::CmdCopy(stagingBuffer, texture);
+cmd.copy(stagingBuffer, texture);
 
 // Blit with scaling
-evk::CmdBlit(src, dst, srcRegion, dstRegion, evk::Filter::Linear);
+cmd.blit(src, dst, srcRegion, dstRegion, evk::Filter::Linear);
+
+uint64_t idx = cmd.submit();
+evk::CmdWait(idx);
 ```
 
 ### Ray Tracing
@@ -187,18 +213,22 @@ evk::BLAS blas = evk::CreateBLAS({
 evk::TLAS tlas = evk::CreateTLAS(maxInstances, allowUpdate);
 
 // Build
-evk::CmdBuildBLAS({blas});
-evk::CmdBuildTLAS(tlas, instances);
+auto& cmd = evk::CmdBegin(evk::Queue::Graphics);
+cmd.buildBLAS({blas});
+cmd.buildTLAS(tlas, instances);
+uint64_t idx = cmd.submit();
+evk::CmdWait(idx);
 ```
 
 ### GPU Profiling
 
 ```cpp
-evk::CmdTimestamp("RenderPass", [&]() {
+auto& cmd = evk::CmdBegin(evk::Queue::Graphics);
+cmd.timestamp("RenderPass", [&]() {
     // ... rendering code ...
 });
-
-evk::Submit();
+uint64_t idx = cmd.submit();
+evk::CmdWait(idx);
 
 for (const auto& ts : evk::GetTimestamps()) {
     printf("%s: %.2f ms\n", ts.name, ts.end - ts.start);
@@ -226,8 +256,9 @@ for (uint32_t i = 0; i < budget.MAX_HEAPS; ++i) {
 |----------|-------------|
 | `InitializeEVK(desc)` | Initialize the Vulkan context |
 | `Shutdown()` | Clean up all resources |
-| `Submit()` | Submit command buffer to GPU |
-| `Sync()` | Wait for all GPU work to complete |
+| `CmdBegin(queue) -> Cmd&` | Begin recording on a queue and return a command buffer handle |
+| `CmdDone(submissionIndex)` | Check if a submitted command buffer has finished |
+| `CmdWait(submissionIndex)` | Wait for a submitted command buffer to complete |
 
 ### Resource Creation
 
@@ -243,16 +274,19 @@ for (uint32_t i = 0; i < budget.MAX_HEAPS; ++i) {
 
 | Function | Description |
 |----------|-------------|
-| `CmdBind(pipeline)` | Bind a pipeline for subsequent draw/dispatch calls |
-| `CmdVertex(buffer)` | Bind vertex buffer |
-| `CmdIndex(buffer)` | Bind index buffer |
-| `CmdPush(data)` | Set push constant data |
-| `CmdDraw(...)` | Issue draw call |
-| `CmdDrawIndexed(...)` | Issue indexed draw call |
-| `CmdDispatch(x, y, z)` | Dispatch compute work |
-| `CmdRender(attachments, clears, fn)` | Execute render pass |
-| `CmdBarrier(...)` | Insert pipeline barrier |
-| `CmdCopy(...)` | Copy between buffers/images |
+| `Cmd::bind(pipeline)` | Bind a pipeline for subsequent draw/dispatch calls |
+| `Cmd::vertex(buffer)` | Bind vertex buffer |
+| `Cmd::index(buffer)` | Bind index buffer |
+| `Cmd::push(data)` | Set push constant data |
+| `Cmd::draw(...)` | Issue draw call |
+| `Cmd::drawIndexed(...)` | Issue indexed draw call |
+| `Cmd::dispatch(x, y, z)` | Dispatch compute work |
+| `Cmd::render(attachments, clears, fn)` | Execute render pass |
+| `Cmd::barrier(...)` | Insert pipeline barrier |
+| `Cmd::copy(...)` | Copy between buffers/images |
+| `Cmd::submit()` | Submit the recorded command buffer to the GPU and return a submission index |
+| `Cmd::present(fn)` | Convenience to begin/end rendering to swapchain and execute fn |
+| `Cmd::timestamp(name, fn)` | Insert GPU timestamp region around fn and record timing |
 
 ### Enums
 

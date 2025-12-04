@@ -336,109 +336,129 @@ namespace evk {
     void Shutdown();
     bool InitializeSwapchain(void* vulkanSurfaceKHR);
 
-    // Returns the frame buffering count
-    uint32_t GetFrameBufferingCount();
-    // Returns the frame buffering index
-    uint32_t GetFrameIndex();
-    // Should be called at the end of each frame to submit the command buffer to the gpu
-    void Submit();
-    // Ensures that no command buffer are running or have access to any resource
-    void Sync();
-    // Returns the timestamps of the last frame
-    const std::vector<TimestampEntry>& GetTimestamps();
     MemoryBudget GetMemoryBudget();
-    // Binds a graphics shader or a compute kernel
-    // Eg. Path/To/Shader
-    // Graphics and Compute shader will not affect each other
-    void CmdBind(Pipeline pipeline);
-    // Dispatches a compute shader
-    void CmdDispatch(uint32_t countX, uint32_t countY, uint32_t countZ);
-    // Transition a image to a layout with dependecy stages
-    void CmdBarrier(Image& image, ImageLayout oldLayout, ImageLayout newLayout, uint32_t mip = 0, uint32_t mipCount = 1, uint32_t layer = 0, uint32_t layerCount = 1);
-    void CmdBarrier();
-    // Fills buffer with value
-    void CmdFill(Buffer dst, uint32_t data, uint64_t size, uint64_t offset = 0);
-    // Updates buffer with small amout of data
-    void CmdUpdate(Buffer& dst, uint64_t dstOffset, uint64_t size, void* src);
-    // Blit a region of a Image to another Image
-    void CmdBlit(Image& src, Image& dst, ImageRegion srcRegion, ImageRegion dstRegion, Filter filter = Filter::Linear);
-    // Copy a Image to another Image of the same size
-    void CmdCopy(Image& src, Image& dst, uint32_t srcMip = 0, uint32_t srcLayer = 0, uint32_t dstMip = 0, uint32_t dstLayer = 0, uint32_t layerCount = 1);
-    // Copy a Buffer to a Image
-    void CmdCopy(Buffer& src, Image& dst, uint32_t mip = 0, uint32_t layer = 0);
-    // Copy regions from a Buffer to a Image
-    void CmdCopy(Buffer& src, Image& dst, const std::vector<ImageRegion>& regions);
-    // Copy regions of a Buffer to Buffer
-    void CmdCopy(Buffer& src, Buffer& dst, uint64_t size, uint64_t srcOffset = 0, uint64_t dstOffset = 0);
+    
+    // Returns the timestamps from the last completed command buffer
+    // Updated when CmdWait() is called or when a command buffer completes during CmdBegin()
+    const std::vector<TimestampEntry>& CmdTimestamps();
 
-    // Copies src to staging buffer then copy to Image
-    void CmdCopy(void* src, Image& dst, uint64_t size, uint32_t mip = 0, uint32_t layer = 0);
-    // Copies src to staging buffer then copy to Buffer
-    void CmdCopy(void* src, Buffer& dst, uint64_t size, uint64_t dstOffset = 0);
+    // Queue type for command buffer submission
+    enum class Queue {
+        Graphics,  // Graphics queue (also supports compute and transfer)
+    };
 
-    // Binds a vertex buffer
-    void CmdVertex(Buffer& buffer, uint64_t offset = 0);
-    // Binds a index buffer
-    void CmdIndex(Buffer& buffer, bool useHalf = false, uint64_t offset = 0);
+    // Command buffer class - provides an interface for recording GPU commands
+    struct Cmd {
+        void* _internal = nullptr;
 
-    void CmdBeginRender(Image* attachments, ClearValue* clearValues, int attachmentCount);
-    void CmdEndRender();
-    void CmdBeginPresent();
-    void CmdEndPresent();
-    void CmdViewport(float x, float y, float w, float h, float minDepth = 0.0f, float maxDepth = 1.0f);
-    void CmdScissor(int32_t x, int32_t y, uint32_t w, uint32_t h);
-    void CmdPush(void* data, uint32_t size, uint32_t offset = 0);
-    void CmdClear(Image image, ClearValue value);
-    void CmdLineWidth(float width);
-    void CmdDraw(uint32_t vertexCount, uint32_t instanceCount = 1, uint32_t firstVertex = 0, uint32_t firstInstance = 0);
-    void CmdDrawIndexed(uint32_t indexCount, uint32_t instanceCount = 1, uint32_t firstIndex = 0, int32_t vertexOffset = 0, uint32_t firstInstance = 0);
-    void CmdDrawIndirect(Buffer& buffer, uint64_t offset, uint32_t drawCount, uint32_t stride);
-    void CmdDrawIndexedIndirect(Buffer& buffer, uint64_t offset, uint32_t drawCount, uint32_t stride);
-    void CmdDrawIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countBufferOffset, uint32_t drawCount, uint32_t stride);
-    void CmdDrawIndexedIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countBufferOffset, uint32_t drawCount, uint32_t stride);
-    int CmdBeginTimestamp(const char* name);
-    void CmdEndTimestamp(int id);
-    void CmdBuildBLAS(const std::vector<BLAS>& blases, bool update = false);
-    void CmdBuildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update = false);
-
-    template <typename... Args>
-    void CmdPush(const Constant<Args...>& data) {
-        CmdPush((void*)(&data), sizeof(data), 0);
-    }
-    template <typename T>
-    void CmdPush(T& data) {
-        CmdPush((void*)(&data), sizeof(T), 0);
-    }
-    template <typename T>
-    void CmdPresent(T callback) {
-        CmdBeginPresent();
-        callback();
-        CmdEndPresent();
-    }
-    template <typename T>
-    void CmdRender(std::initializer_list<Image> attachments, std::initializer_list<ClearValue> clearValues, T callback, ImageLayout finalLayout = ImageLayout::ShaderRead) {
-        for (auto a : attachments) {
-            CmdBarrier(a, ImageLayout::Undefined, ImageLayout::Attachment);
+        // Push constants to the shader
+        void push(void* data, uint32_t size, uint32_t offset = 0);
+        template <typename... Args>
+        void push(const Constant<Args...>& data) {
+            push((void*)(&data), sizeof(data), 0);
         }
-        CmdBeginRender((Image*)attachments.begin(), (ClearValue*)clearValues.begin(), (int)attachments.size());
-        callback();
-        CmdEndRender();
-        for (auto a : attachments) {
-            CmdBarrier(a, ImageLayout::Attachment, finalLayout);
+        template <typename T>
+        void push(T& data) {
+            push((void*)(&data), sizeof(T), 0);
         }
-    }
-    template <typename T>
-    void CmdRender(Image* attachments, ClearValue* clearValues, int attachmentCount, T callback) {
-        CmdBeginRender(attachments, clearValues, attachmentCount);
-        callback();
-        CmdEndRender();
-    }
-    template <typename T>
-    void CmdTimestamp(const char* name, T callback) {
-        int id = CmdBeginTimestamp(name);
-        callback();
-        CmdEndTimestamp(id);
-    }
+
+        // Bind a pipeline (compute or graphics)
+        void bind(Pipeline pipeline);
+
+        // Dispatch a compute shader
+        void dispatch(uint32_t countX, uint32_t countY = 1, uint32_t countZ = 1);
+
+        // Memory barriers
+        void barrier(Image& image, ImageLayout oldLayout, ImageLayout newLayout, uint32_t mip = 0, uint32_t mipCount = 1, uint32_t layer = 0, uint32_t layerCount = 1);
+        void barrier();
+
+        // Buffer commands
+        void fill(Buffer dst, uint32_t data, uint64_t size, uint64_t offset = 0);
+        void update(Buffer& dst, uint64_t dstOffset, uint64_t size, void* src);
+        void copy(Buffer& src, Buffer& dst, uint64_t size, uint64_t srcOffset = 0, uint64_t dstOffset = 0);
+        void copy(void* src, Buffer& dst, uint64_t size, uint64_t dstOffset = 0);
+
+        // Image commands
+        void blit(Image& src, Image& dst, ImageRegion srcRegion, ImageRegion dstRegion, Filter filter = Filter::Linear);
+        void copy(Image& src, Image& dst, uint32_t srcMip = 0, uint32_t srcLayer = 0, uint32_t dstMip = 0, uint32_t dstLayer = 0, uint32_t layerCount = 1);
+        void copy(Buffer& src, Image& dst, uint32_t mip = 0, uint32_t layer = 0);
+        void copy(Buffer& src, Image& dst, const std::vector<ImageRegion>& regions);
+        void copy(void* src, Image& dst, uint64_t size, uint32_t mip = 0, uint32_t layer = 0);
+        void clear(Image image, ClearValue value);
+
+        // Vertex/Index buffer binding
+        void vertex(Buffer& buffer, uint64_t offset = 0);
+        void index(Buffer& buffer, bool useHalf = false, uint64_t offset = 0);
+
+        // Rendering
+        void beginRender(Image* attachments, ClearValue* clearValues, int attachmentCount);
+        void endRender();
+        void beginPresent();
+        void endPresent();
+        void viewport(float x, float y, float w, float h, float minDepth = 0.0f, float maxDepth = 1.0f);
+        void scissor(int32_t x, int32_t y, uint32_t w, uint32_t h);
+        void lineWidth(float width);
+
+        // Drawing
+        void draw(uint32_t vertexCount, uint32_t instanceCount = 1, uint32_t firstVertex = 0, uint32_t firstInstance = 0);
+        void drawIndexed(uint32_t indexCount, uint32_t instanceCount = 1, uint32_t firstIndex = 0, int32_t vertexOffset = 0, uint32_t firstInstance = 0);
+        void drawIndirect(Buffer& buffer, uint64_t offset, uint32_t drawCount, uint32_t stride);
+        void drawIndexedIndirect(Buffer& buffer, uint64_t offset, uint32_t drawCount, uint32_t stride);
+        void drawIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countBufferOffset, uint32_t drawCount, uint32_t stride);
+        void drawIndexedIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countBufferOffset, uint32_t drawCount, uint32_t stride);
+
+        // Timestamps
+        int beginTimestamp(const char* name);
+        void endTimestamp(int id);
+
+        // Ray tracing
+        void buildBLAS(const std::vector<BLAS>& blases, bool update = false);
+        void buildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update = false);
+
+        // Submit the command buffer to the GPU and return a submission index
+        uint64_t submit();
+
+        // Helper templates
+        template <typename T>
+        void present(T callback) {
+            beginPresent();
+            callback();
+            endPresent();
+        }
+        template <typename T>
+        void render(std::initializer_list<Image> attachments, std::initializer_list<ClearValue> clearValues, T callback, ImageLayout finalLayout = ImageLayout::ShaderRead) {
+            for (auto a : attachments) {
+                barrier(a, ImageLayout::Undefined, ImageLayout::Attachment);
+            }
+            beginRender((Image*)attachments.begin(), (ClearValue*)clearValues.begin(), (int)attachments.size());
+            callback();
+            endRender();
+            for (auto a : attachments) {
+                barrier(a, ImageLayout::Attachment, finalLayout);
+            }
+        }
+        template <typename T>
+        void render(Image* attachments, ClearValue* clearValues, int attachmentCount, T callback) {
+            beginRender(attachments, clearValues, attachmentCount);
+            callback();
+            endRender();
+        }
+        template <typename T>
+        void timestamp(const char* name, T callback) {
+            int id = beginTimestamp(name);
+            callback();
+            endTimestamp(id);
+        }
+    };
+
+    // Begin recording a command buffer for the specified queue
+    Cmd& CmdBegin(Queue queue = Queue::Graphics);
+
+    // Check if a command buffer submission is complete
+    bool CmdDone(uint64_t submissionIndex);
+
+    // Wait for a command buffer submission to complete
+    void CmdWait(uint64_t submissionIndex);
 
     // Loads a SPIR-V binary from disk into a std::vector<uint8_t>.
     // Returns an empty vector on failure.

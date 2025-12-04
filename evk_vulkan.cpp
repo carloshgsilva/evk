@@ -135,7 +135,8 @@ namespace evk {
     void Resource::decRef() {
         refCount--;
         if (refCount == 0) {
-            GetFrame().toDelete.push_back(this);
+            auto& S = GetState();
+            S.pendingDeletions.push_back({S.nextSubmissionIndex, this});
         }
     }
     RID ResourceRef::GetRID() const {
@@ -686,14 +687,6 @@ namespace evk {
         return ToInternal(res).desc;
     }
 
-    FrameData::~FrameData() {
-        auto& D = GetState().device;
-        vkDestroySemaphore(D, imageReadySemaphore, nullptr);
-        vkDestroyCommandPool(D, pool, nullptr);
-        vkDestroySemaphore(D, cmdDoneSemaphore, nullptr);
-        vkDestroyFence(D, fence, nullptr);
-        vkDestroyQueryPool(D, queryPool, nullptr);
-    }
     State& GetState() {
         EVK_ASSERT(GState, "EVK not intialized! did you call evk::Initialize()?");
         return *GState;
@@ -702,87 +695,6 @@ namespace evk {
         EVK_ASSERT(state != nullptr, "State is null!");
         EVK_ASSERT(GState == nullptr, "State already initialized!");
         GState = state;
-    }
-    FrameData& GetFrame() {
-        return GetState().frames[GetState().frame];
-    }
-    void _BeginFrame() {
-        auto& S = GetState();
-        auto& F = GetFrame();
-
-        F.timestampNames.clear();
-        F.doingPresent = false;
-        F.insideRenderPass = false;
-        F.stagingOffset = 0;
-        CHECK_VK(vkResetCommandPool(S.device, F.pool, VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT));
-
-        VkCommandBufferBeginInfo cmdbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        cmdbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        CHECK_VK(vkBeginCommandBuffer(F.cmd, &cmdbi));
-
-        vkCmdResetQueryPool(F.cmd, F.queryPool, 0, PERF_QUERY_COUNT);
-        vkCmdBindDescriptorSets(F.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, S.pipelineLayout, 0, 1, &S.descriptorSet, 0, nullptr);
-        vkCmdBindDescriptorSets(F.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pipelineLayout, 0, 1, &S.descriptorSet, 0, nullptr);
-    }
-    void _EndFrame() {
-        auto& S = GetState();
-        auto& F = GetFrame();
-
-        CHECK_VK(vkEndCommandBuffer(F.cmd));
-
-        VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit.waitSemaphoreCount = F.doingPresent ? 1 : 0;
-        submit.pWaitSemaphores = F.doingPresent ? &S.frames[S.swapchainSemaphoreIndex].imageReadySemaphore : nullptr;
-        submit.signalSemaphoreCount = F.doingPresent ? 1 : 0;
-        submit.pSignalSemaphores = F.doingPresent ? &F.cmdDoneSemaphore : nullptr;
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &F.cmd;
-        submit.pWaitDstStageMask = &dstStage;
-        CHECK_VK(vkQueueSubmit(S.queue, 1, &submit, F.fence));
-
-        if (F.doingPresent) {
-            VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-            present.waitSemaphoreCount = 1;
-            present.pWaitSemaphores = &F.cmdDoneSemaphore;
-            present.swapchainCount = 1;
-            present.pSwapchains = &S.swapchain;
-            present.pImageIndices = &S.swapchainIndex;
-            VkResult r = vkQueuePresentKHR(S.queue, &present);
-
-            if (r == VK_ERROR_OUT_OF_DATE_KHR) {
-                S.frame = (int)S.frames.size() - 1;
-                RecreateSwapchain();
-            }
-        }
-    }
-    void _WaitFrameCompletion() {
-        auto& F = GetFrame();
-
-        CHECK_VK(vkWaitForFences(GetState().device, 1, &F.fence, true, std::numeric_limits<uint64_t>().max()));
-        CHECK_VK(vkResetFences(GetState().device, 1, &F.fence));
-        F.queries.resize(PERF_QUERY_COUNT);
-
-        if(F.timestampNames.empty() == false) { 
-            vkGetQueryPoolResults(GetState().device, F.queryPool, 0, PERF_QUERY_COUNT, PERF_QUERY_COUNT * sizeof(uint64_t), F.queries.data(), 8, VK_QUERY_RESULT_64_BIT);
-            F.timestampEntries.clear();
-            uint64_t start = F.queries[0];
-            for (int i = 0; i < F.timestampNames.size(); i++) {
-                TimestampEntry e = {};
-                e.start = (F.queries[i * 2] - start) * 1e-6 * GetState().timestampPeriod;
-                e.end = (F.queries[i * 2 + 1] - start) * 1e-6 * GetState().timestampPeriod;
-                e.name = F.timestampNames[i];
-                F.timestampEntries.push_back(e);
-            }
-        }
-    }
-    void _ReleaseResources() {
-        auto& F = GetFrame();
-
-        for (int i = 0; i < F.toDelete.size(); i++) {
-            delete F.toDelete[i];
-        }
-        F.toDelete.clear();
     }
 
     //////////////////////
@@ -1186,41 +1098,46 @@ namespace evk {
             CHECK_VK(vkAllocateDescriptorSets(S.device, &descset, &S.descriptorSet));
         }
 
-        // Frames data
+        // Command buffers
         {
-            S.frames.resize(desc.frameBufferingCount);
-            for (uint32_t i = 0; i < desc.frameBufferingCount; i++) {
-                FrameData& fd = S.frames[i];
-                VkSemaphoreCreateInfo semaphoreci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-                CHECK_VK(vkCreateSemaphore(S.device, &semaphoreci, nullptr, &fd.imageReadySemaphore));
-
+            S.commandBuffers.resize(MAX_COMMAND_BUFFERS);
+            for (uint32_t i = 0; i < MAX_COMMAND_BUFFERS; i++) {
+                CommandBufferData& cb = S.commandBuffers[i];
+                
                 VkCommandPoolCreateInfo cmdPoolci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
                 cmdPoolci.queueFamilyIndex = S.queueFamily;
-                CHECK_VK(vkCreateCommandPool(S.device, &cmdPoolci, nullptr, &fd.pool));
+                cmdPoolci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+                CHECK_VK(vkCreateCommandPool(S.device, &cmdPoolci, nullptr, &cb.pool));
 
                 VkCommandBufferAllocateInfo cmdAlloc = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
                 cmdAlloc.commandBufferCount = 1;
                 cmdAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-                cmdAlloc.commandPool = fd.pool;
-                CHECK_VK(vkAllocateCommandBuffers(S.device, &cmdAlloc, &fd.cmd));
+                cmdAlloc.commandPool = cb.pool;
+                CHECK_VK(vkAllocateCommandBuffers(S.device, &cmdAlloc, &cb.cmd));
 
                 VkFenceCreateInfo fenceci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
                 fenceci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-                CHECK_VK(vkCreateFence(S.device, &fenceci, nullptr, &fd.fence));
+                CHECK_VK(vkCreateFence(S.device, &fenceci, nullptr, &cb.fence));
 
                 VkQueryPoolCreateInfo queryPoolci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
                 queryPoolci.queryCount = PERF_QUERY_COUNT;
                 queryPoolci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-                CHECK_VK(vkCreateQueryPool(S.device, &queryPoolci, nullptr, &fd.queryPool));
+                CHECK_VK(vkCreateQueryPool(S.device, &queryPoolci, nullptr, &cb.queryPool));
 
-                CHECK_VK(vkCreateSemaphore(S.device, &semaphoreci, nullptr, &fd.cmdDoneSemaphore));
+                // Create semaphores for swapchain synchronization
+                VkSemaphoreCreateInfo semaphoreci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+                CHECK_VK(vkCreateSemaphore(S.device, &semaphoreci, nullptr, &cb.imageReadySemaphore));
+                CHECK_VK(vkCreateSemaphore(S.device, &semaphoreci, nullptr, &cb.cmdDoneSemaphore));
 
-                fd.stagingBuffer = CreateBuffer({
-                    .name = "Staging buffer",
+                cb.stagingBuffer = CreateBuffer({
+                    .name = "Command buffer staging",
                     .size = 64'000'000,
                     .usage = BufferUsage::TransferSrc,
                     .memoryType = MemoryType::CPU_TO_GPU,
                 });
+                
+                cb.inUse = false;
+                cb.submitted = false;
             }
         }
 
@@ -1238,31 +1155,67 @@ namespace evk {
             GetState().vkDestroyAccelerationStructureKHR = (PFN_vkDestroyAccelerationStructureKHR)vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR");
         }
 
-        _WaitFrameCompletion();
-        _BeginFrame();
-
         return true;
     }
     void Shutdown() {
         auto& S = GetState();
 
-        // release internal resources
-        for (auto& f : S.frames) {
-            f.image.release();
-            f.stagingBuffer.release();
-        }
-
-        _EndFrame();
-        CHECK_VK(vkDeviceWaitIdle(S.device));
-
-        for (auto& f : S.frames) {
-            for (int i = 0; i < f.toDelete.size(); i++) {
-                delete f.toDelete[i];
+        // Wait for all command buffers to complete
+        std::vector<VkFence> fences;
+        for (auto& cb : S.commandBuffers) {
+            if (cb.submitted) {
+                fences.push_back(cb.fence);
             }
-            f.toDelete.clear();
+        }
+        if (!fences.empty()) {
+            vkWaitForFences(S.device, (uint32_t)fences.size(), fences.data(), VK_TRUE, UINT64_MAX);
         }
 
-        S.frames.clear();
+        // Clean up pending deletions first
+        for (auto& [idx, res] : S.pendingDeletions) {
+            delete res;
+        }
+        S.pendingDeletions.clear();
+
+        // Release staging buffers - directly delete rather than deferring
+        for (auto& cb : S.commandBuffers) {
+            if (cb.stagingBuffer.res != nullptr) {
+                // Directly delete the resource instead of going through decRef
+                delete cb.stagingBuffer.res;
+                cb.stagingBuffer.res = nullptr;
+            }
+        }
+        
+        // Now clean up the pending deletions that were created by releasing staging buffers
+        for (auto& [idx, res] : S.pendingDeletions) {
+            delete res;
+        }
+        S.pendingDeletions.clear();
+
+        // Clean up swapchain images
+        for (auto& img : S.swapchainImages) {
+            if (img.res != nullptr) {
+                delete img.res;
+                img.res = nullptr;
+            }
+        }
+        S.swapchainImages.clear();
+
+        // Final cleanup of any remaining pending deletions
+        for (auto& [idx, res] : S.pendingDeletions) {
+            delete res;
+        }
+        S.pendingDeletions.clear();
+
+        // Now destroy command buffer Vulkan resources (including semaphores)
+        for (auto& cb : S.commandBuffers) {
+            vkDestroyQueryPool(S.device, cb.queryPool, nullptr);
+            vkDestroyFence(S.device, cb.fence, nullptr);
+            vkDestroySemaphore(S.device, cb.imageReadySemaphore, nullptr);
+            vkDestroySemaphore(S.device, cb.cmdDoneSemaphore, nullptr);
+            vkDestroyCommandPool(S.device, cb.pool, nullptr);
+        }
+        S.commandBuffers.clear();
 
         vmaDestroyAllocator(GetState().allocator);
 
@@ -1342,19 +1295,19 @@ namespace evk {
 
         VkSurfaceCapabilitiesKHR surfaceCaps;
         CHECK_VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(S.physicalDevice, S.surface, &surfaceCaps));
-        // auto capabilities = S.physicalDevice.getSurfaceCapabilitiesKHR(surface);i
         VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
         VkColorSpaceKHR colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-        auto frameCount = S.frames.size();
+        uint32_t imageCount = surfaceCaps.minImageCount < 2 ? 2 : surfaceCaps.minImageCount;
+        if (surfaceCaps.maxImageCount > 0 && imageCount > surfaceCaps.maxImageCount) {
+            imageCount = surfaceCaps.maxImageCount;
+        }
         VkSurfaceTransformFlagBitsKHR transform = surfaceCaps.currentTransform;
         VkExtent2D extent = surfaceCaps.currentExtent;
-
-        EVK_ASSERT(surfaceCaps.minImageCount <= S.frames.size() && S.frames.size() <= surfaceCaps.maxImageCount, "Frame buffering count out of range!");
 
         VkSwapchainCreateInfoKHR swapchainci = {
             .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
             .surface = surface,
-            .minImageCount = (uint32_t)frameCount,
+            .minImageCount = imageCount,
             .imageFormat = format,
             .imageColorSpace = colorSpace,
             .imageExtent = extent,
@@ -1369,17 +1322,28 @@ namespace evk {
         };
 
         CHECK_VK(vkCreateSwapchainKHR(S.device, &swapchainci, nullptr, &S.swapchain));
-        S.swapchainIndex = (uint32_t)(frameCount - 1);
 
-        uint32_t imageCount = 0;
+        // Get swapchain images
+        uint32_t swapchainImageCount = 0;
         std::vector<VkImage> images;
-        CHECK_VK(vkGetSwapchainImagesKHR(S.device, S.swapchain, &imageCount, nullptr));
-        images.resize(imageCount);
-        CHECK_VK(vkGetSwapchainImagesKHR(S.device, S.swapchain, &imageCount, images.data()));
-        for (int i = 0; i < frameCount; i++) {
-            FrameData& d = S.frames[i];
-            d.image = CreateImageForSwapchain(images[i], extent.width, extent.height);
+        CHECK_VK(vkGetSwapchainImagesKHR(S.device, S.swapchain, &swapchainImageCount, nullptr));
+        images.resize(swapchainImageCount);
+        CHECK_VK(vkGetSwapchainImagesKHR(S.device, S.swapchain, &swapchainImageCount, images.data()));
+        
+        // Clean up old swapchain images
+        for (auto& img : S.swapchainImages) {
+            if (img.res != nullptr) {
+                delete img.res;
+                img.res = nullptr;
+            }
         }
+        
+        // Create new swapchain image wrappers
+        S.swapchainImages.resize(swapchainImageCount);
+        for (uint32_t i = 0; i < swapchainImageCount; i++) {
+            S.swapchainImages[i] = CreateImageForSwapchain(images[i], extent.width, extent.height);
+        }
+        S.swapchainIndex = 0;
 
         vkDestroySwapchainKHR(S.device, oldSwapchain, nullptr);
 
@@ -1390,57 +1354,193 @@ namespace evk {
         return RecreateSwapchain();
     }
 
-    void Submit() {
+
+    // Helper to read timestamps from a completed command buffer and store in lastTimestamps
+    static void ReadTimestampsFromCommandBuffer(CommandBufferData& cb) {
         auto& S = GetState();
-        auto& F = GetFrame();
-
-        _EndFrame();
-        S.frame_total++;
-
-        // Swap frame
-        S.frame = (S.frame + 1) % S.frames.size();
-
-        _WaitFrameCompletion();
-        _ReleaseResources();
-        _BeginFrame();
-    }
-    uint32_t GetFrameBufferingCount() {
-        return (uint32_t)GetState().frames.size();
-    }
-    uint32_t GetFrameIndex() {
-        return GetState().frame;
-    }
-    void Sync() {
-        for (int i = 0; i < GetState().frames.size(); i++) {
-            Submit();
+        
+        if (cb.timestampNames.empty()) {
+            S.lastTimestamps.clear();
+            return;
+        }
+        
+        cb.queries.resize(PERF_QUERY_COUNT);
+        vkGetQueryPoolResults(S.device, cb.queryPool, 0, PERF_QUERY_COUNT, 
+                              PERF_QUERY_COUNT * sizeof(uint64_t), cb.queries.data(), 
+                              sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+        
+        S.lastTimestamps.clear();
+        uint64_t start = cb.queries[0];
+        for (size_t i = 0; i < cb.timestampNames.size(); i++) {
+            TimestampEntry e = {};
+            e.start = (cb.queries[i * 2] - start) * 1e-6 * S.timestampPeriod;
+            e.end = (cb.queries[i * 2 + 1] - start) * 1e-6 * S.timestampPeriod;
+            e.name = cb.timestampNames[i];
+            S.lastTimestamps.push_back(e);
         }
     }
-    const std::vector<TimestampEntry>& GetTimestamps() {
-        return GetFrame().timestampEntries;
-    }
 
-    MemoryBudget GetMemoryBudget() {
-        static_assert(sizeof(MemoryBudget::Heap) == sizeof(VmaBudget));
-        static_assert(MemoryBudget::MAX_HEAPS == VK_MAX_MEMORY_HEAPS);
-        MemoryBudget budget = {};
-        vmaGetHeapBudgets(GetState().allocator, (VmaBudget*)&budget);
-        return budget;
+    static void CleanupCompletedCommandBuffers() {
+        auto& S = GetState();
+        
+        for (auto& cb : S.commandBuffers) {
+            if (cb.submitted) {
+                VkResult result = vkGetFenceStatus(S.device, cb.fence);
+                if (result == VK_SUCCESS) {
+                    // Read timestamps before marking as not submitted
+                    ReadTimestampsFromCommandBuffer(cb);
+                    
+                    cb.submitted = false;
+                    cb.inUse = false;
+                    
+                    // Also clean up global pending deletions that were waiting on this submission
+                    auto it = S.pendingDeletions.begin();
+                    while (it != S.pendingDeletions.end()) {
+                        if (it->first <= cb.submissionIndex) {
+                            delete it->second;
+                            it = S.pendingDeletions.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+            }
+        }
     }
-    // Cmds //
-    //////////
-    void CmdBind(Pipeline pipeline) {
+    
+    Cmd& CmdBegin(Queue queue) {
+        auto& S = GetState();
+        
+        // Clean up any completed command buffers
+        CleanupCompletedCommandBuffers();
+        
+        // Find a free command buffer
+        CommandBufferData* cmdData = nullptr;
+        for (auto& cb : S.commandBuffers) {
+            if (!cb.inUse && !cb.submitted) {
+                cmdData = &cb;
+                break;
+            }
+        }
+        
+        EVK_ASSERT(cmdData != nullptr, "No available command buffers! Wait for some to complete.");
+        
+        cmdData->inUse = true;
+        cmdData->submitted = false;
+        cmdData->insideRenderPass = false;
+        cmdData->doingPresent = false;
+        cmdData->stagingOffset = 0;
+        cmdData->timestampNames.clear();
+        
+        // Reset and begin the command buffer
+        CHECK_VK(vkResetCommandBuffer(cmdData->cmd, 0));
+        
+        VkCommandBufferBeginInfo cmdbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        cmdbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        CHECK_VK(vkBeginCommandBuffer(cmdData->cmd, &cmdbi));
+        
+        vkCmdResetQueryPool(cmdData->cmd, cmdData->queryPool, 0, PERF_QUERY_COUNT);
+        vkCmdBindDescriptorSets(cmdData->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, S.pipelineLayout, 0, 1, &S.descriptorSet, 0, nullptr);
+        vkCmdBindDescriptorSets(cmdData->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pipelineLayout, 0, 1, &S.descriptorSet, 0, nullptr);
+        
+        S.currentCmdData = cmdData;
+        S.currentCmd._internal = cmdData;
+        
+        return S.currentCmd;
+    }
+    
+    bool CmdDone(uint64_t submissionIndex) {
+        auto& S = GetState();
+        
+        for (auto& cb : S.commandBuffers) {
+            if (cb.submissionIndex == submissionIndex && cb.submitted) {
+                VkResult result = vkGetFenceStatus(S.device, cb.fence);
+                if (result == VK_SUCCESS && cb.submitted) {
+                    // Command buffer completed - read timestamps and clean up
+                    ReadTimestampsFromCommandBuffer(cb);
+                    
+                    cb.submitted = false;
+                    cb.inUse = false;
+                    
+                    // Clean up global pending deletions
+                    auto it = S.pendingDeletions.begin();
+                    while (it != S.pendingDeletions.end()) {
+                        if (it->first <= cb.submissionIndex) {
+                            delete it->second;
+                            it = S.pendingDeletions.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    return true;
+                }
+                return false;
+            }
+        }
+        
+        // If not found in submitted buffers, it's either already done and cleaned up, or invalid
+        return true;
+    }
+    
+    void CmdWait(uint64_t submissionIndex) {
+        auto& S = GetState();
+        
+        for (auto& cb : S.commandBuffers) {
+            if (cb.submissionIndex == submissionIndex && cb.submitted) {
+                CHECK_VK(vkWaitForFences(S.device, 1, &cb.fence, VK_TRUE, UINT64_MAX));
+                
+                // Read timestamps before marking as not submitted
+                ReadTimestampsFromCommandBuffer(cb);
+                
+                cb.submitted = false;
+                cb.inUse = false;
+                
+                // Also clean up global pending deletions
+                auto it = S.pendingDeletions.begin();
+                while (it != S.pendingDeletions.end()) {
+                    if (it->first <= cb.submissionIndex) {
+                        delete it->second;
+                        it = S.pendingDeletions.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                return;
+            }
+        }
+    }
+    
+    const std::vector<TimestampEntry>& CmdTimestamps() {
+        return GetState().lastTimestamps;
+    }
+    
+    // Cmd class method implementations
+    void Cmd::push(void* data, uint32_t size, uint32_t offset) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        EVK_ASSERT(size % 4 == 0, "Push constant 'size' must be aligned by 4 bytes!");
+        EVK_ASSERT(offset % 4 == 0, "Push constant 'offset' must be aligned by 4 bytes!");
+        EVK_ASSERT(offset + size <= 128, "Push constant offset+size must be smaller than 128 bytes!");
+        vkCmdPushConstants(cb->cmd, GetState().pipelineLayout, VK_SHADER_STAGE_ALL, offset, size, data);
+    }
+    
+    void Cmd::bind(Pipeline pipeline) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
         bool isCompute = ToInternal(pipeline).isCompute;
         bool isGraphics = !isCompute;
         EVK_ASSERT(pipeline.res != nullptr, "Null pipeline");
-        EVK_ASSERT(!isGraphics || GetFrame().insideRenderPass, "graphics pipeline bind must be inside a render pass.");
-        EVK_ASSERT(!isCompute || !GetFrame().insideRenderPass, "compute pipeline bind must be outside a render pass.");
-        vkCmdBindPipeline(GetFrame().cmd, isCompute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS, ToInternal(pipeline).pipeline);
+        EVK_ASSERT(!isGraphics || cb->insideRenderPass, "graphics pipeline bind must be inside a render pass.");
+        EVK_ASSERT(!isCompute || !cb->insideRenderPass, "compute pipeline bind must be outside a render pass.");
+        vkCmdBindPipeline(cb->cmd, isCompute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS, ToInternal(pipeline).pipeline);
     }
-    void CmdDispatch(uint32_t countX, uint32_t countY, uint32_t countZ) {
-        vkCmdDispatch(GetFrame().cmd, countX, countY, countZ);
+    
+    void Cmd::dispatch(uint32_t countX, uint32_t countY, uint32_t countZ) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        vkCmdDispatch(cb->cmd, countX, countY, countZ);
     }
-    void CmdBarrier(Image& image, ImageLayout oldLayout, ImageLayout newLayout, uint32_t mip, uint32_t mipCount, uint32_t layer, uint32_t layerCount) {
-        EVK_ASSERT(GetFrame().insideRenderPass == false, "can't be used inside a render pass.");
+    
+    void Cmd::barrier(Image& image, ImageLayout oldLayout, ImageLayout newLayout, uint32_t mip, uint32_t mipCount, uint32_t layer, uint32_t layerCount) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        EVK_ASSERT(cb->insideRenderPass == false, "can't be used inside a render pass.");
         bool isDepth = DoesFormatHaveDepth(GetDesc(image).format);
         VkImageAspectFlags aspects = {};
         if (isDepth) {
@@ -1467,81 +1567,16 @@ namespace evk {
         barrier.subresourceRange.levelCount = mipCount;
         barrier.subresourceRange.baseMipLevel = mip;
 
-        VkPipelineStageFlags srcStage;
-        VkPipelineStageFlags dstStage;
-
-        {
-            /*
-            if (oldLayout == ImageLayout::Undefined) {
-                srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-                barrier.srcAccessMask = VK_ACCESS_NONE_KHR;
-            }
-            else if (oldLayout == ImageLayout::TransferSrc) {
-                srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-                barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            }
-            else if (oldLayout == ImageLayout::TransferDst) {
-                srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            }
-            else if (oldLayout == ImageLayout::ShaderRead) {
-                srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-                barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            }
-            else if (oldLayout == ImageLayout::Attachment) {
-                srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-                barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-            }
-            else if (oldLayout == ImageLayout::General) {
-                srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-                barrier.srcAccessMask = VK_ACCESS_NONE_KHR;
-            }
-            else {
-                EVK_ASSERT(false, "Unsupported old layout transition!")
-            }
-
-            if (newLayout == ImageLayout::Undefined) {
-                dstStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-                barrier.dstAccessMask = VK_ACCESS_NONE_KHR;
-            }
-            else if (newLayout == ImageLayout::TransferSrc) {
-                dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-                barrier.dstAccessMask  = VK_ACCESS_TRANSFER_READ_BIT;
-            }
-            else if (newLayout == ImageLayout::TransferDst) {
-                dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-                barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            }
-            else if (newLayout == ImageLayout::ShaderRead) {
-                dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-                barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            }
-            else if (newLayout == ImageLayout::General) {
-                dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
-                barrier.dstAccessMask = VK_ACCESS_NONE_KHR;
-            }
-            else if (newLayout == ImageLayout::Attachment) {
-                dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-                barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-            }
-            else if (newLayout == ImageLayout::Present) {
-                dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-                barrier.dstAccessMask = VK_ACCESS_NONE_KHR;
-            }
-            else {
-                EVK_ASSERT(false, "Unsupported new layout transition!")
-            }
-            */
-            srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-            dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-            barrier.srcAccessMask = VK_ACCESS_NONE_KHR;
-            barrier.dstAccessMask = VK_ACCESS_NONE_KHR;
-        }
-        vkCmdPipelineBarrier(GetFrame().cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        barrier.srcAccessMask = VK_ACCESS_NONE_KHR;
+        barrier.dstAccessMask = VK_ACCESS_NONE_KHR;
+        
+        vkCmdPipelineBarrier(cb->cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     }
-    void CmdBarrier() {
+    
+    void Cmd::barrier() {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
         VkMemoryBarrier2 barrier = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
             .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -1554,20 +1589,61 @@ namespace evk {
             .memoryBarrierCount = 1,
             .pMemoryBarriers = &barrier,
         };
-        vkCmdPipelineBarrier2(GetFrame().cmd, &dependency);
+        vkCmdPipelineBarrier2(cb->cmd, &dependency);
     }
-    void CmdFill(Buffer dst, uint32_t data, uint64_t size, uint64_t offset) {
+    
+    void Cmd::fill(Buffer dst, uint32_t data, uint64_t size, uint64_t offset) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
         EVK_ASSERT(size > 0, "Size must be bigger than 0");
         EVK_ASSERT(size % 4 == 0, "Trying to fill buffer '%s', but size is %lld which is not a multiple of 4", GetDesc(dst).name.c_str(), size);
-        vkCmdFillBuffer(GetFrame().cmd, ToInternal(dst).buffer, offset, size, data);
+        vkCmdFillBuffer(cb->cmd, ToInternal(dst).buffer, offset, size, data);
     }
-    void CmdUpdate(Buffer& dst, uint64_t dstOffset, uint64_t size, void* src) {
+    
+    void Cmd::update(Buffer& dst, uint64_t dstOffset, uint64_t size, void* src) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
         EVK_ASSERT(dstOffset % 4 == 0, "Trying to update buffer '%s', but dstOffset is %lld which is not a multiple of 4", GetDesc(dst).name.c_str(), dstOffset);
         EVK_ASSERT(size % 4 == 0, "Trying to update buffer '%s', but size is %lld which is not a multiple of 4", GetDesc(dst).name.c_str(), size);
         EVK_ASSERT(size <= 65536, "Trying to update buffer '%s', but size is %lld which is not smaller than 65536 ", GetDesc(dst).name.c_str(), size);
-        vkCmdUpdateBuffer(GetFrame().cmd, ToInternal(dst).buffer, dstOffset, size, src);
+        vkCmdUpdateBuffer(cb->cmd, ToInternal(dst).buffer, dstOffset, size, src);
     }
-    void CmdBlit(Image& src, Image& dst, ImageRegion srcRegion, ImageRegion dstRegion, Filter filter) {
+    
+    void Cmd::copy(Buffer& src, Buffer& dst, uint64_t size, uint64_t srcOffset, uint64_t dstOffset) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        EVK_ASSERT(size > 0, "Size must be bigger than 0");
+        EVK_ASSERT((size + dstOffset) <= ToInternal(dst).allocation->GetSize(), "size + dstOffset must be smaller or equal than buffer size");
+
+        VkBufferCopy copy{};
+        copy.srcOffset = srcOffset;
+        copy.dstOffset = dstOffset;
+        copy.size = size;
+
+        vkCmdCopyBuffer(cb->cmd, ToInternal(src).buffer, ToInternal(dst).buffer, 1, &copy);
+    }
+    
+    void Cmd::copy(void* src, Buffer& dst, uint64_t size, uint64_t dstOffset) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        EVK_ASSERT(size > 0, "Size must be bigger than 0");
+
+        if (cb->stagingOffset + size >= 64'000'000) {
+            printf("[evk] [warn] Creating extra staging buffer of size %llu!!! FIXME\n", size);
+            Buffer tempStaging = CreateBuffer({
+                .size = size,
+                .usage = BufferUsage::TransferSrc,
+                .memoryType = MemoryType::CPU,
+            });
+            uint64_t staging = uint64_t(tempStaging.GetPtr());
+            std::memcpy((void*)staging, src, size);
+            copy(tempStaging, dst, size, 0u, dstOffset);
+        } else {
+            uint64_t staging = uint64_t(cb->stagingBuffer.GetPtr()) + cb->stagingOffset;
+            std::memcpy((void*)staging, src, size);
+            copy(cb->stagingBuffer, dst, size, cb->stagingOffset, dstOffset);
+            cb->stagingOffset += size;
+        }
+    }
+    
+    void Cmd::blit(Image& src, Image& dst, ImageRegion srcRegion, ImageRegion dstRegion, Filter filter) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
         if (srcRegion.width == 0) srcRegion.width = std::max(GetDesc(src).extent.width >> srcRegion.mip, 1u);
         if (srcRegion.height == 0) srcRegion.height = std::max(GetDesc(src).extent.height >> srcRegion.mip, 1u);
         if (srcRegion.depth == 0) srcRegion.depth = std::max(GetDesc(src).extent.depth >> srcRegion.mip, 1u);
@@ -1575,24 +1651,26 @@ namespace evk {
         if (dstRegion.height == 0) dstRegion.height = std::max(GetDesc(dst).extent.height >> dstRegion.mip, 1u);
         if (dstRegion.depth == 0) dstRegion.depth = std::max(GetDesc(dst).extent.depth >> dstRegion.mip, 1u);
 
-        VkImageBlit blit = {};
-        blit.srcOffsets[0] = {srcRegion.x, srcRegion.y, srcRegion.z};
-        blit.srcOffsets[1] = {srcRegion.x + srcRegion.width, srcRegion.y + srcRegion.height, srcRegion.z + srcRegion.depth};
-        blit.srcSubresource.aspectMask = DoesFormatHaveDepth(GetDesc(src).format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-        blit.srcSubresource.mipLevel = srcRegion.mip;
-        blit.srcSubresource.baseArrayLayer = srcRegion.layer;
-        blit.srcSubresource.layerCount = 1;
+        VkImageBlit blitInfo = {};
+        blitInfo.srcOffsets[0] = {srcRegion.x, srcRegion.y, srcRegion.z};
+        blitInfo.srcOffsets[1] = {srcRegion.x + srcRegion.width, srcRegion.y + srcRegion.height, srcRegion.z + srcRegion.depth};
+        blitInfo.srcSubresource.aspectMask = DoesFormatHaveDepth(GetDesc(src).format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+        blitInfo.srcSubresource.mipLevel = srcRegion.mip;
+        blitInfo.srcSubresource.baseArrayLayer = srcRegion.layer;
+        blitInfo.srcSubresource.layerCount = 1;
 
-        blit.dstOffsets[0] = {dstRegion.x, dstRegion.y, dstRegion.z};
-        blit.dstOffsets[1] = {dstRegion.x + dstRegion.width, dstRegion.y + dstRegion.height, dstRegion.z + dstRegion.depth};
-        blit.dstSubresource.aspectMask = DoesFormatHaveDepth(GetDesc(dst).format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-        blit.dstSubresource.mipLevel = dstRegion.mip;
-        blit.dstSubresource.baseArrayLayer = dstRegion.layer;
-        blit.dstSubresource.layerCount = 1;
+        blitInfo.dstOffsets[0] = {dstRegion.x, dstRegion.y, dstRegion.z};
+        blitInfo.dstOffsets[1] = {dstRegion.x + dstRegion.width, dstRegion.y + dstRegion.height, dstRegion.z + dstRegion.depth};
+        blitInfo.dstSubresource.aspectMask = DoesFormatHaveDepth(GetDesc(dst).format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+        blitInfo.dstSubresource.mipLevel = dstRegion.mip;
+        blitInfo.dstSubresource.baseArrayLayer = dstRegion.layer;
+        blitInfo.dstSubresource.layerCount = 1;
 
-        vkCmdBlitImage(GetFrame().cmd, ToInternal(src).image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, FILTER_VK[(int)filter]);
+        vkCmdBlitImage(cb->cmd, ToInternal(src).image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitInfo, FILTER_VK[(int)filter]);
     }
-    void CmdCopy(Image& src, Image& dst, uint32_t srcMip, uint32_t srcLayer, uint32_t dstMip, uint32_t dstLayer, uint32_t layerCount) {
+    
+    void Cmd::copy(Image& src, Image& dst, uint32_t srcMip, uint32_t srcLayer, uint32_t dstMip, uint32_t dstLayer, uint32_t layerCount) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
         EVK_ASSERT(src, "src = null");
         EVK_ASSERT(dst, "dst = null");
 
@@ -1609,9 +1687,11 @@ namespace evk {
         copy.dstSubresource.baseArrayLayer = dstLayer;
         copy.dstSubresource.layerCount = layerCount;
 
-        vkCmdCopyImage(GetFrame().cmd, ToInternal(src).image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        vkCmdCopyImage(cb->cmd, ToInternal(src).image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }
-    void CmdCopy(Buffer& src, Image& dst, uint32_t mip, uint32_t layer) {
+    
+    void Cmd::copy(Buffer& src, Image& dst, uint32_t mip, uint32_t layer) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
         auto extent = GetDesc(dst).extent;
 
         VkBufferImageCopy copy = {};
@@ -1625,9 +1705,11 @@ namespace evk {
         copy.imageOffset = {0, 0, 0};
         copy.imageExtent = {extent.width >> mip, extent.height >> mip, extent.depth >> mip};
 
-        vkCmdCopyBufferToImage(GetFrame().cmd, ToInternal(src).buffer, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        vkCmdCopyBufferToImage(cb->cmd, ToInternal(src).buffer, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }
-    void CmdCopy(Buffer& src, Image& dst, const std::vector<ImageRegion>& regions) {
+    
+    void Cmd::copy(Buffer& src, Image& dst, const std::vector<ImageRegion>& regions) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
         EVK_ASSERT(regions.size() <= 16, "regions size must be less or equals than 16");
 
         auto extent = GetDesc(dst).extent;
@@ -1648,33 +1730,22 @@ namespace evk {
             copy.imageExtent = {extent.width >> region.mip, extent.height >> region.mip, extent.depth >> region.mip};
         }
 
-        vkCmdCopyBufferToImage(GetFrame().cmd, ToInternal(src).buffer, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()), copies);
+        vkCmdCopyBufferToImage(cb->cmd, ToInternal(src).buffer, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()), copies);
     }
-    void CmdCopy(Buffer& src, Buffer& dst, uint64_t size, uint64_t srcOffset, uint64_t dstOffset) {
-        EVK_ASSERT(size > 0, "Size must be bigger than 0");
-        EVK_ASSERT((size + dstOffset) <= ToInternal(dst).allocation->GetSize(), "size + dstOffset must be smaller or equal than buffer size");
-
-        VkBufferCopy copy{};
-        copy.srcOffset = srcOffset;
-        copy.dstOffset = dstOffset;
-        copy.size = size;
-
-        vkCmdCopyBuffer(GetFrame().cmd, ToInternal(src).buffer, ToInternal(dst).buffer, 1, &copy);
-    }
-
-    void CmdCopy(void* src, Image& dst, uint64_t size, uint32_t mip, uint32_t layer) {
+    
+    void Cmd::copy(void* src, Image& dst, uint64_t size, uint32_t mip, uint32_t layer) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
         EVK_ASSERT(size > 0, "Size must be bigger than 0");
 
-        auto& F = GetFrame();
         auto& extent = GetDesc(dst).extent;
 
-        EVK_ASSERT(F.stagingOffset + size < 64'000'000, "Staging buffer out of memory");
+        EVK_ASSERT(cb->stagingOffset + size < 64'000'000, "Staging buffer out of memory");
 
-        uint64_t staging = uint64_t(F.stagingBuffer.GetPtr()) + F.stagingOffset;
+        uint64_t staging = uint64_t(cb->stagingBuffer.GetPtr()) + cb->stagingOffset;
         std::memcpy((void*)staging, src, size);
 
         VkBufferImageCopy copy = {};
-        copy.bufferOffset = F.stagingOffset;
+        copy.bufferOffset = cb->stagingOffset;
         copy.bufferRowLength = 0;
         copy.bufferImageHeight = 0;
         copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1684,48 +1755,47 @@ namespace evk {
         copy.imageOffset = {0, 0, 0};
         copy.imageExtent = {extent.width >> mip, extent.height >> mip, extent.depth >> mip};
 
-        F.stagingOffset += size;
+        cb->stagingOffset += size;
 
-        vkCmdCopyBufferToImage(GetFrame().cmd, ToInternal(F.stagingBuffer).buffer, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        vkCmdCopyBufferToImage(cb->cmd, ToInternal(cb->stagingBuffer).buffer, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }
-    void CmdCopy(void* src, Buffer& dst, uint64_t size, uint64_t dstOffset) {
-        EVK_ASSERT(size > 0, "Size must be bigger than 0");
-        // EVK_ASSERT(F.stagingOffset + size < 64'000'000, "Staging buffer out of memory");
-
-        auto& F = GetFrame();
-        if (F.stagingOffset + size >= 64'000'000) {
-            printf("[evk] [warn] Creating extra staging buffer of size %llu!!! FIXME\n", size);
-            Buffer tempStaging = CreateBuffer({
-                .size = size,
-                .usage = BufferUsage::TransferSrc,
-                .memoryType = MemoryType::CPU,
-            });
-            uint64_t staging = uint64_t(tempStaging.GetPtr());
-            std::memcpy((void*)staging, src, size);
-            CmdCopy(tempStaging, dst, size, 0u, dstOffset);
+    
+    void Cmd::clear(Image image, ClearValue value) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        EVK_ASSERT(cb->insideRenderPass == false, "can't be used inside a render pass.");
+        barrier(image, ImageLayout::Undefined, ImageLayout::TransferDst);
+        const ImageDesc& desc = GetDesc(image);
+        if (DoesFormatHaveDepth(desc.format)) {
+            VkClearDepthStencilValue vkValue = {.depth = value.depthStencil.depth, .stencil = value.depthStencil.stencil};
+            VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, .baseMipLevel = 0, .levelCount = desc.mipCount, .baseArrayLayer = 0, .layerCount = desc.layerCount};
+            vkCmdClearDepthStencilImage(cb->cmd, ToInternal(image).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &vkValue, 1, &range);
         } else {
-            uint64_t staging = uint64_t(F.stagingBuffer.GetPtr()) + F.stagingOffset;
-            std::memcpy((void*)staging, src, size);
-            CmdCopy(F.stagingBuffer, dst, size, F.stagingOffset, dstOffset);
-            F.stagingOffset += size;
+            VkClearColorValue vkValue = {.uint32 = {value.color.uint32[0], value.color.uint32[1], value.color.uint32[2], value.color.uint32[3]}};
+            VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = desc.mipCount, .baseArrayLayer = 0, .layerCount = desc.layerCount};
+            vkCmdClearColorImage(cb->cmd, ToInternal(image).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &vkValue, 1, &range);
         }
     }
-
-    void CmdVertex(Buffer& buffer, uint64_t offset) {
+    
+    void Cmd::vertex(Buffer& buffer, uint64_t offset) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
         VkDeviceSize rawOffset = offset;
-        vkCmdBindVertexBuffers(GetFrame().cmd, 0, 1, &ToInternal(buffer).buffer, &rawOffset);
+        vkCmdBindVertexBuffers(cb->cmd, 0, 1, &ToInternal(buffer).buffer, &rawOffset);
     }
-    void CmdIndex(Buffer& buffer, bool useHalf, uint64_t offset) {
+    
+    void Cmd::index(Buffer& buffer, bool useHalf, uint64_t offset) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
         VkDeviceSize rawOffset = offset;
-        vkCmdBindIndexBuffer(GetFrame().cmd, ToInternal(buffer).buffer, rawOffset, useHalf ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+        vkCmdBindIndexBuffer(cb->cmd, ToInternal(buffer).buffer, rawOffset, useHalf ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     }
-    void CmdBeginRender(Image* attachments, ClearValue* clearValues, int attachmentCount) {
-        EVK_ASSERT(GetFrame().insideRenderPass == false, "render pass already bound!");
+    
+    void Cmd::beginRender(Image* attachments, ClearValue* clearValues, int attachmentCount) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        EVK_ASSERT(cb->insideRenderPass == false, "render pass already bound!");
         EVK_ASSERT(attachments, "attachments = nullptr");
         EVK_ASSERT(attachmentCount > 0, "attachmentCount = 0");
         EVK_ASSERT(attachmentCount < MAX_ATTACHMENTS_COUNT, "Number of attachments %d greater than %d", attachmentCount, MAX_ATTACHMENTS_COUNT);
 
-        GetFrame().insideRenderPass = true;
+        cb->insideRenderPass = true;
 
         bool hasDepth = false;
         bool hasStencil = false;
@@ -1736,14 +1806,14 @@ namespace evk {
             auto& attach = attachInfos[i];
             auto& clear = clearValues[i];
             bool isDepthStencil = DoesFormatHaveDepth(desc.format);
-            bool isStencil = DoesFormatHaveStencil(desc.format);
+            bool isStencilOnly = DoesFormatHaveStencil(desc.format);
             EVK_ASSERT((uint32_t)ToInternal(attachments[i]).desc.usage & (uint32_t)ImageUsage::Attachment, "Image '%s' which is attachment %d don't have ImageUsage::Attachment", GetDesc(attachments[i]).name.c_str(), i);
 
             attach = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
-            if (isDepthStencil || isStencil) {
+            if (isDepthStencil || isStencilOnly) {
                 EVK_ASSERT(i == attachmentCount - 1, "DepthStencil attachment must be in the last attachment index!");
                 hasDepth = isDepthStencil;
-                hasStencil = isStencil;
+                hasStencil = isStencilOnly;
             } else {
                 colorAttachmentCount++;
             }
@@ -1757,7 +1827,7 @@ namespace evk {
             attach.loadOp = clearValues ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             attach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             if (clearValues) {
-                if (isDepthStencil || isStencil) {
+                if (isDepthStencil || isStencilOnly) {
                     VkClearDepthStencilValue clearDepthStencil;
                     clearDepthStencil.depth = clear.depthStencil.depth;
                     clearDepthStencil.stencil = clear.depthStencil.stencil;
@@ -1791,117 +1861,291 @@ namespace evk {
         viewport.height = -(float)extent.height;
         viewport.minDepth = 0.0f;
         viewport.maxDepth = 1.0f;
-        vkCmdSetViewport(GetFrame().cmd, 0, 1, &viewport);
+        vkCmdSetViewport(cb->cmd, 0, 1, &viewport);
 
         VkRect2D scissor = {};
         scissor.offset.x = 0;
         scissor.offset.y = 0;
         scissor.extent.width = extent.width;
         scissor.extent.height = extent.height;
-        vkCmdSetScissor(GetFrame().cmd, 0, 1, &scissor);
+        vkCmdSetScissor(cb->cmd, 0, 1, &scissor);
 
-        vkCmdSetLineWidth(GetFrame().cmd, 1.0f);
+        vkCmdSetLineWidth(cb->cmd, 1.0f);
 
-        vkCmdBeginRendering(GetFrame().cmd, &info);
+        vkCmdBeginRendering(cb->cmd, &info);
     }
-    void CmdEndRender() {
-        EVK_ASSERT(GetFrame().insideRenderPass == true, "no render pass bound!");
-        GetFrame().insideRenderPass = false;
-        vkCmdEndRendering(GetFrame().cmd);
+    
+    void Cmd::endRender() {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        EVK_ASSERT(cb->insideRenderPass == true, "no render pass bound!");
+        cb->insideRenderPass = false;
+        vkCmdEndRendering(cb->cmd);
     }
-    void CmdBeginPresent() {
-        auto& F = GetFrame();
-        EVK_ASSERT(!F.doingPresent, "CmdBeginPresent have already been called this frame.");
-        F.doingPresent = true;
+    
+    void Cmd::beginPresent() {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        EVK_ASSERT(!cb->doingPresent, "beginPresent have already been called.");
+        cb->doingPresent = true;
 
         auto& S = GetState();
-        S.swapchainSemaphoreIndex = (S.swapchainSemaphoreIndex + 1) % S.frames.size();
-        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, 0, S.frames[S.swapchainSemaphoreIndex].imageReadySemaphore, 0, &S.swapchainIndex);
-        CmdBarrier(S.frames[S.swapchainIndex].image, ImageLayout::Undefined, ImageLayout::Attachment);
+        // Use the command buffer's own imageReadySemaphore for acquire
+        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &S.swapchainIndex);
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
+            RecreateSwapchain();
+            r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &S.swapchainIndex);
+        }
+        
+        barrier(S.swapchainImages[S.swapchainIndex], ImageLayout::Undefined, ImageLayout::Attachment);
 
         ClearValue clears[] = {ClearColor{0.0f, 0.0f, 0.0f, 1.0f}};
-        CmdBeginRender(&S.frames[S.swapchainIndex].image, clears, 1);
+        beginRender(&S.swapchainImages[S.swapchainIndex], clears, 1);
     }
-    void CmdEndPresent() {
-        CmdEndRender();
-        CmdBarrier(GetState().frames[GetState().swapchainIndex].image, ImageLayout::Attachment, ImageLayout::Present);
+    
+    void Cmd::endPresent() {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        endRender();
+        barrier(GetState().swapchainImages[GetState().swapchainIndex], ImageLayout::Attachment, ImageLayout::Present);
     }
-    void CmdViewport(float x, float y, float w, float h, float minDepth, float maxDepth) {
-        VkViewport viewport = {};
-        viewport.x = x;
-        viewport.y = y;
-        viewport.width = w;
-        viewport.height = h;
-        viewport.minDepth = minDepth;
-        viewport.maxDepth = maxDepth;
-        vkCmdSetViewport(GetFrame().cmd, 0, 1, &viewport);
+    
+    void Cmd::viewport(float x, float y, float w, float h, float minDepth, float maxDepth) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        VkViewport vp = {};
+        vp.x = x;
+        vp.y = y;
+        vp.width = w;
+        vp.height = h;
+        vp.minDepth = minDepth;
+        vp.maxDepth = maxDepth;
+        vkCmdSetViewport(cb->cmd, 0, 1, &vp);
     }
-    void CmdScissor(int32_t x, int32_t y, uint32_t w, uint32_t h) {
-        VkRect2D scissor = {};
-        scissor.offset.x = x;
-        scissor.offset.y = y;
-        scissor.extent.width = w;
-        scissor.extent.height = h;
-        vkCmdSetScissor(GetFrame().cmd, 0, 1, &scissor);
+    
+    void Cmd::scissor(int32_t x, int32_t y, uint32_t w, uint32_t h) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        VkRect2D sc = {};
+        sc.offset.x = x;
+        sc.offset.y = y;
+        sc.extent.width = w;
+        sc.extent.height = h;
+        vkCmdSetScissor(cb->cmd, 0, 1, &sc);
     }
-    void CmdPush(void* data, uint32_t size, uint32_t offset) {
-        EVK_ASSERT(size % 4 == 0, "Push constant 'size' must be aligned by 4 bytes!");
-        EVK_ASSERT(offset % 4 == 0, "Push constant 'offset' must be aligned by 4 bytes!");
-        EVK_ASSERT(offset + size <= 128, "Push constant offset+size must be smaller than 128 bytes!");
-        vkCmdPushConstants(GetFrame().cmd, GetState().pipelineLayout, VK_SHADER_STAGE_ALL, offset, size, data);
+    
+    void Cmd::lineWidth(float width) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        vkCmdSetLineWidth(cb->cmd, width);
     }
-    void CmdClear(Image image, ClearValue value) {
-        EVK_ASSERT(GetFrame().insideRenderPass == false, "can't be used inside a render pass.");
-        CmdBarrier(image, ImageLayout::Undefined, ImageLayout::TransferDst);
-        const ImageDesc& desc = GetDesc(image);
-        if (DoesFormatHaveDepth(desc.format)) {
-            VkClearDepthStencilValue vkValue = {.depth = value.depthStencil.depth, .stencil = value.depthStencil.stencil};
-            VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, .baseMipLevel = 0, .levelCount = desc.mipCount, .baseArrayLayer = 0, .layerCount = desc.layerCount};
-            vkCmdClearDepthStencilImage(GetFrame().cmd, ToInternal(image).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &vkValue, 1, &range);
-        } else {
-            VkClearColorValue vkValue = {.uint32 = {value.color.uint32[0], value.color.uint32[1], value.color.uint32[2], value.color.uint32[3]}};
-            VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = desc.mipCount, .baseArrayLayer = 0, .layerCount = desc.layerCount};
-            vkCmdClearColorImage(GetFrame().cmd, ToInternal(image).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &vkValue, 1, &range);
-        }
+    
+    void Cmd::draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        vkCmdDraw(cb->cmd, vertexCount, instanceCount, firstVertex, firstInstance);
     }
-    void CmdLineWidth(float width) {
-        vkCmdSetLineWidth(GetFrame().cmd, width);
+    
+    void Cmd::drawIndexed(uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        vkCmdDrawIndexed(cb->cmd, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
     }
-    void CmdDraw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
-        vkCmdDraw(GetFrame().cmd, vertexCount, instanceCount, firstVertex, firstInstance);
+    
+    void Cmd::drawIndirect(Buffer& buffer, uint64_t offset, uint32_t drawCount, uint32_t stride) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        vkCmdDrawIndirect(cb->cmd, ToInternal(buffer).buffer, offset, drawCount, stride);
     }
-    void CmdDrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
-        vkCmdDrawIndexed(GetFrame().cmd, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+    
+    void Cmd::drawIndexedIndirect(Buffer& buffer, uint64_t offset, uint32_t drawCount, uint32_t stride) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        vkCmdDrawIndexedIndirect(cb->cmd, ToInternal(buffer).buffer, offset, drawCount, stride);
     }
-    void CmdDrawIndirect(Buffer& buffer, uint64_t offset, uint32_t drawCount, uint32_t stride) {
-        vkCmdDrawIndirect(GetFrame().cmd, ToInternal(buffer).buffer, offset, drawCount, stride);
+    
+    void Cmd::drawIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countBufferOffset, uint32_t drawCount, uint32_t stride) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        vkCmdDrawIndirectCount(cb->cmd, ToInternal(buffer).buffer, offset, ToInternal(countBuffer).buffer, countBufferOffset, drawCount, stride);
     }
-    void CmdDrawIndexedIndirect(Buffer& buffer, uint64_t offset, uint32_t drawCount, uint32_t stride) {
-        vkCmdDrawIndexedIndirect(GetFrame().cmd, ToInternal(buffer).buffer, offset, drawCount, stride);
+    
+    void Cmd::drawIndexedIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countBufferOffset, uint32_t drawCount, uint32_t stride) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        vkCmdDrawIndexedIndirectCount(cb->cmd, ToInternal(buffer).buffer, offset, ToInternal(countBuffer).buffer, countBufferOffset, drawCount, stride);
     }
-    void CmdDrawIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countBufferOffset, uint32_t drawCount, uint32_t stride) {
-        vkCmdDrawIndirectCount(GetFrame().cmd, ToInternal(buffer).buffer, offset, ToInternal(countBuffer).buffer, countBufferOffset, drawCount, stride);
-    }
-    void CmdDrawIndexedIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countBufferOffset, uint32_t drawCount, uint32_t stride) {
-        vkCmdDrawIndexedIndirectCount(GetFrame().cmd, ToInternal(buffer).buffer, offset, ToInternal(countBuffer).buffer, countBufferOffset, drawCount, stride);
-    }
-    int CmdBeginTimestamp(const char* name) {
+    
+    int Cmd::beginTimestamp(const char* name) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
         VkDebugUtilsLabelEXT label = {
             .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
             .pLabelName = name,
         };
         if(GetState().vkCmdBeginDebugUtilsLabelEXT) {
-            GetState().vkCmdBeginDebugUtilsLabelEXT(GetFrame().cmd, &label);
+            GetState().vkCmdBeginDebugUtilsLabelEXT(cb->cmd, &label);
         }
-        int id = GetFrame().AllocTimestamp(name);
-        vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, id * 2);
+        int id = cb->AllocTimestamp(name);
+        vkCmdWriteTimestamp(cb->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, cb->queryPool, id * 2);
         return id;
     }
-    void CmdEndTimestamp(int id) {
-        vkCmdWriteTimestamp(GetFrame().cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GetFrame().queryPool, id * 2 + 1);
+    
+    void Cmd::endTimestamp(int id) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        vkCmdWriteTimestamp(cb->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, cb->queryPool, id * 2 + 1);
         if(GetState().vkCmdEndDebugUtilsLabelEXT) {
-            GetState().vkCmdEndDebugUtilsLabelEXT(GetFrame().cmd);
+            GetState().vkCmdEndDebugUtilsLabelEXT(cb->cmd);
         }
+    }
+    
+    void Cmd::buildBLAS(const std::vector<BLAS>& blases, bool update) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        auto& S = GetState();
+        VkDeviceSize scratchSize = {0};
+        for (auto& blasRes : blases) {
+            scratchSize = std::max(scratchSize, ToInternal(blasRes).sizeInfo.buildScratchSize);
+        }
+
+        if(scratchSize == 0u)
+            return;
+
+        Buffer scratchBuffer = CreateBuffer({
+            .name = "BLAS Build Scratch Buffer",
+            .size = scratchSize,
+            .usage = BufferUsage::Storage,
+            .memoryType = MemoryType::GPU,
+        });
+
+        for (auto& blasRes : blases) {
+            Internal_BLAS& blas = ToInternal(blasRes);
+
+            EVK_ASSERT(update == false && blas.buildInfo.dstAccelerationStructure == VK_NULL_HANDLE, "BLAS is already built, did you meant to build with update == true?");
+
+            blas.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+            blas.buildInfo.scratchData = {ToInternal(scratchBuffer).deviceAddress};
+            blas.buildInfo.dstAccelerationStructure = blas.accel;
+            if (update) {
+                blas.buildInfo.srcAccelerationStructure = blas.accel;
+            }
+
+            auto range = blas.ranges.data();
+            S.vkCmdBuildAccelerationStructuresKHR(cb->cmd, 1, &blas.buildInfo, &range);
+            VkMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+            };
+            vkCmdPipelineBarrier(cb->cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+            VkAccelerationStructureDeviceAddressInfoKHR addressInfo = {
+                .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+                .accelerationStructure = blas.accel,
+            };
+            blas.accStructureDeviceAddress = S.vkGetAccelerationStructureDeviceAddressKHR(S.device, &addressInfo);
+
+            // Cleanup
+            blas.aabbsBuffer = {};
+            blas.indexBuffer = {};
+            blas.vertexBuffer = {};
+        }
+    }
+    
+    void Cmd::buildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        auto& S = GetState();
+        Internal_TLAS& res = ToInternal(tlas);
+
+        EVK_ASSERT(tlas, "Invalid TLAS.");
+        EVK_ASSERT(blasInstances.size() < res.instances.size(), "TLAS has been created with max of %llu BLAS count but now is being built with %llu BLAS count!",
+                    res.instances.size(), blasInstances.size());
+
+        for (int i = 0; i < blasInstances.size(); i++) {
+            const BLASInstance& blasInstance = blasInstances[i];
+            Internal_BLAS& internalBlas = ToInternal(blasInstance.blas);
+            EVK_ASSERT(internalBlas.accStructureDeviceAddress != 0u, "BLAS is not built");
+
+            VkTransformMatrixKHR transform{};
+            transform.matrix[0][0] = blasInstance.transform[0];
+            transform.matrix[0][1] = blasInstance.transform[1];
+            transform.matrix[0][2] = blasInstance.transform[2];
+            transform.matrix[0][3] = blasInstance.transform[3];
+            transform.matrix[1][0] = blasInstance.transform[4];
+            transform.matrix[1][1] = blasInstance.transform[5];
+            transform.matrix[1][2] = blasInstance.transform[6];
+            transform.matrix[1][3] = blasInstance.transform[7];
+            transform.matrix[2][0] = blasInstance.transform[8];
+            transform.matrix[2][1] = blasInstance.transform[9];
+            transform.matrix[2][2] = blasInstance.transform[10];
+            transform.matrix[2][3] = blasInstance.transform[11];
+
+            res.instances[i] = VkAccelerationStructureInstanceKHR{
+                .transform = transform,
+                .instanceCustomIndex = blasInstance.customId,
+                .mask = blasInstance.mask,
+                .instanceShaderBindingTableRecordOffset = 0,
+                .flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR,
+                .accelerationStructureReference = internalBlas.accStructureDeviceAddress,
+            };
+        }
+        WriteBuffer(res.instancesBuffer, res.instances.data(), blasInstances.size() * sizeof(VkAccelerationStructureInstanceKHR));
+
+        Buffer scratchBuffer = CreateBuffer({
+            .name = "TLAS Scratch",
+            .size = res.sizeInfo.buildScratchSize,
+            .usage = BufferUsage::Storage,
+            .memoryType = MemoryType::GPU,
+        });
+
+        res.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        res.buildInfo.srcAccelerationStructure = res.accel;
+        res.buildInfo.dstAccelerationStructure = res.accel;
+        res.buildInfo.scratchData.deviceAddress = ToInternal(scratchBuffer).deviceAddress;
+
+        VkAccelerationStructureBuildRangeInfoKHR buildOffsetInfo{static_cast<uint32_t>(blasInstances.size()), 0, 0, 0};
+        const VkAccelerationStructureBuildRangeInfoKHR* pBuildOffsetInfo = &buildOffsetInfo;
+
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        vkCmdPipelineBarrier(cb->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        S.vkCmdBuildAccelerationStructuresKHR(cb->cmd, 1, &res.buildInfo, &pBuildOffsetInfo);
+    }
+    
+    uint64_t Cmd::submit() {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        auto& S = GetState();
+        
+        CHECK_VK(vkEndCommandBuffer(cb->cmd));
+        
+        // Reset the fence before submitting
+        CHECK_VK(vkResetFences(S.device, 1, &cb->fence));
+        
+        VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submitInfo.waitSemaphoreCount = cb->doingPresent ? 1 : 0;
+        submitInfo.pWaitSemaphores = cb->doingPresent ? &cb->imageReadySemaphore : nullptr;
+        submitInfo.signalSemaphoreCount = cb->doingPresent ? 1 : 0;
+        submitInfo.pSignalSemaphores = cb->doingPresent ? &cb->cmdDoneSemaphore : nullptr;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &cb->cmd;
+        submitInfo.pWaitDstStageMask = &dstStage;
+        CHECK_VK(vkQueueSubmit(S.queue, 1, &submitInfo, cb->fence));
+        
+        if (cb->doingPresent) {
+            VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+            present.waitSemaphoreCount = 1;
+            present.pWaitSemaphores = &cb->cmdDoneSemaphore;
+            present.swapchainCount = 1;
+            present.pSwapchains = &S.swapchain;
+            present.pImageIndices = &S.swapchainIndex;
+            VkResult r = vkQueuePresentKHR(S.queue, &present);
+
+            if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+                RecreateSwapchain();
+            }
+        }
+        
+        cb->submissionIndex = S.nextSubmissionIndex++;
+        cb->submitted = true;
+        S.currentCmdData = nullptr;
+        
+        return cb->submissionIndex;
+    }
+
+    MemoryBudget GetMemoryBudget() {
+        static_assert(sizeof(MemoryBudget::Heap) == sizeof(VmaBudget));
+        static_assert(MemoryBudget::MAX_HEAPS == VK_MAX_MEMORY_HEAPS);
+        MemoryBudget budget = {};
+        vmaGetHeapBudgets(GetState().allocator, (VmaBudget*)&budget);
+        return budget;
     }
 
     BLAS CreateBLAS(const BLASDesc& desc) {
@@ -2075,193 +2319,5 @@ namespace evk {
         }
 
         return TLAS{res};
-    }
-
-    void CmdBuildBLAS(const std::vector<BLAS>& blases, bool update) {
-        auto& S = GetState();
-        VkDeviceSize batchSize = {0};
-        VkDeviceSize batchSizeLimit = {256'000'000};
-
-        VkDeviceSize scratchSize = {0};
-        for (auto& blasRes : blases) {
-            scratchSize = std::max(scratchSize, ToInternal(blasRes).sizeInfo.buildScratchSize);
-        }
-
-        if(scratchSize == 0u)
-            return;
-
-        // Ensure any prior transfer writes (e.g. CmdCopy into vertex/index buffers) are visible
-        // to the acceleration structure build stage.
-        {
-            VkMemoryBarrier2 barrier = {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                .dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                .dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR,
-            };
-            VkDependencyInfo dependency = {
-                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                .memoryBarrierCount = 1,
-                .pMemoryBarriers = &barrier,
-            };
-            vkCmdPipelineBarrier2(GetFrame().cmd, &dependency);
-        }
-
-        Buffer scratchBuffer = CreateBuffer({
-            .name = "BLAS Build Scratch Buffer",
-            .size = scratchSize + 256,
-            .usage = BufferUsage::Storage,
-            .memoryType = MemoryType::GPU,
-        });
-
-        std::vector<VkAccelerationStructureBuildGeometryInfoKHR> buildInfos = {};
-        std::vector<VkAccelerationStructureBuildRangeInfoKHR*> buildRanges = {};
-
-        int i = 0;
-        for (auto& blasRes : blases) {
-            Internal_BLAS& blas = ToInternal(blasRes);
-            batchSize += blas.sizeInfo.accelerationStructureSize;
-
-            blas.buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-            blas.buildInfo.dstAccelerationStructure = blas.accel;
-            blas.buildInfo.srcAccelerationStructure = VK_NULL_HANDLE;
-            blas.buildInfo.scratchData.deviceAddress = (ToInternal(scratchBuffer).deviceAddress + 255) & ~(255ULL);
-
-            buildInfos.push_back(blas.buildInfo);
-            buildRanges.push_back(blas.ranges.data());
-
-            auto range = blas.ranges.data();
-            S.vkCmdBuildAccelerationStructuresKHR(GetFrame().cmd, 1, &blas.buildInfo, &range);
-
-            // Serialize AS builds when reusing the same scratch buffer.
-            // The scratch buffer is not an acceleration structure resource, so we use a generic
-            // memory barrier in the AS build stage to cover scratch reads/writes.
-            {
-                VkMemoryBarrier2 barrier2 = {
-                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                    .srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                    .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
-                    .dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                    .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-                };
-                VkDependencyInfo dependency = {
-                    .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                    .memoryBarrierCount = 1,
-                    .pMemoryBarriers = &barrier2,
-                };
-                vkCmdPipelineBarrier2(GetFrame().cmd, &dependency);
-            }
-
-            VkAccelerationStructureDeviceAddressInfoKHR addressInfo = {
-                .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
-                .accelerationStructure = blas.accel,
-            };
-            blas.accStructureDeviceAddress = S.vkGetAccelerationStructureDeviceAddressKHR(S.device, &addressInfo);
-
-            // TODO: Compactation
-            // if (batchSize >= batchSizeLimit || i == blases.size() - 1) {
-            //    Sync();  // TODO: replace with SubmitSync()
-            //    buildInfos.clear();
-            //    buildRanges.clear();
-            //    batchSize = 0;
-            //}
-            i++;
-            // Cleanup not used resources
-            // TODO: if (desc.allowUpdate == false) {
-                blas.aabbsBuffer = {};
-                blas.indexBuffer = {};
-                blas.vertexBuffer = {};
-            //}
-        }
-    }
-    void CmdBuildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update) {
-        auto& S = GetState();
-        Internal_TLAS& res = ToInternal(tlas);
-
-        EVK_ASSERT(tlas, "Invalid TLAS.");
-        EVK_ASSERT(blasInstances.size() <= res.instances.size(), "TLAS has been created with max of %llu BLAS count but now is being built with %llu BLAS count!",
-                    res.instances.size(), blasInstances.size());
-
-        for (int i = 0; i < blasInstances.size(); i++) {
-            const BLASInstance& blasInstance = blasInstances[i];
-            Internal_BLAS& internalBlas = ToInternal(blasInstance.blas);
-            EVK_ASSERT(internalBlas.accStructureDeviceAddress != 0u, "BLAS is not built");
-
-            VkTransformMatrixKHR transform{};
-            transform.matrix[0][0] = blasInstance.transform[0];
-            transform.matrix[0][1] = blasInstance.transform[1];
-            transform.matrix[0][2] = blasInstance.transform[2];
-            transform.matrix[0][3] = blasInstance.transform[3];
-            transform.matrix[1][0] = blasInstance.transform[4];
-            transform.matrix[1][1] = blasInstance.transform[5];
-            transform.matrix[1][2] = blasInstance.transform[6];
-            transform.matrix[1][3] = blasInstance.transform[7];
-            transform.matrix[2][0] = blasInstance.transform[8];
-            transform.matrix[2][1] = blasInstance.transform[9];
-            transform.matrix[2][2] = blasInstance.transform[10];
-            transform.matrix[2][3] = blasInstance.transform[11];
-
-            res.instances[i] = VkAccelerationStructureInstanceKHR{
-                .transform = transform,
-                .instanceCustomIndex = blasInstance.customId,
-                .mask = blasInstance.mask,
-                .instanceShaderBindingTableRecordOffset = 0,
-                .flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR,
-                .accelerationStructureReference = internalBlas.accStructureDeviceAddress,
-            };
-        }
-        WriteBuffer(res.instancesBuffer, res.instances.data(), blasInstances.size() * sizeof(VkAccelerationStructureInstanceKHR));
-
-        Buffer scratchBuffer = CreateBuffer({
-            .name = "TLAS Scratch",
-            .size = res.sizeInfo.buildScratchSize + 256,
-            .usage = BufferUsage::Storage,
-            .memoryType = MemoryType::GPU,
-        });
-
-        // Update build information
-        res.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-        res.buildInfo.dstAccelerationStructure = res.accel;
-
-        if (update) {
-            EVK_ASSERT((res.buildInfo.flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0,
-                       "CmdBuildTLAS called with update=true but TLAS was not created with allowUpdate=true");
-            res.buildInfo.srcAccelerationStructure = res.accel;
-        } else {
-            // For full rebuilds the source must be null to avoid undefined
-            // behaviour on some drivers when rebuilding every frame.
-            res.buildInfo.srcAccelerationStructure = VK_NULL_HANDLE;
-        }
-
-        res.buildInfo.scratchData.deviceAddress = (ToInternal(scratchBuffer).deviceAddress + 255) & ~(255ULL);
-
-        // Build Offsets info: n instances
-        VkAccelerationStructureBuildRangeInfoKHR buildOffsetInfo{static_cast<uint32_t>(blasInstances.size()), 0, 0, 0};
-        const VkAccelerationStructureBuildRangeInfoKHR* pBuildOffsetInfo = &buildOffsetInfo;
-
-        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-        vkCmdPipelineBarrier(GetFrame().cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
-        // Build the TLAS
-        S.vkCmdBuildAccelerationStructuresKHR(GetFrame().cmd, 1, &res.buildInfo, &pBuildOffsetInfo);
-
-        // Make TLAS build writes visible before any subsequent shader ray queries/loads.
-        {
-            VkMemoryBarrier2 barrier2 = {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                .srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                .srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
-                .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                .dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR,
-            };
-            VkDependencyInfo dependency = {
-                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                .memoryBarrierCount = 1,
-                .pMemoryBarriers = &barrier2,
-            };
-            vkCmdPipelineBarrier2(GetFrame().cmd, &dependency);
-        }
     }
 }  // namespace evk
