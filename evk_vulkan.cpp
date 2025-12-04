@@ -1100,8 +1100,7 @@ namespace evk {
                     .memoryType = MemoryType::CPU_TO_GPU,
                 });
                 
-                cb.inUse = false;
-                cb.submitted = false;
+                cb.state = CmdState::Ready;
             }
         }
 
@@ -1127,7 +1126,7 @@ namespace evk {
         // Wait for all command buffers to complete
         std::vector<VkFence> fences;
         for (auto& cb : S.commandBuffers) {
-            if (cb.submitted) {
+            if (cb.state == CmdState::Submitted) {
                 fences.push_back(cb.fence);
             }
         }
@@ -1337,14 +1336,14 @@ namespace evk {
         auto& S = GetState();
         
         for (auto& cb : S.commandBuffers) {
-            if (cb.submitted) {
+            if (cb.state == CmdState::Submitted) {
                 VkResult result = vkGetFenceStatus(S.device, cb.fence);
                 if (result == VK_SUCCESS) {
                     // Read timestamps before marking as not submitted
                     ReadTimestampsFromCommandBuffer(cb);
                     
-                    cb.submitted = false;
-                    cb.inUse = false;
+                    EVK_ASSERT(cb.state == CmdState::Submitted, "Command buffer not submitted for cleanup");
+                    cb.state = CmdState::Ready;
                     
                     // Also clean up global pending deletions that were waiting on this submission
                     auto it = S.pendingDeletions.begin();
@@ -1370,7 +1369,7 @@ namespace evk {
         // Find a free command buffer
         CommandBufferData* cmdData = nullptr;
         for (auto& cb : S.commandBuffers) {
-            if (!cb.inUse && !cb.submitted) {
+            if (cb.state == CmdState::Ready) {
                 cmdData = &cb;
                 break;
             }
@@ -1378,8 +1377,8 @@ namespace evk {
         
         EVK_ASSERT(cmdData != nullptr, "No available command buffers! Wait for some to complete.");
         
-        cmdData->inUse = true;
-        cmdData->submitted = false;
+        EVK_ASSERT(cmdData->state == CmdState::Ready, "Command buffer not ready for begin");
+        cmdData->state = CmdState::InUse;
         cmdData->insideRenderPass = false;
         cmdData->doingPresent = false;
         cmdData->stagingOffset = 0;
@@ -1406,14 +1405,14 @@ namespace evk {
         auto& S = GetState();
         
         for (auto& cb : S.commandBuffers) {
-            if (cb.submissionIndex == submissionIndex && cb.submitted) {
+            if (cb.submissionIndex == submissionIndex && cb.state == CmdState::Submitted) {
                 VkResult result = vkGetFenceStatus(S.device, cb.fence);
-                if (result == VK_SUCCESS && cb.submitted) {
+                if (result == VK_SUCCESS && cb.state == CmdState::Submitted) {
                     // Command buffer completed - read timestamps and clean up
                     ReadTimestampsFromCommandBuffer(cb);
                     
-                    cb.submitted = false;
-                    cb.inUse = false;
+                    EVK_ASSERT(cb.state == CmdState::Submitted, "Command buffer not submitted for done");
+                    cb.state = CmdState::Ready;
                     
                     // Clean up global pending deletions
                     auto it = S.pendingDeletions.begin();
@@ -1439,14 +1438,14 @@ namespace evk {
         auto& S = GetState();
         
         for (auto& cb : S.commandBuffers) {
-            if (cb.submissionIndex == submissionIndex && cb.submitted) {
+            if (cb.submissionIndex == submissionIndex && cb.state == CmdState::Submitted) {
                 CHECK_VK(vkWaitForFences(S.device, 1, &cb.fence, VK_TRUE, UINT64_MAX));
                 
                 // Read timestamps before marking as not submitted
                 ReadTimestampsFromCommandBuffer(cb);
                 
-                cb.submitted = false;
-                cb.inUse = false;
+                EVK_ASSERT(cb.state == CmdState::Submitted, "Command buffer not submitted for wait");
+                cb.state = CmdState::Ready;
                 
                 // Also clean up global pending deletions
                 auto it = S.pendingDeletions.begin();
@@ -2087,7 +2086,8 @@ namespace evk {
         }
         
         cb->submissionIndex = S.nextSubmissionIndex++;
-        cb->submitted = true;
+        EVK_ASSERT(cb->state == CmdState::InUse, "Command buffer not in use for submit");
+        cb->state = CmdState::Submitted;
         S.currentCmdData = nullptr;
         
         return cb->submissionIndex;
