@@ -17,6 +17,8 @@ int main() {
         .enableSwapchain = false,
     });
 
+    main_llm();
+
     // Test the command buffer API
     {
         // Create a test buffer

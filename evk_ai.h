@@ -10,6 +10,14 @@
 #include <vector>
 #include <unordered_map>
 
+namespace evk::ai {
+    evk::Cmd& GetCmd();
+    uint64_t SubmitCmd(bool wait = true);
+    void BeginGraphRecording();
+    void EndGraphRecording(bool wait = true);
+    bool InGraphRecording();
+}
+
 struct float16_t {
     uint16_t value;
 
@@ -259,13 +267,15 @@ struct Tensor {
     // copies data from CPU to GPU
     void cpu_upload() {
         cpu();
-        evk::CmdCopy(cpu_buffer, buffer, shape.count() * sizeof(float16_t));
-        evk::Sync();
+        auto& cmd = evk::ai::GetCmd();
+        cmd.copy(cpu_buffer, buffer, shape.count() * sizeof(float16_t));
+        evk::ai::SubmitCmd(true);
     }
     void cpu_download() {
         cpu();
-        evk::CmdCopy(buffer, cpu_buffer, shape.count() * sizeof(float16_t));
-        evk::Sync();
+        auto& cmd = evk::ai::GetCmd();
+        cmd.copy(buffer, cpu_buffer, shape.count() * sizeof(float16_t));
+        evk::ai::SubmitCmd(true);
     }
     float16_t* cpu() {
         if(!cpu_buffer) {
@@ -589,12 +599,14 @@ struct Graph {
         
         out.forward_fn = [&a, &out]() {
             // Just copy the buffer - shapes are already set
-            evk::CmdCopy(a.buffer, out.buffer, a.shape.count() * sizeof(float16_t));
+            auto& cmd = evk::ai::GetCmd();
+            cmd.copy(a.buffer, out.buffer, a.shape.count() * sizeof(float16_t));
         };
         
         out.backward_fn = [&a, &out]() {
             // Gradient flows back unchanged (just reshape)
-            evk::CmdCopy(out.grad().buffer, a.grad().buffer, a.shape.count() * sizeof(float16_t));
+            auto& cmd = evk::ai::GetCmd();
+            cmd.copy(out.grad().buffer, a.grad().buffer, a.shape.count() * sizeof(float16_t));
         };
         
         return out;
@@ -697,7 +709,8 @@ struct Graph {
 
         out.forward_fn = [&a, &out, factor]() {
             // out = a * factor
-            evk::CmdCopy(a.buffer, out.buffer, a.shape.count() * sizeof(float16_t));
+            auto& cmd = evk::ai::GetCmd();
+            cmd.copy(a.buffer, out.buffer, a.shape.count() * sizeof(float16_t));
             evk::ai::scale(out, factor);
         };
 
@@ -833,7 +846,8 @@ struct Graph {
             evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, dummy_loss);
             
             // Copy flat gradient back to 3D logits gradient (same memory layout)
-            evk::CmdCopy(flat_grad.buffer, logits.grad().buffer, logits.shape.count() * sizeof(float16_t));
+            auto& cmd = evk::ai::GetCmd();
+            cmd.copy(flat_grad.buffer, logits.grad().buffer, logits.shape.count() * sizeof(float16_t));
         };
         return loss;
     }
@@ -923,6 +937,7 @@ struct Graph {
     // eval the graph
     // if backward is true, also run the backward pass
     void eval(bool backward = false) {
+        evk::ai::BeginGraphRecording();
         for(auto& node : nodes) {
             if (node->forward_fn) {
                 node->forward_fn();
@@ -936,7 +951,6 @@ struct Graph {
                     evk::ai::zero(node->grad());
                 }
             }
-            evk::Sync();
 
             // Run backward functions in reverse node order so intermediate
             // operators (e.g. matmul) can populate grads for parameters.
@@ -947,6 +961,7 @@ struct Graph {
                 }
             }
         }
+        evk::ai::EndGraphRecording(true);
     }
 
     // apply the gradient update using SGD

@@ -240,17 +240,18 @@ struct Transformer {
     }
     
     void copy_weights_to_inference() {
-        evk::CmdCopy(token_emb->buffer, inf_token_emb->buffer, token_emb->shape.count() * sizeof(float16_t));
-        evk::CmdCopy(pos_emb->buffer, inf_pos_emb->buffer, pos_emb->shape.count() * sizeof(float16_t));
-        evk::CmdCopy(w_out->buffer, inf_w_out->buffer, w_out->shape.count() * sizeof(float16_t));
+        auto& cmd = evk::ai::GetCmd();
+        cmd.copy(token_emb->buffer, inf_token_emb->buffer, token_emb->shape.count() * sizeof(float16_t));
+        cmd.copy(pos_emb->buffer, inf_pos_emb->buffer, pos_emb->shape.count() * sizeof(float16_t));
+        cmd.copy(w_out->buffer, inf_w_out->buffer, w_out->shape.count() * sizeof(float16_t));
         
         // Copy all attention block weights
         for (uint32_t i = 0; i < num_layers; ++i) {
-            evk::CmdCopy(blocks[i].w_q->buffer, inf_blocks[i].w_q->buffer, blocks[i].w_q->shape.count() * sizeof(float16_t));
-            evk::CmdCopy(blocks[i].w1->buffer, inf_blocks[i].w1->buffer, blocks[i].w1->shape.count() * sizeof(float16_t));
-            evk::CmdCopy(blocks[i].w2->buffer, inf_blocks[i].w2->buffer, blocks[i].w2->shape.count() * sizeof(float16_t));
+            cmd.copy(blocks[i].w_q->buffer, inf_blocks[i].w_q->buffer, blocks[i].w_q->shape.count() * sizeof(float16_t));
+            cmd.copy(blocks[i].w1->buffer, inf_blocks[i].w1->buffer, blocks[i].w1->shape.count() * sizeof(float16_t));
+            cmd.copy(blocks[i].w2->buffer, inf_blocks[i].w2->buffer, blocks[i].w2->shape.count() * sizeof(float16_t));
         }
-        evk::Sync();
+        evk::ai::SubmitCmd(true);
     }
     
     // Train on a single batch with raw token arrays
@@ -268,14 +269,12 @@ struct Transformer {
         targets->cpu_upload();
         
         model.eval(true);
-        evk::Sync();
         
         loss->cpu_download();
         float loss_val = float(loss->cpu()[0]);
 
         model.step_adam(learning_rate, 0.9f, 0.999f, 1e-4f);
         // model.step(-learning_rate*0.1f);
-        evk::Sync();
         
         return loss_val;
     }
@@ -304,7 +303,6 @@ struct Transformer {
             
             // Forward pass (no backward)
             inference.eval(false);
-            evk::Sync();
             
             // Get logits for the last position
             inf_logits->cpu_download();
@@ -533,6 +531,7 @@ void run_circle_detection(uint32_t num_layers);
 
 #include <chrono>
 void main_llm() {
+    evk::ai::initialize();
     printf("=== main_llm ===\n");
     // run_next_token_prediction_attention();  // Comment out for now
 
@@ -544,6 +543,7 @@ void main_llm() {
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
     printf("run_circle_detection() took %.4f seconds\n", duration.count());
+    evk::ai::shutdown();
 }
 
 // ============================================================================
@@ -956,7 +956,6 @@ struct CircleDetector {
         for (uint32_t out_pos = 0; out_pos < output_seq_len; ++out_pos) {
             transformer.inf_input->cpu_upload();
             transformer.inference.eval(false);
-            evk::Sync();
             
             transformer.inf_logits->cpu_download();
             float16_t* logits = transformer.inf_logits->cpu();
