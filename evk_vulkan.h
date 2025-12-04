@@ -31,21 +31,31 @@ namespace evk {
     const uint32_t TLAS_COUNT = 16384;
     
     const uint32_t PERF_QUERY_COUNT = 64;
+    const uint32_t MAX_COMMAND_BUFFERS = 4;
 
-    struct FrameData {
-        Image image;
+    // Forward declarations
+    struct CommandBufferData;
 
-        VkSemaphore imageReadySemaphore;
-
-        VkCommandPool pool;
-        VkCommandBuffer cmd;
-        VkSemaphore cmdDoneSemaphore;
-        bool doingPresent = false;
+    struct CommandBufferData {
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        uint64_t submissionIndex = 0;
+        bool inUse = false;
+        bool submitted = false;
         bool insideRenderPass = false;
-        VkFence fence;  // for the queue submit
+        bool doingPresent = false;
 
-        // performance queries
-        VkQueryPool queryPool;
+        // Semaphores for swapchain synchronization (when doingPresent is true)
+        VkSemaphore imageReadySemaphore = VK_NULL_HANDLE;  // Wait on this before rendering to swapchain
+        VkSemaphore cmdDoneSemaphore = VK_NULL_HANDLE;     // Signal this when done, present waits on it
+
+        // Staging buffer for this command buffer
+        Buffer stagingBuffer = {};
+        uint64_t stagingOffset = 0;
+
+        // Timestamp queries
+        VkQueryPool queryPool = VK_NULL_HANDLE;
         std::vector<const char*> timestampNames;
         std::vector<uint64_t> queries;
         std::vector<TimestampEntry> timestampEntries;
@@ -55,14 +65,6 @@ namespace evk {
             timestampNames.push_back(name);
             return id;
         }
-
-        Buffer stagingBuffer = {};
-        uint64_t stagingOffset = 0;
-
-        // deferred deletion
-        std::vector<Resource*> toDelete;
-
-        ~FrameData();
     };
 
     struct SlotAllocator {
@@ -106,15 +108,23 @@ namespace evk {
         SlotAllocator imageSlots = SlotAllocator(IMAGE_COUNT);
         SlotAllocator tlasSlots = SlotAllocator(TLAS_COUNT);
 
+        // Command buffer management (new API)
+        std::vector<CommandBufferData> commandBuffers;
+        uint64_t nextSubmissionIndex = 1;  // Start at 1 so 0 is invalid
+        Cmd currentCmd;  // Current command buffer being recorded
+        CommandBufferData* currentCmdData = nullptr;
+        
+        // Resources pending deletion (waiting for any command buffer to complete)
+        std::vector<std::pair<uint64_t, Resource*>> pendingDeletions;
+
+        // Last completed timestamps
+        std::vector<TimestampEntry> lastTimestamps;
+
         // Swapchain
         VkSurfaceKHR surface;
         VkSwapchainKHR swapchain;
         uint32_t swapchainIndex = 0;
-        uint32_t swapchainSemaphoreIndex = 0;
-
-        std::vector<FrameData> frames = {};
-        uint32_t frame = 0;
-        uint32_t frame_total = 0;
+        std::vector<Image> swapchainImages;  // Swapchain images
 
         // Raytracing
         PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR;
@@ -133,7 +143,6 @@ namespace evk {
         PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT;
     };
     State& GetState();
-    FrameData& GetFrame();
     void SetState(State* state);
 
 #define DEFINE_TO_INTERNAL(libClass) \
