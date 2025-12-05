@@ -61,16 +61,26 @@ void main() {
     barrier();
     float invValid = sharedInvValid;
 
-    // 1) Row-wise max for stability
+    // 1) Streaming max + sum
     float localMax = -3.402823466e+38; // -FLT_MAX
+    float localSum = 0.0;
     for (uint j = lid; j < vocabSize; j += gl_WorkGroupSize.x) {
         float v = float(logitsBuffer.x[rowStart + j]);
         v = clamp(v, -65000.0, 65000.0);
-        localMax = max(localMax, v);
+        float diff = v - localMax;
+        if (diff > 0.0) {
+            localSum = localSum * exp2(-diff * LOG2E) + 1.0;
+            localMax = v;
+        } else {
+            localSum += exp2(diff * LOG2E);
+        }
     }
+
     float subgroupMaxVal = subgroupMax(localMax);
+    float subgroupSum = subgroupAdd(localSum * exp2((localMax - subgroupMaxVal) * LOG2E));
     if (subgroupLane == 0) {
         sharedMax[subgroupId] = subgroupMaxVal;
+        sharedDenom[subgroupId] = subgroupSum;
     }
     barrier();
     if (subgroupId == 0 && subgroupLane == 0) {
@@ -79,38 +89,24 @@ void main() {
         for (uint s = 1; s < subgroupLimit; ++s) {
             rowMaxVal = max(rowMaxVal, sharedMax[s]);
         }
-        sharedMax[0] = rowMaxVal;
-    }
-    barrier();
-    float rowMax = sharedMax[0];
 
-    // 2) Sum of exp
-    float localSum = 0.0;
-    for (uint j = lid; j < vocabSize; j += gl_WorkGroupSize.x) {
-        float logit = float(logitsBuffer.x[rowStart + j]);
-        logit = clamp(logit, -65000.0, 65000.0);
-        localSum += exp2((logit - rowMax) * LOG2E);
-    }
-    float subgroupDenom = subgroupAdd(localSum);
-    if (subgroupLane == 0) {
-        sharedDenom[subgroupId] = subgroupDenom;
-    }
-    barrier();
-    if (subgroupId == 0 && subgroupLane == 0) {
         float denom = 0.0;
-        uint subgroupLimit = min(subgroupCount, MAX_SUBGROUPS);
         for (uint s = 0; s < subgroupLimit; ++s) {
-            denom += sharedDenom[s];
+            float m = sharedMax[s];
+            float sum = sharedDenom[s];
+            denom += sum * exp2((m - rowMaxVal) * LOG2E);
         }
+        sharedMax[0] = rowMaxVal;
         sharedDenom[0] = denom;
     }
     barrier();
+    float rowMax = sharedMax[0];
     float safeDenom = max(sharedDenom[0], 1e-20);
     float invDenom = 1.0 / safeDenom;
     float logDenom = log2(safeDenom) * LN2;
     float targetLogProb = 0.0;
 
-    // 3) Gradients
+    // 2) Gradients
     for (uint j = lid; j < vocabSize; j += gl_WorkGroupSize.x) {
         float logit = float(logitsBuffer.x[rowStart + j]);
         logit = clamp(logit, -65000.0, 65000.0);
