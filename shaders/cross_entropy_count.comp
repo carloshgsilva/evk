@@ -4,6 +4,8 @@
 #extension GL_EXT_shader_16bit_storage : enable
 #extension GL_EXT_buffer_reference : enable
 #extension GL_EXT_shader_atomic_float : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 layout(buffer_reference) buffer BufferU16 { uint16_t x[]; };
 layout(buffer_reference) buffer BufferFp32 { float x[]; };
@@ -15,15 +17,37 @@ PUSH(
     uint vocabSize;           // V
 )
 
-// Counts valid targets (target != 0 && target < vocabSize)
+const uint MAX_SUBGROUPS = 64;
+shared uint sharedCounts[MAX_SUBGROUPS];
+
+// Counts valid targets (target != 0 && target < vocabSize) with reduced atomics
 COMPUTE(256, 1, 1)
 void main() {
     uint gid = gl_GlobalInvocationID.x;
-    if (gid >= totalPositions) return;
 
-    uint t = uint(targetBuffer.x[gid]);
-    if (t != 0u && t < vocabSize) {
-        atomicAdd(accumBuffer.x[1], 1.0);
+    uint subgroupId = gl_SubgroupID;
+    uint subgroupLane = gl_SubgroupInvocationID;
+    uint subgroupCount = gl_NumSubgroups;
+
+    bool inRange = gid < totalPositions;
+    uint t = inRange ? uint(targetBuffer.x[gid]) : 0u;
+    uint localCount = (inRange && t != 0u && t < vocabSize) ? 1u : 0u;
+
+    uint subgroupTotal = subgroupAdd(localCount);
+    if (subgroupLane == 0) {
+        sharedCounts[subgroupId] = subgroupTotal;
+    }
+    barrier();
+
+    if (subgroupId == 0 && subgroupLane == 0) {
+        uint total = 0u;
+        uint limit = min(subgroupCount, MAX_SUBGROUPS);
+        for (uint s = 0u; s < limit; ++s) {
+            total += sharedCounts[s];
+        }
+        if (total > 0u) {
+            atomicAdd(accumBuffer.x[1], float(total));
+        }
     }
 }
 

@@ -97,8 +97,8 @@ void benchmark_matmul_broadcast() {
 void benchmark_cross_entropy_loss() {
     printf("benchmark_cross_entropy_loss()\n");
     const uint32_t BATCH = 8u;
-    const uint32_t SEQ = 256u;
-    const uint32_t VOCAB = 4096u;
+    const uint32_t SEQ = 1024u;
+    const uint32_t VOCAB = 4096u*4u;
     const uint32_t POSITIONS = BATCH * SEQ;
 
     Tensor* logits = new Tensor({POSITIONS, VOCAB});
@@ -126,7 +126,7 @@ void benchmark_cross_entropy_loss() {
 
     float min_ms = 1e9f;
     for (int it = 0; it < 16; ++it) {
-        const uint32_t subIter = 1;
+        const uint32_t subIter = 16;
         auto& cmd = evk::ai::GetCmd();
         for (uint32_t i = 0; i < subIter; ++i) {
             cmd.timestamp("cross_entropy_loss", [&]() {
