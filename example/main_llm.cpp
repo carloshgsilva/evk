@@ -1026,7 +1026,7 @@ void run_circle_detection(uint32_t num_layers) {
     
     // Hyperparameters - optimized for 2-circle detection
     constexpr uint32_t N_POINTS = 32;       // Points sampled from circles
-    constexpr uint32_t N_MAX_PRIMS = 2;     // Detect up to 2 circles
+    constexpr uint32_t N_MAX_PRIMS = 3;     // Detect up to 2 circles
     constexpr uint32_t GRID_SIZE = 64;      // Discrete coordinate space
     constexpr uint32_t EMBED_DIM = 128;     // Embedding dimension
     constexpr uint32_t HIDDEN_DIM = 256;    // FFN hidden dimension
@@ -1047,12 +1047,12 @@ void run_circle_detection(uint32_t num_layers) {
            detector.input_seq_len, detector.output_seq_len, detector.total_seq_len);
     
     // Training hyperparameters
-    const int EPOCHS = 1000;
+    const int EPOCHS = 3000;
     const float LR = 0.0180f;
     const int WARMUP_EPOCHS = 30;
     const float MIN_LR_SCALE = 0.05f;
     const int CURRICULUM_SINGLE_EPOCHS = 40;
-    const int LOG_INTERVAL = 25;
+    const int LOG_INTERVAL = 100;
     
     printf("  Training for %d epochs with LR=%.4f, warmup=%d (1-circle warmup for %d epochs)...\n",
            EPOCHS, LR, WARMUP_EPOCHS, CURRICULUM_SINGLE_EPOCHS);

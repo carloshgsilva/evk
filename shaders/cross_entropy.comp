@@ -92,6 +92,14 @@ void main() {
         }
     }
     
+    // Scale gradients by mean over valid positions to match loss definition
+    float invValid = (validPositions > 0u) ? (1.0 / float(validPositions)) : 0.0;
+    uint totalElems = totalPositions * vocabSize;
+    for (uint idx = lid; idx < totalElems; idx += 32) {
+        float g = float(gradBuffer.x[idx]) * invValid;
+        gradBuffer.x[idx] = float16_t(g);
+    }
+    
     // Store mean loss (over valid positions only)
     if (lid == 0) {
         float loss = (validPositions > 0) ? (totalLoss / float(validPositions)) : 0.0;
