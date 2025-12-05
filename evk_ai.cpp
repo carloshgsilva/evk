@@ -11,7 +11,7 @@ namespace evk::ai {
     }
 
     uint64_t SubmitCmd(bool wait) {
-        if (!g_cmd) return 0;
+        assert(g_cmd);
         uint64_t idx = g_cmd->submit();
         g_cmd = nullptr;
         if (wait) {
@@ -160,7 +160,7 @@ namespace evk::ai {
         auto& cmd = evk::ai::GetCmd();
         cmd.copy(zero_buf, m_buffer, size);
         cmd.copy(zero_buf, v_buffer, size);
-        evk::CmdWait(cmd.submit());
+        evk::ai::SubmitCmd(true);
         t = 0;
     }
 
