@@ -26,6 +26,7 @@ const uint MAX_SUBGROUPS = 64;
 shared float sharedMax[MAX_SUBGROUPS];
 shared float sharedDenom[MAX_SUBGROUPS];
 shared float sharedTarget[MAX_SUBGROUPS];
+shared float sharedInvValid;
 
 const float LOG2E = 1.4426950408889634;
 const float LN2 = 0.6931471805599453;
@@ -51,6 +52,14 @@ void main() {
         }
         return;
     }
+
+    // Broadcast global scale factor (1 / validCount) for this dispatch
+    if (lid == 0) {
+        float count = accumBuffer.x[1];
+        sharedInvValid = (count > 0.0) ? (1.0 / count) : 0.0;
+    }
+    barrier();
+    float invValid = sharedInvValid;
 
     // 1) Row-wise max for stability
     float localMax = -3.402823466e+38; // -FLT_MAX
@@ -107,9 +116,9 @@ void main() {
         logit = clamp(logit, -65000.0, 65000.0);
         float softmax_val = exp2((logit - rowMax) * LOG2E) * invDenom;
 
-        float grad = isValidTarget ? softmax_val : 0.0;
+        float grad = isValidTarget ? (softmax_val * invValid) : 0.0;
         if (isValidTarget && j == targetIdx) {
-            grad -= 1.0;
+            grad -= invValid;
             targetLogProb = logit - rowMax - logDenom;
         }
         gradBuffer.x[rowStart + j] = float16_t(grad);
@@ -132,10 +141,7 @@ void main() {
     barrier();
 
     // 4) Accumulate totals using atomics
-    if (isValidTarget) {
-        if (lid == 0) {
-            atomicAdd(accumBuffer.x[0], -sharedTarget[0]); // total loss
-            atomicAdd(accumBuffer.x[1], 1.0);            // valid count
-        }
+    if (isValidTarget && lid == 0) {
+        atomicAdd(accumBuffer.x[0], -sharedTarget[0]); // total loss (unscaled)
     }
 }
