@@ -242,6 +242,7 @@ struct Tensor {
     std::function<void()> forward_fn;
     std::function<void()> backward_fn;
 
+    Tensor() = default;
     Tensor(const Shape& shape) {
         this->shape = shape;
         // compute total size as product of first `count` dimensions
@@ -250,6 +251,13 @@ struct Tensor {
             .size = s,
             .usage = evk::BufferUsage::Storage,
         });
+    }
+
+    static Tensor alias(const Shape& shape, const evk::Buffer& existing_buffer) {
+        Tensor t;
+        t.shape = shape;
+        t.buffer = existing_buffer;
+        return t;
     }
 
     // get the grad tensor
@@ -262,17 +270,21 @@ struct Tensor {
     }
 
     // copies data from CPU to GPU
-    void cpu_upload() {
+    void cpu_upload(bool submit = true) {
         cpu();
         auto& cmd = evk::ai::GetCmd();
         cmd.copy(cpu_buffer, buffer, shape.count() * sizeof(float16_t));
-        evk::ai::SubmitCmd(true);
+        if (submit) {
+            evk::ai::SubmitCmd(true);
+        }
     }
-    void cpu_download() {
+    void cpu_download(bool submit = true) {
         cpu();
         auto& cmd = evk::ai::GetCmd();
         cmd.copy(buffer, cpu_buffer, shape.count() * sizeof(float16_t));
-        evk::ai::SubmitCmd(true);
+        if (submit) {
+            evk::ai::SubmitCmd(true);
+        }
     }
     float16_t* cpu() {
         if(!cpu_buffer) {
@@ -576,6 +588,15 @@ struct Graph {
     // Some operations need a reusable temp/scratch buffer
     std::unique_ptr<Tensor> scratch;
 
+    Tensor& get_scratch(const Shape& shape) {
+        if (!scratch || scratch->shape.count() < shape.count()) {
+            scratch = std::make_unique<Tensor>(shape);
+        } else {
+            scratch->shape = shape;
+        }
+        return *scratch;
+    }
+
     Tensor& tensor(Shape shape, bool param = false) {
         nodes.push_back(std::make_unique<Tensor>(shape));
         Tensor& tensor = *nodes.back();
@@ -631,7 +652,7 @@ struct Graph {
         c.forward_fn = [&a, &b, &c, tile_m, tile_n]() {
             evk::ai::matmul(a, b, c, false, false, false, tile_m, tile_n);
         };
-        c.backward_fn = [&a, &b, &c, tile_m, tile_n]() {
+        c.backward_fn = [this, &a, &b, &c, tile_m, tile_n]() {
             // grad_a = grad_c @ b^T
             // For 3D @ 2D broadcast case: grad_c is (B,M,N), b is (K,N), grad_a is (B,M,K)
             evk::ai::matmul(c.grad(), b, a.grad(), false, true, true, tile_m, tile_n);
@@ -644,7 +665,7 @@ struct Graph {
                 uint32_t B = a.shape[0];
                 uint32_t K = a.shape[2];
                 uint32_t N = b.shape[1];
-                Tensor temp_grad({B, K, N});
+                Tensor& temp_grad = get_scratch(Shape({B, K, N}));
                 evk::ai::matmul(a, c.grad(), temp_grad, true, false, false, tile_m, tile_n);
                 
                 // Sum across batch dimension on GPU
@@ -823,20 +844,16 @@ struct Graph {
         loss.forward_fn = [&logits, &targets, &loss, &flat_grad, B, N, V]() {
             // Directly use logits buffer aliased as flat (B*N, V)
             // Directly use targets buffer aliased as flat (B*N)
-            Tensor flat_logits({B * N, V});
-            flat_logits.buffer = logits.buffer;  // Alias, no copy
-            Tensor flat_targets({B * N});
-            flat_targets.buffer = targets.buffer;  // Alias, no copy
+            Tensor flat_logits = Tensor::alias(Shape({B * N, V}), logits.buffer);
+            Tensor flat_targets = Tensor::alias(Shape({B * N}), targets.buffer);
             
             // Compute loss and gradient into flat_grad
             evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, loss);
         };
         loss.backward_fn = [&logits, &targets, &loss, &flat_grad, B, N, V]() {
             // Re-compute gradient (since eval() zeroes gradients before backward)
-            Tensor flat_logits({B * N, V});
-            flat_logits.buffer = logits.buffer;  // Alias, no copy
-            Tensor flat_targets({B * N});
-            flat_targets.buffer = targets.buffer;  // Alias, no copy
+            Tensor flat_logits = Tensor::alias(Shape({B * N, V}), logits.buffer);
+            Tensor flat_targets = Tensor::alias(Shape({B * N}), targets.buffer);
             Tensor dummy_loss({1});
             
             // Compute gradient into flat_grad, then copy to logits.grad()
@@ -933,7 +950,8 @@ struct Graph {
 
     // eval the graph
     // if backward is true, also run the backward pass
-    void eval(bool backward = false) {
+    // submit/wait control command buffer submission for batching
+    void eval(bool backward = false, bool submit = true, bool wait = true) {
         evk::ai::GetCmd();
         for(auto& node : nodes) {
             if (node->forward_fn) {
@@ -958,7 +976,9 @@ struct Graph {
                 }
             }
         }
-        evk::ai::SubmitCmd(true);
+        if (submit) {
+            evk::ai::SubmitCmd(wait);
+        }
     }
 
     // apply the gradient update using SGD

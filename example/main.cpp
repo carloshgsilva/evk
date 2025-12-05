@@ -20,9 +20,9 @@ int main() {
     });
     evk::ai::initialize();
 
-    test_cross_entropy_loss();
+    // test_cross_entropy_loss();
     // bench();
-    // main_llm();
+    main_llm();
 
     // Test the command buffer API
     {
