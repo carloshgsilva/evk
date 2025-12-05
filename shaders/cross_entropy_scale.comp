@@ -1,0 +1,39 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+layout(buffer_reference) buffer BufferFp32 { float x[]; };
+
+PUSH(
+    BufferFp16 gradBuffer;   // (totalPositions, vocabSize)
+    BufferFp16 resultBuffer; // scalar loss output
+    BufferFp32 accumBuffer;  // float[2] -> {totalLoss, validCount}
+    uint totalElements;      // totalPositions * vocabSize
+)
+
+// Scale gradients by mean over valid positions and write mean loss
+COMPUTE(256, 1, 1)
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    float totalLoss = accumBuffer.x[0];
+    float validCount = accumBuffer.x[1];
+    float invValid = (validCount > 0.0) ? (1.0 / validCount) : 0.0;
+
+    if (gid < totalElements) {
+        float g = float(gradBuffer.x[gid]) * invValid;
+        gradBuffer.x[gid] = float16_t(g);
+    }
+
+    if (gid == 0) {
+        float loss = (validCount > 0.0) ? (totalLoss * invValid) : 0.0;
+        if (isnan(loss) || isinf(loss)) {
+            loss = 0.0;
+        }
+        resultBuffer.x[0] = float16_t(loss);
+    }
+}
+

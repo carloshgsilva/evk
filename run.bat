@@ -9,8 +9,8 @@ if errorlevel 1 (
 )
 
 REM Compile each shader
-for %%s in (matmul mse_loss sgd adam add softmax softmax_bwd cross_entropy transpose flash_attention flash_attention_bwd embed embed_bwd position_add position_add_bwd causal_mask relu relu_bwd scale zero sum_batch rms_norm rms_norm_bwd) do (
-    glslc shaders/%%s.comp -std=460 --target-env=vulkan1.3 -o shaders/bin/%%s.comp.spv
+for %%f in (shaders\*.comp) do (
+    glslc "%%f" -std=460 --target-env=vulkan1.3 -o "shaders/bin/%%~nf.comp.spv"
     if errorlevel 1 (
         exit /b 1
     )

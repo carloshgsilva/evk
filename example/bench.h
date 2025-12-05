@@ -96,7 +96,67 @@ void benchmark_matmul_broadcast() {
     delete c;
 }
 
+void benchmark_cross_entropy_loss() {
+    printf("benchmark_cross_entropy_loss()\n");
+    const uint32_t BATCH = 8u;
+    const uint32_t SEQ = 256u;
+    const uint32_t VOCAB = 4096u;
+    const uint32_t POSITIONS = BATCH * SEQ;
+
+    Tensor* logits = new Tensor({POSITIONS, VOCAB});
+    Tensor* targets = new Tensor({POSITIONS});
+    Tensor* grad = new Tensor({POSITIONS, VOCAB});
+    Tensor* loss = new Tensor({1});
+
+    logits->random();
+
+    float16_t* target_data = targets->cpu();
+    for (uint32_t i = 0; i < POSITIONS; ++i) {
+        uint16_t idx = uint16_t((i % (VOCAB - 1)) + 1);
+        if ((i % 13u) == 0u) {
+            idx = 0;
+        }
+        target_data[i].value = idx;
+    }
+    targets->cpu_upload();
+
+    evk::ai::BeginGraphRecording();
+    for (uint32_t i = 0; i < 4; ++i) {
+        evk::ai::cross_entropy_loss(*logits, *targets, *grad, *loss);
+    }
+    evk::ai::EndGraphRecording(true);
+
+    float min_ms = 1e9f;
+    for (int it = 0; it < 16; ++it) {
+        const uint32_t subIter = 1;
+        evk::ai::BeginGraphRecording();
+        auto& cmd = evk::ai::GetCmd();
+        for (uint32_t i = 0; i < subIter; ++i) {
+            cmd.timestamp("cross_entropy_loss", [&]() {
+                evk::ai::cross_entropy_loss(*logits, *targets, *grad, *loss);
+            });
+        }
+
+        evk::ai::EndGraphRecording(true);
+        for(const auto& ts: evk::CmdTimestamps()) {
+            min_ms = fminf(min_ms, float(ts.end - ts.start));
+        }
+    }
+
+    float positions_per_s = float(POSITIONS) / (min_ms / 1000.0f);
+    float logits_per_s = float(POSITIONS) * float(VOCAB) / (min_ms / 1000.0f);
+    printf("cross_entropy_loss: %5.3fms (%7.3f Mpos/s, %7.3f Glogits/s)",
+           min_ms, positions_per_s / 1e6f, logits_per_s / 1e9f);
+    printf(" BATCH = %d, SEQ = %d, VOCAB = %d\n", BATCH, SEQ, VOCAB);
+
+    delete logits;
+    delete targets;
+    delete grad;
+    delete loss;
+}
+
 void bench() {
-    benchmark_matmul();
+    // benchmark_matmul();
     // benchmark_matmul_broadcast();
+    benchmark_cross_entropy_loss();
 }
