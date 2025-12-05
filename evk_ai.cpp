@@ -173,7 +173,7 @@ namespace evk::ai {
         auto& cmd = evk::ai::GetCmd();
         cmd.copy(zero_buf, m_buffer, size);
         cmd.copy(zero_buf, v_buffer, size);
-        evk::ai::SubmitCmd(true);
+        evk::CmdWait(cmd.submit());
         t = 0;
     }
 
@@ -360,9 +360,6 @@ namespace evk::ai {
         }));
         cmd.dispatch(tilesCols, tilesRows, batch);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void flash_attention(Tensor& q, Tensor& k, Tensor& v, Tensor& o) {
@@ -418,9 +415,6 @@ namespace evk::ai {
         uint32_t groupZ = B * H;
         cmd.dispatch(groupX, groupY, groupZ);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void flash_attention_bwd(Tensor& q, Tensor& k, Tensor& v, Tensor& o, Tensor& dO, Tensor& dQ, Tensor& dK, Tensor& dV, uint32_t heads) {
@@ -524,9 +518,6 @@ namespace evk::ai {
             cmd.dispatch(1u, tilesJ, B);
         }
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void mse_loss(Tensor& predicted, Tensor& target, Tensor& predGrad, Tensor& result) {
@@ -551,9 +542,6 @@ namespace evk::ai {
 
         cmd.dispatch(1, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void sgd(Tensor& param, Tensor& gradient, float learning_rate) {
@@ -576,9 +564,6 @@ namespace evk::ai {
         const uint32_t WORKGROUP_SIZE = 256u;
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void adam(Tensor& param, Tensor& gradient, AdamState& state,
@@ -626,9 +611,6 @@ namespace evk::ai {
         const uint32_t WORKGROUP_SIZE = 256u;
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void add(Tensor& a, Tensor& b, Tensor& c) {
@@ -654,9 +636,6 @@ namespace evk::ai {
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void softmax(Tensor& in, Tensor& out) {
@@ -678,9 +657,6 @@ namespace evk::ai {
         });
         cmd.dispatch(outerCount, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void softmax_backward(Tensor& probs, Tensor& grad_out, Tensor& grad_in, float scale_factor) {
@@ -702,9 +678,6 @@ namespace evk::ai {
         });
         cmd.dispatch(outerCount, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void relu(Tensor& in, Tensor& out) {
@@ -727,9 +700,6 @@ namespace evk::ai {
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void relu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in) {
@@ -751,9 +721,6 @@ namespace evk::ai {
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void cross_entropy_loss(Tensor& logits, Tensor& targets, Tensor& grad, Tensor& result) {
@@ -831,9 +798,6 @@ namespace evk::ai {
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void embed_backward(Tensor& grad_out, Tensor& indices, Tensor& grad_embeddings) {
@@ -857,9 +821,6 @@ namespace evk::ai {
         // Dispatch one workgroup per embedding dimension (sequential over indices to avoid races)
         cmd.dispatch(embed_dim, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     void apply_causal_mask(Tensor& scores) {
@@ -882,9 +843,6 @@ namespace evk::ai {
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     // Position embedding addition: out = input + pos_emb (broadcast across batch)
@@ -907,9 +865,6 @@ namespace evk::ai {
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     // Position embedding backward
@@ -949,9 +904,6 @@ namespace evk::ai {
         groupsX = (posElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     // In-place scale: buffer *= scale
@@ -970,9 +922,6 @@ namespace evk::ai {
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     // Zero out a tensor on GPU
@@ -990,9 +939,6 @@ namespace evk::ai {
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     // Sum across batch dimension: out[i] += sum_b(input[b, i])
@@ -1010,9 +956,6 @@ namespace evk::ai {
         uint32_t groupsX = (size_per_batch + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     // RMS Normalization forward: out = input / sqrt(mean(input^2) + eps)
@@ -1039,9 +982,6 @@ namespace evk::ai {
         // One workgroup per row
         cmd.dispatch(outerCount, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 
     // RMS Normalization backward
@@ -1068,9 +1008,6 @@ namespace evk::ai {
         // One workgroup per row
         cmd.dispatch(outerCount, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
     }
 }
 
