@@ -2,6 +2,7 @@
 
 #include "win_dbg.h"
 #include "evk.h"
+#include "tests.h"
 #include "bench.h"
 
 void main_llm();
@@ -19,7 +20,8 @@ int main() {
     });
     evk::ai::initialize();
 
-    bench();
+    test_cross_entropy_loss();
+    // bench();
     // main_llm();
 
     // Test the command buffer API
