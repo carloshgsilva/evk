@@ -3,99 +3,6 @@
 
 #define TEST(expr) if((expr)) { printf(" TEST(" #expr ") [PASS]\n"); } else { printf(" TEST(" #expr ") [FAIL] [%s:%d]\n", __FILE__, __LINE__); exit(1); }
 
-void benchmark_matmul() {
-    printf("benchmark_matmul()\n");
-    const uint32_t SIZE = 4096u;
-    for (uint32_t tile_m = 48; tile_m <= 224; tile_m += 16) {
-        for (uint32_t tile_n = 48; tile_n <= 224; tile_n += 16) {
-            if(tile_m != 96 || tile_n != 96) {
-                continue;
-            }
-            const uint32_t M = ((SIZE + tile_m - 1) / tile_m) * tile_m;
-            const uint32_t N = ((SIZE + tile_n - 1) / tile_n) * tile_n;
-            if(tile_m * tile_n >= 80*144){
-                continue;
-            }
-            Tensor* a = new Tensor({M, SIZE});
-            Tensor* b = new Tensor({SIZE, N});
-            Tensor* c = new Tensor({M, N});
-        
-            a->identity(2.0f);
-            b->identity(3.0f);
-        
-            // warm up
-            for (uint32_t i = 0; i < 4; ++i) {
-                evk::ai::matmul(*a, *b, *c, false, false, false, tile_m, tile_n);
-            }
-
-            float min_ms = 1e9f;
-            for(int it = 0; it < 16; ++it) {
-                const uint32_t subIter = 32;
-                for (uint32_t i = 0; i < subIter; ++i) {
-                    evk::CmdTimestamp("matmul", [&]() {
-                        evk::ai::matmul(*a, *b, *c, false, false, false, tile_m, tile_n);
-                    });
-                }
-                
-                evk::Sync();
-                for(auto ts: evk::GetTimestamps()) {
-                    min_ms = fminf(min_ms, float(ts.end - ts.start));
-                }
-            }
-            float tflops = float(2 * uint64_t(M) * uint64_t(N) * uint64_t(M)) / (min_ms / 1000.0f) / 1e12f;
-            printf("matmul: %5.3fms (%7.3ftflops)", min_ms, tflops);
-            printf(" M = %d, N = %d, tile_m = %d, tile_n = %d\n", M, N, tile_m, tile_n);
-
-            delete a;
-            delete b;
-            delete c;
-            evk::Sync();
-        }
-    }
-}
-
-void benchmark_matmul_broadcast() {
-    printf("benchmark_matmul_broadcast()\n");
-    const uint32_t BATCH = 32u;
-    const uint32_t SIZE = 2048u;
-    const uint32_t TILE = 64u;
-    Tensor* a = new Tensor({BATCH, SIZE, SIZE});
-    Tensor* b = new Tensor({SIZE, SIZE});
-    Tensor* c = new Tensor({BATCH, SIZE, SIZE});
-
-    a->identity(2.0f);
-    b->identity(3.0f);
-
-    // warm up
-    for (uint32_t i = 0; i < 4; ++i) {
-        evk::ai::matmul(*a, *b, *c, false, false, false, TILE, TILE);
-    }
-
-    float min_ms = 1e9f;
-    for(int it = 0; it < 16; ++it) {
-        const uint32_t subIter = 16;
-        for (uint32_t i = 0; i < subIter; ++i) {
-            evk::CmdTimestamp("matmul_broadcast", [&]() {
-                evk::ai::matmul(*a, *b, *c, false, false, false, TILE, TILE);
-            });
-        }
-        
-        evk::Sync();
-        for(auto ts: evk::GetTimestamps()) {
-            min_ms = fminf(min_ms, float(ts.end - ts.start));
-        }
-    }
-    float tflops = float(2 * uint64_t(BATCH) * uint64_t(SIZE) * uint64_t(SIZE) * uint64_t(SIZE)) / (min_ms / 1000.0f) / 1e12f;
-    printf("matmul_batched: %5.3fms (%7.3ftflops)", min_ms, tflops);
-    printf(" BATCH = %d, SIZE = %d\n", BATCH, SIZE);
-
-    delete a;
-    delete b;
-    delete c;
-    evk::Sync();
-}
-
-
 void test_add() {
     printf("test_add()\n");
     Tensor a({4});
@@ -218,6 +125,142 @@ void test_mse_loss() {
     TEST(grad_cpu[0] == float16_t(0.0f));
     TEST(grad_cpu[1] == float16_t(0.0f));
     TEST(grad_cpu[2] == float16_t(1.0f));
+}
+
+void test_cross_entropy_loss() {
+    printf("test_cross_entropy_loss()\n");
+
+    const uint32_t POSITIONS = 3;
+    const uint32_t VOCAB = 4;
+
+    Tensor logits({POSITIONS, VOCAB});
+    Tensor targets({POSITIONS});
+    Tensor grad({POSITIONS, VOCAB});
+    Tensor loss({1});
+
+    float host_logits[POSITIONS][VOCAB] = {
+        {0.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 2.0f, 0.0f},
+        {1.0f, -1.0f, 0.5f, 0.0f}, // ignored row
+    };
+    uint16_t host_targets[POSITIONS] = {1u, 3u, 0u}; // last target is IGNORE
+
+    float16_t* lp = logits.cpu();
+    for (uint32_t i = 0; i < POSITIONS; ++i) {
+        for (uint32_t j = 0; j < VOCAB; ++j) {
+            lp[i * VOCAB + j] = float16_t(host_logits[i][j]);
+        }
+    }
+    float16_t* tp = targets.cpu();
+    for (uint32_t i = 0; i < POSITIONS; ++i) {
+        tp[i].value = host_targets[i];
+    }
+    logits.cpu_upload();
+    targets.cpu_upload();
+
+    evk::ai::cross_entropy_loss(logits, targets, grad, loss);
+
+    grad.cpu_download();
+    loss.cpu_download();
+
+    float expected_grad[POSITIONS][VOCAB] = {};
+    float total_loss = 0.0f;
+    uint32_t valid = 0;
+    for (uint32_t row = 0; row < POSITIONS; ++row) {
+        uint16_t t = host_targets[row];
+        if (t == 0u || t >= VOCAB) {
+            continue;
+        }
+        ++valid;
+        float row_max = host_logits[row][0];
+        for (uint32_t j = 1; j < VOCAB; ++j) {
+            row_max = (std::max)(row_max, host_logits[row][j]);
+        }
+        float denom = 0.0f;
+        for (uint32_t j = 0; j < VOCAB; ++j) {
+            denom += std::exp(host_logits[row][j] - row_max);
+        }
+        float log_denom = std::log(denom);
+        for (uint32_t j = 0; j < VOCAB; ++j) {
+            float prob = std::exp(host_logits[row][j] - row_max) / denom;
+            float g = prob;
+            if (j == t) {
+                g -= 1.0f;
+                total_loss += -(host_logits[row][j] - row_max - log_denom);
+            }
+            expected_grad[row][j] = g;
+        }
+    }
+
+    float inv_valid = (valid > 0) ? (1.0f / float(valid)) : 0.0f;
+    for (uint32_t i = 0; i < POSITIONS; ++i) {
+        for (uint32_t j = 0; j < VOCAB; ++j) {
+            expected_grad[i][j] *= inv_valid;
+        }
+    }
+    float expected_loss = total_loss * inv_valid;
+
+    const float loss_tol = 5e-3f;
+    const float grad_tol = 1e-2f;
+
+    float got_loss = float(loss.cpu()[0]);
+    bool loss_ok = std::abs(got_loss - expected_loss) < loss_tol;
+
+    float16_t* gp = grad.cpu();
+    bool grad_ok = true;
+    for (uint32_t i = 0; i < POSITIONS && grad_ok; ++i) {
+        for (uint32_t j = 0; j < VOCAB; ++j) {
+            float g = float(gp[i * VOCAB + j]);
+            if (std::abs(g - expected_grad[i][j]) > grad_tol) {
+                grad_ok = false;
+                break;
+            }
+        }
+    }
+
+    TEST(loss_ok);
+    TEST(grad_ok);
+
+    // All positions ignored -> zero loss and zero gradients
+    {
+        const uint32_t POS2 = 2;
+        const uint32_t VOCAB2 = 3;
+        Tensor logits2({POS2, VOCAB2});
+        Tensor targets2({POS2});
+        Tensor grad2({POS2, VOCAB2});
+        Tensor loss2({1});
+
+        float16_t* l2 = logits2.cpu();
+        for (uint32_t i = 0; i < POS2 * VOCAB2; ++i) {
+            l2[i] = float16_t(0.1f * float(i));
+        }
+        float16_t* t2 = targets2.cpu();
+        for (uint32_t i = 0; i < POS2; ++i) {
+            t2[i].value = 0u;
+        }
+        logits2.cpu_upload();
+        targets2.cpu_upload();
+
+        evk::ai::cross_entropy_loss(logits2, targets2, grad2, loss2);
+
+        grad2.cpu_download();
+        loss2.cpu_download();
+
+        float loss_zero = float(loss2.cpu()[0]);
+        bool loss_zero_ok = std::abs(loss_zero) < 1e-6f;
+
+        float16_t* g2 = grad2.cpu();
+        bool grad_zero_ok = true;
+        for (uint32_t i = 0; i < POS2 * VOCAB2; ++i) {
+            if (std::abs(float(g2[i])) > 1e-6f) {
+                grad_zero_ok = false;
+                break;
+            }
+        }
+
+        TEST(loss_zero_ok);
+        TEST(grad_zero_ok);
+    }
 }
 
 void test_flash_attention_backward() {
@@ -344,24 +387,27 @@ void test_flash_attention_cmp_softmax() {
     float attention_time = 1e9f;
     for(int n = 0; n < 1; ++n) {
         const int ITERS = 16;
+        evk::ai::BeginGraphRecording();
+        auto& cmd = evk::ai::GetCmd();
         for(int it = 0; it < ITERS; ++it) {
-            evk::CmdTimestamp("flash_attention", [&]() {
+            cmd.timestamp("flash_attention", [&]() {
                 evk::ai::flash_attention(q, k, v, o_flash);
             });
         }
 
         for(int it = 0; it < ITERS; ++it) {
-            evk::CmdTimestamp("attention", [&]() {
+            cmd.timestamp("attention", [&]() {
                 evk::ai::matmul(q_scaled, k, s, false, true, false, 64, 64);   // S = (Q/√Dh) * K^T
                 evk::ai::softmax(s, p);                                        // P = softmax(S) over last dim
                 evk::ai::matmul(p, v, o_base, false, false, false, 64, 64);    // O = P * V
             });
         }
+        evk::ai::EndGraphRecording(true);
 
         o_flash.cpu_download();
         o_base.cpu_download();
 
-        for(auto& ts : evk::GetTimestamps()) {
+        for(const auto& ts : evk::CmdTimestamps()) {
             if (strcmp(ts.name, "flash_attention") == 0) {
                 flash_time = fmin(flash_time, float(ts.end - ts.start));
             } else if (strcmp(ts.name, "attention") == 0) {
@@ -508,7 +554,7 @@ void test_adam() {
     for (int step = 0; step < 10; ++step) {
         evk::ai::adam(param, grad, state, 0.1f, 0.9f, 0.999f, 1e-4f);
     }
-    evk::Sync();
+    evk::ai::SubmitCmd(true);
 
     param.cpu_download();
     pp = param.cpu();
@@ -736,7 +782,7 @@ void test_adam_batched_matmul() {
         
         // Adam update
         evk::ai::adam(w, w_grad, adam_state, lr);
-        evk::Sync();
+    evk::ai::SubmitCmd(true);
         
         loss_tensor.cpu_download();
         float loss_val = float(loss_tensor.cpu()[0]);
