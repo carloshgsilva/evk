@@ -8,10 +8,8 @@ layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 layout(buffer_reference) buffer BufferFp32 { float x[]; };
 
 PUSH(
-    BufferFp16 gradBuffer;   // (totalPositions, vocabSize)
     BufferFp16 resultBuffer; // scalar loss output
     BufferFp32 accumBuffer;  // float[2] -> {totalLoss, validCount}
-    uint totalElements;      // totalPositions * vocabSize
 )
 
 // Write mean loss (grads are already scaled in cross_entropy.comp)

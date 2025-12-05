@@ -764,17 +764,13 @@ namespace evk::ai {
         cmd.dispatch(totalPositions, 1, 1);
         cmd.barrier();
 
-        // Pass 3: Scale gradients and write mean loss
-        uint32_t totalElements = 0u; // grads already scaled; loss only
-        uint32_t groupsX = 1u;
+        // Pass 3: Write mean loss
         cmd.bind(pipelines->cross_entropy_scale);
         cmd.push(evk::Constant{
-            grad.buffer.GetReference(),
             result.buffer.GetReference(),
             pipelines->cross_entropy_accum.GetReference(),
-            totalElements,
         });
-        cmd.dispatch(groupsX, 1, 1);
+        cmd.dispatch(1u, 1, 1);
         cmd.barrier();
     }
 
