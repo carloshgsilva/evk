@@ -387,7 +387,6 @@ void test_flash_attention_cmp_softmax() {
     float attention_time = 1e9f;
     for(int n = 0; n < 1; ++n) {
         const int ITERS = 16;
-        evk::ai::BeginGraphRecording();
         auto& cmd = evk::ai::GetCmd();
         for(int it = 0; it < ITERS; ++it) {
             cmd.timestamp("flash_attention", [&]() {
@@ -402,7 +401,7 @@ void test_flash_attention_cmp_softmax() {
                 evk::ai::matmul(p, v, o_base, false, false, false, 64, 64);    // O = P * V
             });
         }
-        evk::ai::EndGraphRecording(true);
+        evk::ai::SubmitCmd(true);
 
         o_flash.cpu_download();
         o_base.cpu_download();

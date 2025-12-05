@@ -20,23 +20,22 @@ void benchmark_matmul() {
             a->identity(2.0f);
             b->identity(3.0f);
 
-            evk::ai::BeginGraphRecording();
+            evk::ai::GetCmd();
             for (uint32_t i = 0; i < 4; ++i) {
                 evk::ai::matmul(*a, *b, *c, false, false, false, tile_m, tile_n);
             }
-            evk::ai::EndGraphRecording(true);
+            evk::ai::SubmitCmd(true);
 
             float min_ms = 1e9f;
             for(int it = 0; it < 16; ++it) {
                 const uint32_t subIter = 32;
-                evk::ai::BeginGraphRecording();
                 auto& cmd = evk::ai::GetCmd();
                 for (uint32_t i = 0; i < subIter; ++i) {
                     cmd.timestamp("matmul", [&]() {
                         evk::ai::matmul(*a, *b, *c, false, false, false, tile_m, tile_n);
                     });
                 }
-                evk::ai::EndGraphRecording(true);
+                evk::ai::SubmitCmd(true);
 
                 for(const auto& ts: evk::CmdTimestamps()) {
                     min_ms = fminf(min_ms, float(ts.end - ts.start));
@@ -65,16 +64,15 @@ void benchmark_matmul_broadcast() {
     a->identity(2.0f);
     b->identity(3.0f);
 
-    evk::ai::BeginGraphRecording();
+    evk::ai::GetCmd();
     for (uint32_t i = 0; i < 4; ++i) {
         evk::ai::matmul(*a, *b, *c, false, false, false, TILE, TILE);
     }
-    evk::ai::EndGraphRecording(true);
+    evk::ai::SubmitCmd(true);
 
     float min_ms = 1e9f;
     for(int it = 0; it < 16; ++it) {
         const uint32_t subIter = 16;
-        evk::ai::BeginGraphRecording();
         auto& cmd = evk::ai::GetCmd();
         for (uint32_t i = 0; i < subIter; ++i) {
             cmd.timestamp("matmul_broadcast", [&]() {
@@ -82,7 +80,7 @@ void benchmark_matmul_broadcast() {
             });
         }
         
-        evk::ai::EndGraphRecording(true);
+        evk::ai::SubmitCmd(true);
         for(const auto& ts: evk::CmdTimestamps()) {
             min_ms = fminf(min_ms, float(ts.end - ts.start));
         }
@@ -120,16 +118,15 @@ void benchmark_cross_entropy_loss() {
     }
     targets->cpu_upload();
 
-    evk::ai::BeginGraphRecording();
+    evk::ai::GetCmd();
     for (uint32_t i = 0; i < 4; ++i) {
         evk::ai::cross_entropy_loss(*logits, *targets, *grad, *loss);
     }
-    evk::ai::EndGraphRecording(true);
+    evk::ai::SubmitCmd(true);
 
     float min_ms = 1e9f;
     for (int it = 0; it < 16; ++it) {
         const uint32_t subIter = 1;
-        evk::ai::BeginGraphRecording();
         auto& cmd = evk::ai::GetCmd();
         for (uint32_t i = 0; i < subIter; ++i) {
             cmd.timestamp("cross_entropy_loss", [&]() {
@@ -137,7 +134,7 @@ void benchmark_cross_entropy_loss() {
             });
         }
 
-        evk::ai::EndGraphRecording(true);
+        evk::ai::SubmitCmd(true);
         for(const auto& ts: evk::CmdTimestamps()) {
             min_ms = fminf(min_ms, float(ts.end - ts.start));
         }
