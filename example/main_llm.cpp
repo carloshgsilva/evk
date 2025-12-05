@@ -1066,7 +1066,7 @@ void run_circle_detection(uint32_t num_layers) {
     const float LR = 0.0225f;
     const int WARMUP_EPOCHS = 120;
     const float MIN_LR_SCALE = 0.08f;
-    const int LOG_INTERVAL = 50;
+    const int LOG_INTERVAL = 100;
     
     printf("  Training for %d epochs with LR=%.4f, warmup=%d\n",
            EPOCHS, LR, WARMUP_EPOCHS);
