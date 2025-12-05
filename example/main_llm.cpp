@@ -273,7 +273,7 @@ struct Transformer {
         loss->cpu_download();
         float loss_val = float(loss->cpu()[0]);
 
-        model.step_adam(learning_rate, 0.9f, 0.999f, 1e-4f);
+        model.step_adam(learning_rate, 0.9f, 0.98f, 5e-5f);
         // model.step(-learning_rate*0.1f);
         
         return loss_val;
@@ -537,9 +537,8 @@ void main_llm() {
 
     auto start = std::chrono::high_resolution_clock::now();
     // run_circle_detection(1);
-    // run_circle_detection(2);
-    // run_circle_detection(4);
-    run_circle_detection(8);
+// run_circle_detection(2);
+    run_circle_detection(4);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
     printf("run_circle_detection() took %.4f seconds\n", duration.count());
@@ -583,12 +582,13 @@ struct CircleDataset {
     
     // Generate a single sample: random circles + sampled points
     // Returns the number of circles generated (1 to n_max_prims)
-    uint32_t generate_sample(CircleData* circles_out, PointData* points_out) {
+    uint32_t generate_sample(CircleData* circles_out, PointData* points_out, uint32_t force_num_circles = 0) {
 #if 0 // Enable variable number of circles for more variety
-        uint32_t num_circles = 1 + (rand() % n_max_prims);
-#else // Fixed number of circles
-        uint32_t num_circles = n_max_prims;
+        uint32_t num_circles = force_num_circles ? force_num_circles : (1 + (rand() % n_max_prims));
+#else // Fixed number of circles unless explicitly overridden
+        uint32_t num_circles = force_num_circles ? force_num_circles : n_max_prims;
 #endif
+        num_circles = (std::max)(1u, (std::min)(num_circles, n_max_prims));
         
         // Generate random circles (ensuring they fit in grid)
         for (uint32_t c = 0; c < num_circles; ++c) {
@@ -625,17 +625,26 @@ struct CircleDataset {
         uint32_t points_per_circle = n_points / num_circles;
         uint32_t extra_points = n_points % num_circles;
         
+        struct TempPoint {
+            float angle;
+            uint16_t x;
+            uint16_t y;
+        };
+        
         uint32_t point_idx = 0;
+        std::vector<std::vector<TempPoint>> circle_points(num_circles);
+        
         for (uint32_t c = 0; c < num_circles && point_idx < n_points; ++c) {
             uint32_t pts_for_this = points_per_circle + (c < extra_points ? 1 : 0);
             float cx = float(circles_out[c].x);
             float cy = float(circles_out[c].y);
             float cr = float(circles_out[c].r);
             
-            for (uint32_t p = 0; p < pts_for_this && point_idx < n_points; ++p) {
-                // Sample angle uniformly
+            circle_points[c].reserve(pts_for_this);
+            
+            for (uint32_t p = 0; p < pts_for_this && point_idx + circle_points[c].size() < n_points; ++p) {
+                // Sample angle uniformly and keep it for deterministic ordering
                 float angle = 2.0f * 3.14159265f * float(rand()) / float(RAND_MAX);
-                // Add small noise to radius
                 float noise = 0.95f + 0.01f * float(rand()) / float(RAND_MAX);
                 float px = cx + cr * noise * cosf(angle);
                 float py = cy + cr * noise * sinf(angle);
@@ -644,21 +653,28 @@ struct CircleDataset {
                 px = fmaxf(0.0f, fminf(float(grid_size - 1), px));
                 py = fmaxf(0.0f, fminf(float(grid_size - 1), py));
                 
-                points_out[point_idx].x = uint16_t(px + 0.5f);
-                points_out[point_idx].y = uint16_t(py + 0.5f);
+                circle_points[c].push_back({angle, uint16_t(px + 0.5f), uint16_t(py + 0.5f)});
+            }
+        }
+        
+        for (uint32_t c = 0; c < num_circles && point_idx < n_points; ++c) {
+            auto& pts = circle_points[c];
+            std::sort(pts.begin(), pts.end(), [](const TempPoint& a, const TempPoint& b) {
+                return a.angle < b.angle;
+            });
+            
+            for (const auto& pt : pts) {
+                if (point_idx >= n_points) break;
+                points_out[point_idx].x = pt.x;
+                points_out[point_idx].y = pt.y;
                 point_idx++;
             }
         }
-
-        // TODO: sort the points by x axis
-        for (uint32_t i = 0; i < n_points; ++i) {
-            for (uint32_t j = i + 1; j < n_points; ++j) {
-                if (points_out[i].x > points_out[j].x) {
-                    PointData temp = points_out[i];
-                    points_out[i] = points_out[j];
-                    points_out[j] = temp;
-                }
-            }
+        
+        // Pad remaining slots (should rarely trigger)
+        for (; point_idx < n_points; ++point_idx) {
+            points_out[point_idx].x = 0;
+            points_out[point_idx].y = 0;
         }
 
         return num_circles;
@@ -814,6 +830,7 @@ struct CircleDetector {
     uint32_t n_points;          // Number of input points
     uint32_t n_max_prims;       // Max number of output circles
     uint32_t grid_size;         // Discrete coordinate space
+    uint16_t start_token;       // Dedicated start token for decoder
     
     // Computed dimensions
     uint32_t vocab_size;        // grid_size for x, y, r
@@ -835,6 +852,7 @@ struct CircleDetector {
           transformer(compute_vocab_size(grid_size_), compute_total_seq_len(n_points_, n_max_prims_), 
                      embed_dim_, hidden_dim_, batch_size_, num_layers_)
     {
+        start_token = uint16_t(vocab_size > 1 ? vocab_size - 1 : 0);
     }
     
     void init_weights(uint32_t seed = 42) {
@@ -879,55 +897,34 @@ struct CircleDetector {
     }
     
     // Train on a batch of generated samples
-    float train_batch(CircleDataset& dataset, float learning_rate) {
+    float train_batch(CircleDataset& dataset, float learning_rate, uint32_t force_num_circles = 0) {
         std::vector<CircleData> circles(n_max_prims);
         std::vector<PointData> points(n_points);
         
         std::vector<uint16_t> full_inp(transformer.batch_size * total_seq_len);
         std::vector<uint16_t> tgt(transformer.batch_size * total_seq_len);
+        std::vector<uint16_t> point_tokens(input_seq_len);
+        std::vector<uint16_t> circle_tokens(output_seq_len);
         
         for (uint32_t b = 0; b < transformer.batch_size; ++b) {
-            uint32_t num_circles = dataset.generate_sample(circles.data(), points.data());
+            uint32_t num_circles = dataset.generate_sample(circles.data(), points.data(), force_num_circles);
             
-            // Encode input points
-            std::vector<uint16_t> point_tokens(input_seq_len);
             encode_points(point_tokens.data(), points.data());
-            
-            // Encode target circles
-            std::vector<uint16_t> circle_tokens(output_seq_len);
             encode_circles(circle_tokens.data(), circles.data(), num_circles);
             
-            // Build full sequence: [point_tokens, shifted_circle_tokens]
-            // For teacher forcing: input[i] predicts target[i]
-            // Input:  [p0, p1, ..., pN-1, c0, c1, ..., cM-2, cM-1]
-            // Target: [p1, p2, ..., pN,   c0, c1, ..., cM-1, EOS]
-            // But we only care about predicting circle tokens
+            uint16_t* inp_ptr = full_inp.data() + b * total_seq_len;
+            uint16_t* tgt_ptr = tgt.data() + b * total_seq_len;
             
             // Full input sequence
-            for (uint32_t t = 0; t < input_seq_len; ++t) {
-                full_inp[b * total_seq_len + t] = point_tokens[t];
-            }
-            // Shifted target for output positions (input to transformer at output positions)
-            // Position input_seq_len + i gets token at output position i-1 (or start token)
-            full_inp[b * total_seq_len + input_seq_len] = 0;  // Start token
-            for (uint32_t t = 1; t < output_seq_len; ++t) {
-                full_inp[b * total_seq_len + input_seq_len + t] = circle_tokens[t - 1];
-            }
+            memcpy(inp_ptr, point_tokens.data(), input_seq_len * sizeof(uint16_t));
+            inp_ptr[input_seq_len] = start_token;  // Start token
+            memcpy(inp_ptr + input_seq_len + 1, circle_tokens.data(), (output_seq_len - 1) * sizeof(uint16_t));
+            std::fill(inp_ptr + input_seq_len + output_seq_len, inp_ptr + total_seq_len, 0);
             
-            // Target: shift by 1 (predict next token)
-            // For input positions, use target=0 (IGNORE token) to exclude from loss
-            // For output positions, target is the circle token sequence
-            for (uint32_t t = 0; t < input_seq_len; ++t) {
-                tgt[b * total_seq_len + t] = 0;  // IGNORE token - no loss computed here
-            }
-            for (uint32_t t = 0; t < output_seq_len; ++t) {
-                tgt[b * total_seq_len + input_seq_len + t] = circle_tokens[t];
-            }
-            // Pad remaining positions with zeros
-            for (uint32_t t = input_seq_len + output_seq_len; t < total_seq_len; ++t) {
-                full_inp[b * total_seq_len + t] = 0;
-                tgt[b * total_seq_len + t] = 0;
-            }
+            // Targets (loss computed only where target != 0)
+            std::fill(tgt_ptr, tgt_ptr + input_seq_len, 0);
+            memcpy(tgt_ptr + input_seq_len, circle_tokens.data(), output_seq_len * sizeof(uint16_t));
+            std::fill(tgt_ptr + input_seq_len + output_seq_len, tgt_ptr + total_seq_len, 0);
         }
         
         return transformer.train_batch(full_inp.data(), tgt.data(), learning_rate);
@@ -949,7 +946,7 @@ struct CircleDetector {
         }
         
         // Autoregressive generation for output tokens
-        inp[input_seq_len] = 0;  // Start token
+        inp[input_seq_len] = start_token;  // Start token
         for (uint32_t t = input_seq_len + 1; t < total_seq_len; ++t) {
             inp[t] = 0;
         }
@@ -1029,12 +1026,12 @@ void run_circle_detection(uint32_t num_layers) {
     
     // Hyperparameters - optimized for 2-circle detection
     constexpr uint32_t N_POINTS = 32;       // Points sampled from circles
-    constexpr uint32_t N_MAX_PRIMS = 2;     // Detect up to 1 circle
+    constexpr uint32_t N_MAX_PRIMS = 2;     // Detect up to 2 circles
     constexpr uint32_t GRID_SIZE = 64;      // Discrete coordinate space
-    constexpr uint32_t EMBED_DIM = 160;     // Embedding dimension
-    constexpr uint32_t HIDDEN_DIM = 320;    // FFN hidden dimension
-    constexpr uint32_t BATCH_SIZE = 96;     // Batch size
-    uint32_t NUM_LAYERS = 8;                // Number of transformer layers
+    constexpr uint32_t EMBED_DIM = 128;     // Embedding dimension
+    constexpr uint32_t HIDDEN_DIM = 256;    // FFN hidden dimension
+    constexpr uint32_t BATCH_SIZE = 128;    // Batch size
+    uint32_t NUM_LAYERS = (std::max)(1u, num_layers); // Number of transformer layers
     
     printf("  Config: n_points=%u, n_max_prims=%u, grid=%u, embed=%u, hidden=%u, layers=%u\n",
            N_POINTS, N_MAX_PRIMS, GRID_SIZE, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS);
@@ -1051,17 +1048,21 @@ void run_circle_detection(uint32_t num_layers) {
     
     // Training hyperparameters
     const int EPOCHS = 1000;
-    const float LR = 0.010f;
-    const int WARMUP_EPOCHS = 100;
+    const float LR = 0.0180f;
+    const int WARMUP_EPOCHS = 30;
+    const float MIN_LR_SCALE = 0.05f;
+    const int CURRICULUM_SINGLE_EPOCHS = 40;
+    const int LOG_INTERVAL = 25;
     
-    printf("  Training for %d epochs with LR=%.4f, warmup=%d...\n", EPOCHS, LR, WARMUP_EPOCHS);
+    printf("  Training for %d epochs with LR=%.4f, warmup=%d (1-circle warmup for %d epochs)...\n",
+           EPOCHS, LR, WARMUP_EPOCHS, CURRICULUM_SINGLE_EPOCHS);
     
     std::vector<float> loss_history;
     loss_history.reserve(EPOCHS);
     
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
         // Learning rate schedule: linear warmup then cosine decay
-        float min_lr = LR * 0.05f;
+        float min_lr = LR * MIN_LR_SCALE;
         float effective_lr = LR;
         if (epoch < WARMUP_EPOCHS) {
             effective_lr = LR * float(epoch + 1) / float(WARMUP_EPOCHS);
@@ -1070,10 +1071,15 @@ void run_circle_detection(uint32_t num_layers) {
             effective_lr = min_lr + (LR - min_lr) * 0.5f * (1.0f + cosf(3.14159265f * progress));
         }
         
-        float epoch_loss = detector.train_batch(dataset, effective_lr);
+        uint32_t forced_circles = (epoch < CURRICULUM_SINGLE_EPOCHS) ? 1u : 0u;
+        if (CURRICULUM_SINGLE_EPOCHS > 0 && epoch == CURRICULUM_SINGLE_EPOCHS) {
+            printf("  switching to 2-circle batches\n");
+        }
+        
+        float epoch_loss = detector.train_batch(dataset, effective_lr, forced_circles);
         loss_history.push_back(epoch_loss);
         
-        if (epoch % 100 == 0 || epoch == EPOCHS - 1) {
+        if (epoch % LOG_INTERVAL == 0 || epoch == EPOCHS - 1) {
             printf("  epoch %3d: loss = %.4f\n", epoch, epoch_loss);
             CircleDataset::save_loss_graph("loss_graph.bmp", loss_history);
         }
