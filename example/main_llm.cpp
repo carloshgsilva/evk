@@ -831,6 +831,7 @@ struct CircleDetector {
     uint32_t n_max_prims;       // Max number of output circles
     uint32_t grid_size;         // Discrete coordinate space
     uint16_t start_token;       // Dedicated start token for decoder
+    uint16_t no_circle_token;   // Explicit "no circle" token (keeps loss active)
     
     // Computed dimensions
     uint32_t vocab_size;        // grid_size for x, y, r
@@ -852,6 +853,7 @@ struct CircleDetector {
           transformer(compute_vocab_size(grid_size_), compute_total_seq_len(n_points_, n_max_prims_), 
                      embed_dim_, hidden_dim_, batch_size_, num_layers_)
     {
+        no_circle_token = uint16_t(vocab_size > 2 ? vocab_size - 2 : 0);
         start_token = uint16_t(vocab_size > 1 ? vocab_size - 1 : 0);
     }
     
@@ -876,10 +878,9 @@ struct CircleDetector {
                 tokens[c * 3 + 1] = circles[c].y + 1;
                 tokens[c * 3 + 2] = circles[c].r + 1;
             } else {
-                // "No circle" token
-                tokens[c * 3 + 0] = 0;
-                tokens[c * 3 + 1] = 0;
-                tokens[c * 3 + 2] = 0;
+                tokens[c * 3 + 0] = no_circle_token;
+                tokens[c * 3 + 1] = no_circle_token;
+                tokens[c * 3 + 2] = no_circle_token;
             }
         }
     }
@@ -890,9 +891,11 @@ struct CircleDetector {
             uint16_t x = tokens[c * 3 + 0];
             uint16_t y = tokens[c * 3 + 1];
             uint16_t r = tokens[c * 3 + 2];
-            circles_out[c].x = (x > 0) ? uint16_t(x - 1) : 0;
-            circles_out[c].y = (y > 0) ? uint16_t(y - 1) : 0;
-            circles_out[c].r = (r > 0) ? uint16_t(r - 1) : 0;
+            bool is_blank = (x == 0) || (y == 0) || (r == 0) ||
+                            (x == no_circle_token) || (y == no_circle_token) || (r == no_circle_token);
+            circles_out[c].x = (!is_blank && x > 0) ? uint16_t(x - 1) : 0;
+            circles_out[c].y = (!is_blank && y > 0) ? uint16_t(y - 1) : 0;
+            circles_out[c].r = (!is_blank && r > 0) ? uint16_t(r - 1) : 0;
         }
     }
     
@@ -974,6 +977,16 @@ struct CircleDetector {
             
             generated_tokens[out_pos] = max_idx;
             
+            // Early stop: once a full circle slot starts with a no-circle token,
+            // force the remaining outputs to no-circle to reduce spurious shapes.
+            bool at_circle_start = (out_pos % 3 == 0);
+            if (at_circle_start && max_idx == no_circle_token) {
+                for (uint32_t k = out_pos; k < output_seq_len; ++k) {
+                    generated_tokens[k] = no_circle_token;
+                }
+                break;
+            }
+            
             // Feed back for next position
             if (out_pos + 1 < output_seq_len) {
                 inp[input_seq_len + out_pos + 1] = max_idx;
@@ -1024,9 +1037,9 @@ void debug_gradients(Transformer& transformer, const char* label) {
 void run_circle_detection(uint32_t num_layers) {
     printf("\n=== Circle Detection Transformer ===\n");
     
-    // Hyperparameters - optimized for 2-circle detection
+    // Hyperparameters
     constexpr uint32_t N_POINTS = 32;       // Points sampled from circles
-    constexpr uint32_t N_MAX_PRIMS = 3;     // Detect up to 2 circles
+    constexpr uint32_t N_MAX_PRIMS = 3;     // Detect up to N circles
     constexpr uint32_t GRID_SIZE = 64;      // Discrete coordinate space
     constexpr uint32_t EMBED_DIM = 128;     // Embedding dimension
     constexpr uint32_t HIDDEN_DIM = 256;    // FFN hidden dimension
@@ -1036,6 +1049,8 @@ void run_circle_detection(uint32_t num_layers) {
     printf("  Config: n_points=%u, n_max_prims=%u, grid=%u, embed=%u, hidden=%u, layers=%u\n",
            N_POINTS, N_MAX_PRIMS, GRID_SIZE, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS);
     
+    srand(1337);  // Deterministic training batches for repeatable profiling
+
     // Create dataset generator
     CircleDataset dataset(N_POINTS, N_MAX_PRIMS, GRID_SIZE);
     
@@ -1048,14 +1063,13 @@ void run_circle_detection(uint32_t num_layers) {
     
     // Training hyperparameters
     const int EPOCHS = 3000;
-    const float LR = 0.0180f;
-    const int WARMUP_EPOCHS = 30;
-    const float MIN_LR_SCALE = 0.05f;
-    const int CURRICULUM_SINGLE_EPOCHS = 40;
-    const int LOG_INTERVAL = 100;
+    const float LR = 0.0225f;
+    const int WARMUP_EPOCHS = 120;
+    const float MIN_LR_SCALE = 0.08f;
+    const int LOG_INTERVAL = 50;
     
-    printf("  Training for %d epochs with LR=%.4f, warmup=%d (1-circle warmup for %d epochs)...\n",
-           EPOCHS, LR, WARMUP_EPOCHS, CURRICULUM_SINGLE_EPOCHS);
+    printf("  Training for %d epochs with LR=%.4f, warmup=%d\n",
+           EPOCHS, LR, WARMUP_EPOCHS);
     
     std::vector<float> loss_history;
     loss_history.reserve(EPOCHS);
@@ -1071,12 +1085,7 @@ void run_circle_detection(uint32_t num_layers) {
             effective_lr = min_lr + (LR - min_lr) * 0.5f * (1.0f + cosf(3.14159265f * progress));
         }
         
-        uint32_t forced_circles = (epoch < CURRICULUM_SINGLE_EPOCHS) ? 1u : 0u;
-        if (CURRICULUM_SINGLE_EPOCHS > 0 && epoch == CURRICULUM_SINGLE_EPOCHS) {
-            printf("  switching to 2-circle batches\n");
-        }
-        
-        float epoch_loss = detector.train_batch(dataset, effective_lr, forced_circles);
+        float epoch_loss = detector.train_batch(dataset, effective_lr, 0);
         loss_history.push_back(epoch_loss);
         
         if (epoch % LOG_INTERVAL == 0 || epoch == EPOCHS - 1) {
