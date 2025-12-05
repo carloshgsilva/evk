@@ -436,8 +436,8 @@ struct Tensor {
                 stats.inf_count++;
             } else {
                 if (v == 0.0f) stats.zero_count++;
-                stats.min_val = std::min(stats.min_val, v);
-                stats.max_val = std::max(stats.max_val, v);
+                stats.min_val = (std::min)(stats.min_val, v);
+                stats.max_val = (std::max)(stats.max_val, v);
                 sum += v;
                 sum_sq += v * v;
                 valid_count++;

@@ -2,6 +2,7 @@
 
 #include "win_dbg.h"
 #include "evk.h"
+#include "bench.h"
 
 void main_llm();
 
@@ -16,8 +17,10 @@ int main() {
         .engineVersion = 1,
         .enableSwapchain = false,
     });
+    evk::ai::initialize();
 
-    main_llm();
+    benchmark_matmul();
+    // main_llm();
 
     // Test the command buffer API
     {
@@ -181,6 +184,7 @@ int main() {
         }
     }
 
+    evk::ai::shutdown();
     evk::Shutdown();
     printf("[test] All tests passed successfully!\n");
     return 0;
