@@ -265,15 +265,17 @@ struct Transformer {
         memcpy(inp, input, batch_size * seq_len * sizeof(uint16_t));
         memcpy(tgt, target, batch_size * seq_len * sizeof(uint16_t));
         
-        input_tokens->cpu_upload();
-        targets->cpu_upload();
+        input_tokens->cpu_upload(false);
+        targets->cpu_upload(false);
         
-        model.eval(true);
+        model.eval(true, false, false);
         
-        loss->cpu_download();
+        loss->cpu_download(false);
+        model.step_adam(learning_rate, 0.9f, 0.98f, 5e-5f);
+        evk::ai::SubmitCmd(true);
+        
         float loss_val = float(loss->cpu()[0]);
 
-        model.step_adam(learning_rate, 0.9f, 0.98f, 5e-5f);
         // model.step(-learning_rate*0.1f);
         
         return loss_val;
@@ -537,7 +539,7 @@ void main_llm() {
 
     auto start = std::chrono::high_resolution_clock::now();
     // run_circle_detection(1);
-// run_circle_detection(2);
+    // run_circle_detection(2);
     run_circle_detection(4);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
@@ -625,14 +627,8 @@ struct CircleDataset {
         uint32_t points_per_circle = n_points / num_circles;
         uint32_t extra_points = n_points % num_circles;
         
-        struct TempPoint {
-            float angle;
-            uint16_t x;
-            uint16_t y;
-        };
-        
         uint32_t point_idx = 0;
-        std::vector<std::vector<TempPoint>> circle_points(num_circles);
+        constexpr float TWO_PI = 6.28318531f;
         
         for (uint32_t c = 0; c < num_circles && point_idx < n_points; ++c) {
             uint32_t pts_for_this = points_per_circle + (c < extra_points ? 1 : 0);
@@ -640,12 +636,14 @@ struct CircleDataset {
             float cy = float(circles_out[c].y);
             float cr = float(circles_out[c].r);
             
-            circle_points[c].reserve(pts_for_this);
+            float angle_step = TWO_PI / float(pts_for_this);
+            float base_angle = angle_step * (float(rand()) / float(RAND_MAX));
             
-            for (uint32_t p = 0; p < pts_for_this && point_idx + circle_points[c].size() < n_points; ++p) {
-                // Sample angle uniformly and keep it for deterministic ordering
-                float angle = 2.0f * 3.14159265f * float(rand()) / float(RAND_MAX);
-                float noise = 0.95f + 0.01f * float(rand()) / float(RAND_MAX);
+            for (uint32_t p = 0; p < pts_for_this && point_idx < n_points; ++p) {
+                float angle = base_angle + angle_step * float(p);
+                angle += (float(rand()) / float(RAND_MAX) - 0.5f) * (0.2f * angle_step);
+                
+                float noise = 0.95f + 0.02f * float(rand()) / float(RAND_MAX);
                 float px = cx + cr * noise * cosf(angle);
                 float py = cy + cr * noise * sinf(angle);
                 
@@ -653,21 +651,9 @@ struct CircleDataset {
                 px = fmaxf(0.0f, fminf(float(grid_size - 1), px));
                 py = fmaxf(0.0f, fminf(float(grid_size - 1), py));
                 
-                circle_points[c].push_back({angle, uint16_t(px + 0.5f), uint16_t(py + 0.5f)});
-            }
-        }
-        
-        for (uint32_t c = 0; c < num_circles && point_idx < n_points; ++c) {
-            auto& pts = circle_points[c];
-            std::sort(pts.begin(), pts.end(), [](const TempPoint& a, const TempPoint& b) {
-                return a.angle < b.angle;
-            });
-            
-            for (const auto& pt : pts) {
-                if (point_idx >= n_points) break;
-                points_out[point_idx].x = pt.x;
-                points_out[point_idx].y = pt.y;
-                point_idx++;
+                points_out[point_idx].x = uint16_t(px + 0.5f);
+                points_out[point_idx].y = uint16_t(py + 0.5f);
+                ++point_idx;
             }
         }
         
@@ -822,6 +808,35 @@ inline uint32_t compute_total_seq_len(uint32_t n_points, uint32_t n_max_prims) {
     return ((raw_total + 15) / 16) * 16;  // Pad to multiple of 16
 }
 
+struct TrainTiming {
+    double data_ms = 0.0;
+    double gpu_ms = 0.0;
+    double total_ms = 0.0;
+    uint64_t steps = 0;
+
+    void reset() {
+        data_ms = gpu_ms = total_ms = 0.0;
+        steps = 0;
+    }
+
+    void accumulate(const TrainTiming& other) {
+        data_ms += other.data_ms;
+        gpu_ms += other.gpu_ms;
+        total_ms += other.total_ms;
+        steps += other.steps;
+    }
+
+    void print(const char* label) const {
+        if (steps == 0) return;
+        printf("  [%s] data=%.3fms gpu=%.3fms total=%.3fms over %llu steps\n",
+               label,
+               data_ms / double(steps),
+               gpu_ms / double(steps),
+               total_ms / double(steps),
+               (unsigned long long)steps);
+    }
+};
+
 // Circle detection using Transformer
 // Input: N_POINTS 2D points -> encoded as tokens
 // Output: N_MAX_PRIMS * 3 values (x, y, r for each circle)
@@ -842,6 +857,14 @@ struct CircleDetector {
     // Underlying transformer
     Transformer transformer;
     
+    // Reusable buffers to avoid per-iteration allocations
+    std::vector<CircleData> tmp_circles;
+    std::vector<PointData> tmp_points;
+    std::vector<uint16_t> tmp_full_inp;
+    std::vector<uint16_t> tmp_tgt;
+    std::vector<uint16_t> tmp_point_tokens;
+    std::vector<uint16_t> tmp_circle_tokens;
+
     CircleDetector(uint32_t n_points_, uint32_t n_max_prims_, uint32_t grid_size_,
                    uint32_t embed_dim_, uint32_t hidden_dim_, uint32_t batch_size_,
                    uint32_t num_layers_ = 2)
@@ -855,6 +878,12 @@ struct CircleDetector {
     {
         no_circle_token = uint16_t(vocab_size > 2 ? vocab_size - 2 : 0);
         start_token = uint16_t(vocab_size > 1 ? vocab_size - 1 : 0);
+        tmp_circles.resize(n_max_prims);
+        tmp_points.resize(n_points);
+        tmp_full_inp.resize(transformer.batch_size * total_seq_len);
+        tmp_tgt.resize(transformer.batch_size * total_seq_len);
+        tmp_point_tokens.resize(input_seq_len);
+        tmp_circle_tokens.resize(output_seq_len);
     }
     
     void init_weights(uint32_t seed = 42) {
@@ -900,15 +929,16 @@ struct CircleDetector {
     }
     
     // Train on a batch of generated samples
-    float train_batch(CircleDataset& dataset, float learning_rate, uint32_t force_num_circles = 0) {
-        std::vector<CircleData> circles(n_max_prims);
-        std::vector<PointData> points(n_points);
-        
-        std::vector<uint16_t> full_inp(transformer.batch_size * total_seq_len);
-        std::vector<uint16_t> tgt(transformer.batch_size * total_seq_len);
-        std::vector<uint16_t> point_tokens(input_seq_len);
-        std::vector<uint16_t> circle_tokens(output_seq_len);
-        
+    float train_batch(CircleDataset& dataset, float learning_rate, uint32_t force_num_circles = 0, TrainTiming* timing = nullptr) {
+        auto t_start = std::chrono::high_resolution_clock::now();
+
+        auto& circles = tmp_circles;
+        auto& points = tmp_points;
+        auto& full_inp = tmp_full_inp;
+        auto& tgt = tmp_tgt;
+        auto& point_tokens = tmp_point_tokens;
+        auto& circle_tokens = tmp_circle_tokens;
+
         for (uint32_t b = 0; b < transformer.batch_size; ++b) {
             uint32_t num_circles = dataset.generate_sample(circles.data(), points.data(), force_num_circles);
             
@@ -930,7 +960,18 @@ struct CircleDetector {
             std::fill(tgt_ptr + input_seq_len + output_seq_len, tgt_ptr + total_seq_len, 0);
         }
         
-        return transformer.train_batch(full_inp.data(), tgt.data(), learning_rate);
+        auto t_after_data = std::chrono::high_resolution_clock::now();
+        float loss = transformer.train_batch(full_inp.data(), tgt.data(), learning_rate);
+        auto t_end = std::chrono::high_resolution_clock::now();
+
+        if (timing) {
+            timing->data_ms += std::chrono::duration<double, std::milli>(t_after_data - t_start).count();
+            timing->gpu_ms += std::chrono::duration<double, std::milli>(t_end - t_after_data).count();
+            timing->total_ms += std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            timing->steps++;
+        }
+
+        return loss;
     }
     
     // Predict circles from points (autoregressive generation)
@@ -1066,13 +1107,15 @@ void run_circle_detection(uint32_t num_layers) {
     const float LR = 0.0225f;
     const int WARMUP_EPOCHS = 120;
     const float MIN_LR_SCALE = 0.08f;
-    const int LOG_INTERVAL = 100;
+    const int LOG_INTERVAL = 500;
     
     printf("  Training for %d epochs with LR=%.4f, warmup=%d\n",
            EPOCHS, LR, WARMUP_EPOCHS);
     
     std::vector<float> loss_history;
     loss_history.reserve(EPOCHS);
+    TrainTiming timing_window;
+    TrainTiming timing_total;
     
     for (int epoch = 0; epoch < EPOCHS; ++epoch) {
         // Learning rate schedule: linear warmup then cosine decay
@@ -1085,13 +1128,16 @@ void run_circle_detection(uint32_t num_layers) {
             effective_lr = min_lr + (LR - min_lr) * 0.5f * (1.0f + cosf(3.14159265f * progress));
         }
         
-        float epoch_loss = detector.train_batch(dataset, effective_lr, 0);
+        float epoch_loss = detector.train_batch(dataset, effective_lr, 0, &timing_window);
         loss_history.push_back(epoch_loss);
         
         if (epoch % LOG_INTERVAL == 0 || epoch == EPOCHS - 1) {
             printf("  epoch %3d: loss = %.4f\n", epoch, epoch_loss);
             fflush(stdout);
             CircleDataset::save_loss_graph("loss_graph.bmp", loss_history);
+            timing_window.print("timing window");
+            timing_total.accumulate(timing_window);
+            timing_window.reset();
         }
         
         // Debug gradients (uncomment to debug gradient issues)
@@ -1099,6 +1145,7 @@ void run_circle_detection(uint32_t num_layers) {
             // debug_gradients(detector.transformer, ("epoch " + std::to_string(epoch)).c_str());
         }
     }
+    timing_total.print("timing total avg");
     
     
     // Evaluation and visualization
