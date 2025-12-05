@@ -13,9 +13,6 @@
 namespace evk::ai {
     evk::Cmd& GetCmd();
     uint64_t SubmitCmd(bool wait = true);
-    void BeginGraphRecording();
-    void EndGraphRecording(bool wait = true);
-    bool InGraphRecording();
 }
 
 struct float16_t {
@@ -937,7 +934,7 @@ struct Graph {
     // eval the graph
     // if backward is true, also run the backward pass
     void eval(bool backward = false) {
-        evk::ai::BeginGraphRecording();
+        evk::ai::GetCmd();
         for(auto& node : nodes) {
             if (node->forward_fn) {
                 node->forward_fn();
@@ -961,7 +958,7 @@ struct Graph {
                 }
             }
         }
-        evk::ai::EndGraphRecording(true);
+        evk::ai::SubmitCmd(true);
     }
 
     // apply the gradient update using SGD

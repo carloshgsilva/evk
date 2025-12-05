@@ -2,7 +2,6 @@
 
 namespace evk::ai {
     static evk::Cmd* g_cmd = nullptr;
-    static bool g_graphRecording = false;
 
     evk::Cmd& GetCmd() {
         if (!g_cmd) {
@@ -19,19 +18,6 @@ namespace evk::ai {
             evk::CmdWait(idx);
         }
         return idx;
-    }
-
-    void BeginGraphRecording() {
-        g_graphRecording = true;
-    }
-
-    void EndGraphRecording(bool wait) {
-        SubmitCmd(wait);
-        g_graphRecording = false;
-    }
-
-    bool InGraphRecording() {
-        return g_graphRecording;
     }
 
     struct Pipelines {
