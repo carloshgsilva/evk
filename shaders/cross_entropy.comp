@@ -21,13 +21,17 @@ PUSH(
     uint totalPositions;       // B * N
 )
 
-// Shared reduction buffers sized for up to 4 subgroups (local_size_x = 128)
-shared float sharedMax[4];
-shared float sharedDenom[4];
-shared float sharedTarget[4];
+// Shared reduction buffers sized for typical subgroup counts (covers up to 64 subgroups)
+const uint MAX_SUBGROUPS = 64;
+shared float sharedMax[MAX_SUBGROUPS];
+shared float sharedDenom[MAX_SUBGROUPS];
+shared float sharedTarget[MAX_SUBGROUPS];
+
+const float LOG2E = 1.4426950408889634;
+const float LN2 = 0.6931471805599453;
 
 // Workgroup processes one row; multiple subgroups cooperate for less loop work
-COMPUTE(128, 1, 1)
+COMPUTE(256, 1, 1)
 void main() {
     uint row = gl_WorkGroupID.x;
     if (row >= totalPositions) return;
@@ -42,7 +46,7 @@ void main() {
 
     // Skip expensive softmax work for ignored positions; just zero gradients.
     if (!isValidTarget) {
-        for (uint j = lid; j < vocabSize; j += 128) {
+        for (uint j = lid; j < vocabSize; j += gl_WorkGroupSize.x) {
             gradBuffer.x[rowStart + j] = float16_t(0.0);
         }
         return;
@@ -50,7 +54,7 @@ void main() {
 
     // 1) Row-wise max for stability
     float localMax = -3.402823466e+38; // -FLT_MAX
-    for (uint j = lid; j < vocabSize; j += 128) {
+    for (uint j = lid; j < vocabSize; j += gl_WorkGroupSize.x) {
         float v = float(logitsBuffer.x[rowStart + j]);
         v = clamp(v, -65000.0, 65000.0);
         localMax = max(localMax, v);
@@ -62,7 +66,8 @@ void main() {
     barrier();
     if (subgroupId == 0 && subgroupLane == 0) {
         float rowMaxVal = sharedMax[0];
-        for (uint s = 1; s < subgroupCount && s < 4; ++s) {
+        uint subgroupLimit = min(subgroupCount, MAX_SUBGROUPS);
+        for (uint s = 1; s < subgroupLimit; ++s) {
             rowMaxVal = max(rowMaxVal, sharedMax[s]);
         }
         sharedMax[0] = rowMaxVal;
@@ -72,10 +77,10 @@ void main() {
 
     // 2) Sum of exp
     float localSum = 0.0;
-    for (uint j = lid; j < vocabSize; j += 128) {
-        float v = float(logitsBuffer.x[rowStart + j]);
-        v = clamp(v, -65000.0, 65000.0);
-        localSum += exp(v - rowMax);
+    for (uint j = lid; j < vocabSize; j += gl_WorkGroupSize.x) {
+        float logit = float(logitsBuffer.x[rowStart + j]);
+        logit = clamp(logit, -65000.0, 65000.0);
+        localSum += exp2((logit - rowMax) * LOG2E);
     }
     float subgroupDenom = subgroupAdd(localSum);
     if (subgroupLane == 0) {
@@ -84,7 +89,8 @@ void main() {
     barrier();
     if (subgroupId == 0 && subgroupLane == 0) {
         float denom = 0.0;
-        for (uint s = 0; s < subgroupCount && s < 4; ++s) {
+        uint subgroupLimit = min(subgroupCount, MAX_SUBGROUPS);
+        for (uint s = 0; s < subgroupLimit; ++s) {
             denom += sharedDenom[s];
         }
         sharedDenom[0] = denom;
@@ -92,14 +98,14 @@ void main() {
     barrier();
     float safeDenom = max(sharedDenom[0], 1e-20);
     float invDenom = 1.0 / safeDenom;
-    float logDenom = log(safeDenom);
-
-    // 3) Gradients + target log prob
+    float logDenom = log2(safeDenom) * LN2;
     float targetLogProb = 0.0;
-    for (uint j = lid; j < vocabSize; j += 128) {
+
+    // 3) Gradients
+    for (uint j = lid; j < vocabSize; j += gl_WorkGroupSize.x) {
         float logit = float(logitsBuffer.x[rowStart + j]);
         logit = clamp(logit, -65000.0, 65000.0);
-        float softmax_val = exp(logit - rowMax) * invDenom;
+        float softmax_val = exp2((logit - rowMax) * LOG2E) * invDenom;
 
         float grad = isValidTarget ? softmax_val : 0.0;
         if (isValidTarget && j == targetIdx) {
@@ -117,7 +123,8 @@ void main() {
     barrier();
     if (subgroupId == 0 && subgroupLane == 0) {
         float totalTarget = 0.0;
-        for (uint s = 0; s < subgroupCount && s < 4; ++s) {
+        uint subgroupLimit = min(subgroupCount, MAX_SUBGROUPS);
+        for (uint s = 0; s < subgroupLimit; ++s) {
             totalTarget += sharedTarget[s];
         }
         sharedTarget[0] = totalTarget;
@@ -126,9 +133,8 @@ void main() {
 
     // 4) Accumulate totals using atomics
     if (isValidTarget) {
-        float reducedTarget = sharedTarget[0];
         if (lid == 0) {
-            atomicAdd(accumBuffer.x[0], -reducedTarget); // total loss
+            atomicAdd(accumBuffer.x[0], -sharedTarget[0]); // total loss
             atomicAdd(accumBuffer.x[1], 1.0);            // valid count
         }
     }
