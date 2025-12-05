@@ -32,6 +32,14 @@ void main() {
     uint targetIdx = uint(targetBuffer.x[row]);
     bool isValidTarget = (targetIdx != 0u);
 
+    // Skip expensive softmax work for ignored positions; just zero gradients.
+    if (!isValidTarget) {
+        for (uint j = lid; j < vocabSize; j += 32) {
+            gradBuffer.x[rowStart + j] = float16_t(0.0);
+        }
+        return;
+    }
+
     // 1) Row-wise max for stability
     float localMax = -3.402823466e+38; // -FLT_MAX
     for (uint j = lid; j < vocabSize; j += 32) {
