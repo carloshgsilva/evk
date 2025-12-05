@@ -25,6 +25,7 @@ namespace evk::ai {
         evk::Pipeline flash_attn_bwd;
         evk::Pipeline mse_loss;
         evk::Pipeline cross_entropy;
+        evk::Pipeline cross_entropy_count;
         evk::Pipeline cross_entropy_scale;
         evk::Pipeline sgd;
         evk::Pipeline adam;
@@ -206,6 +207,10 @@ namespace evk::ai {
         pipelines->cross_entropy = evk::CreatePipeline({
             .name = "cross_entropy",
             .CS = evk::loadSpirvFile("shaders/bin/cross_entropy.comp.spv"),
+        });
+        pipelines->cross_entropy_count = evk::CreatePipeline({
+            .name = "cross_entropy_count",
+            .CS = evk::loadSpirvFile("shaders/bin/cross_entropy_count.comp.spv"),
         });
         pipelines->cross_entropy_scale = evk::CreatePipeline({
             .name = "cross_entropy_scale",
@@ -732,7 +737,21 @@ namespace evk::ai {
         cmd.fill(pipelines->cross_entropy_accum, 0u, sizeof(float) * 2);
         cmd.barrier();
 
-        // Pass 1: compute logits softmax, unscaled grad, accumulate loss/count
+        const uint32_t WORKGROUP_SIZE = 256u;
+
+        // Pass 1: count valid targets to derive global scaling
+        uint32_t countGroups = (totalPositions + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        cmd.bind(pipelines->cross_entropy_count);
+        cmd.push(evk::Constant{
+            targets.buffer.GetReference(),
+            pipelines->cross_entropy_accum.GetReference(),
+            totalPositions,
+            vocabSize,
+        });
+        cmd.dispatch(countGroups, 1, 1);
+        cmd.barrier();
+
+        // Pass 2: compute logits softmax, scaled grad, accumulate unscaled loss
         cmd.bind(pipelines->cross_entropy);
         cmd.push(evk::Constant{
             logits.buffer.GetReference(),
@@ -745,16 +764,14 @@ namespace evk::ai {
         cmd.dispatch(totalPositions, 1, 1);
         cmd.barrier();
 
-        // Pass 2: scale gradients and write mean loss
-        uint32_t totalElements = totalPositions * vocabSize;
-        const uint32_t WORKGROUP_SIZE = 256u;
-        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        // Pass 3: write mean loss (grad already scaled)
+        uint32_t groupsX = 1u;
         cmd.bind(pipelines->cross_entropy_scale);
         cmd.push(evk::Constant{
             grad.buffer.GetReference(),
             result.buffer.GetReference(),
             pipelines->cross_entropy_accum.GetReference(),
-            totalElements,
+            0u, // skip grad scaling; only compute loss
         });
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
