@@ -1090,6 +1090,7 @@ void run_circle_detection(uint32_t num_layers) {
         
         if (epoch % LOG_INTERVAL == 0 || epoch == EPOCHS - 1) {
             printf("  epoch %3d: loss = %.4f\n", epoch, epoch_loss);
+            fflush(stdout);
             CircleDataset::save_loss_graph("loss_graph.bmp", loss_history);
         }
         
