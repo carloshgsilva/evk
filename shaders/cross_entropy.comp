@@ -5,107 +5,75 @@
 #extension GL_EXT_buffer_reference : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_atomic_float : enable
 #extension GL_EXT_control_flow_attributes : enable
-
-// Cross Entropy Loss compute shader
-// Computes: loss = -mean(log_softmax(logits)[target])
-// Also computes gradient: grad = softmax(logits) - one_hot(target)
-// Sequential approach for simplicity (similar to mse_loss)
 
 layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 layout(buffer_reference) buffer BufferU16 { uint16_t x[]; };
+layout(buffer_reference) buffer BufferFp32 { float x[]; };
 
 PUSH(
-    BufferFp16 logitsBuffer;    // (totalPositions, vocabSize) logits
-    BufferU16 targetBuffer;     // (totalPositions) target indices as uint16
-    BufferFp16 resultBuffer;    // scalar output loss
-    BufferFp16 gradBuffer;      // (totalPositions, vocabSize) gradient output
-    uint vocabSize;             // V
-    uint totalPositions;        // B * N
+    BufferFp16 logitsBuffer;   // (totalPositions, vocabSize)
+    BufferU16 targetBuffer;    // (totalPositions)
+    BufferFp16 gradBuffer;     // (totalPositions, vocabSize)
+    BufferFp32 accumBuffer;    // float[2] -> {totalLoss, validCount}
+    uint vocabSize;            // V
+    uint totalPositions;       // B * N
 )
 
+// One workgroup (single subgroup) per row
 COMPUTE(32, 1, 1)
 void main() {
-    uint lid = gl_LocalInvocationID.x;
-    
-    float totalLoss = 0.0;
-    uint validPositions = 0;  // Count positions with valid targets
-    
-    // Process each position
-    for (uint pos = 0; pos < totalPositions; ++pos) {
-        uint rowStart = pos * vocabSize;
-        uint targetIdx = uint(targetBuffer.x[pos]);
-        
-        // Check if this is a valid position (target != 0 means valid)
-        // Target 0 is used as "ignore" marker for input positions
-        bool isValidTarget = (targetIdx != 0);
-        
-        // 1) Find max for numerical stability (parallel across lanes)
-        float localMax = -3.402823466e+38;
-        for (uint j = lid; j < vocabSize; j += 32) {
-            float v = float(logitsBuffer.x[rowStart + j]);
-            // Clamp to prevent overflow
-            v = clamp(v, -65000.0, 65000.0);
-            localMax = max(localMax, v);
-        }
-        float rowMax = subgroupMax(localMax);
-        
-        // 2) Compute exp sum
-        float localSum = 0.0;
-        for (uint j = lid; j < vocabSize; j += 32) {
-            float v = float(logitsBuffer.x[rowStart + j]);
-            v = clamp(v, -65000.0, 65000.0);
-            float ex = exp(v - rowMax);
-            localSum += ex;
-        }
-        float denom = subgroupAdd(localSum);
-        float invDenom = 1.0 / max(denom, 1e-20);
-        
-        // 3) Compute gradients and find target log probability
-        float targetLogProb = 0.0;
-        for (uint j = lid; j < vocabSize; j += 32) {
-            float logit = float(logitsBuffer.x[rowStart + j]);
-            logit = clamp(logit, -65000.0, 65000.0);
-            float softmax_val = exp(logit - rowMax) * invDenom;
-            
-            // Gradient: softmax - one_hot(target)
-            // But zero out gradient if this is an ignored position
-            float grad = softmax_val;
-            if (j == targetIdx) {
-                grad -= 1.0;
-                targetLogProb = logit - rowMax - log(max(denom, 1e-20));
-            }
-            // Zero gradient for ignored positions (target == 0)
-            gradBuffer.x[rowStart + j] = float16_t(isValidTarget ? grad : 0.0);
-        }
-        
-        // Only accumulate loss for valid positions
-        if (isValidTarget) {
-            // Reduce target log probability
-            targetLogProb = subgroupAdd(targetLogProb);
-            
-            // Accumulate loss (negative log probability)
-            if (!isnan(targetLogProb) && !isinf(targetLogProb)) {
-                totalLoss += -targetLogProb;
-            }
-            validPositions++;
-        }
+    uint row = gl_WorkGroupID.x;
+    if (row >= totalPositions) return;
+
+    uint lid = gl_LocalInvocationID.x; // 0..31
+    uint rowStart = row * vocabSize;
+    uint targetIdx = uint(targetBuffer.x[row]);
+    bool isValidTarget = (targetIdx != 0u);
+
+    // 1) Row-wise max for stability
+    float localMax = -3.402823466e+38; // -FLT_MAX
+    for (uint j = lid; j < vocabSize; j += 32) {
+        float v = float(logitsBuffer.x[rowStart + j]);
+        v = clamp(v, -65000.0, 65000.0);
+        localMax = max(localMax, v);
     }
-    
-    // Scale gradients by mean over valid positions to match loss definition
-    float invValid = (validPositions > 0u) ? (1.0 / float(validPositions)) : 0.0;
-    uint totalElems = totalPositions * vocabSize;
-    for (uint idx = lid; idx < totalElems; idx += 32) {
-        float g = float(gradBuffer.x[idx]) * invValid;
-        gradBuffer.x[idx] = float16_t(g);
+    float rowMax = subgroupMax(localMax);
+
+    // 2) Sum of exp
+    float localSum = 0.0;
+    for (uint j = lid; j < vocabSize; j += 32) {
+        float v = float(logitsBuffer.x[rowStart + j]);
+        v = clamp(v, -65000.0, 65000.0);
+        localSum += exp(v - rowMax);
     }
-    
-    // Store mean loss (over valid positions only)
-    if (lid == 0) {
-        float loss = (validPositions > 0) ? (totalLoss / float(validPositions)) : 0.0;
-        if (isnan(loss) || isinf(loss)) {
-            loss = 0.0;  // Fallback
+    float denom = subgroupAdd(localSum);
+    float safeDenom = max(denom, 1e-20);
+    float invDenom = 1.0 / safeDenom;
+    float logDenom = log(safeDenom);
+
+    // 3) Gradients + target log prob
+    float targetLogProb = 0.0;
+    for (uint j = lid; j < vocabSize; j += 32) {
+        float logit = float(logitsBuffer.x[rowStart + j]);
+        logit = clamp(logit, -65000.0, 65000.0);
+        float softmax_val = exp(logit - rowMax) * invDenom;
+
+        float grad = isValidTarget ? softmax_val : 0.0;
+        if (isValidTarget && j == targetIdx) {
+            grad -= 1.0;
+            targetLogProb = logit - rowMax - logDenom;
         }
-        resultBuffer.x[0] = float16_t(loss);
+        gradBuffer.x[rowStart + j] = float16_t(grad);
+    }
+
+    // 4) Accumulate totals using atomics
+    if (isValidTarget) {
+        float reducedTarget = subgroupAdd(targetLogProb);
+        if (lid == 0) {
+            atomicAdd(accumBuffer.x[0], -reducedTarget); // total loss
+            atomicAdd(accumBuffer.x[1], 1.0);            // valid count
+        }
     }
 }

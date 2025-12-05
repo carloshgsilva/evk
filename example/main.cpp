@@ -19,7 +19,7 @@ int main() {
     });
     evk::ai::initialize();
 
-    benchmark_matmul();
+    bench();
     // main_llm();
 
     // Test the command buffer API

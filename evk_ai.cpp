@@ -39,6 +39,7 @@ namespace evk::ai {
         evk::Pipeline flash_attn_bwd;
         evk::Pipeline mse_loss;
         evk::Pipeline cross_entropy;
+        evk::Pipeline cross_entropy_scale;
         evk::Pipeline sgd;
         evk::Pipeline adam;
         evk::Pipeline add;
@@ -56,6 +57,7 @@ namespace evk::ai {
         evk::Pipeline sum_batch;
         evk::Pipeline rms_norm;
         evk::Pipeline rms_norm_bwd;
+        evk::Buffer cross_entropy_accum;
         evk::Buffer flash_scratch;
         uint32_t flash_scratch_elems = 0;
     };
@@ -219,6 +221,10 @@ namespace evk::ai {
             .name = "cross_entropy",
             .CS = evk::loadSpirvFile("shaders/bin/cross_entropy.comp.spv"),
         });
+        pipelines->cross_entropy_scale = evk::CreatePipeline({
+            .name = "cross_entropy_scale",
+            .CS = evk::loadSpirvFile("shaders/bin/cross_entropy_scale.comp.spv"),
+        });
         pipelines->embed = evk::CreatePipeline({
             .name = "embed",
             .CS = evk::loadSpirvFile("shaders/bin/embed.comp.spv"),
@@ -267,6 +273,7 @@ namespace evk::ai {
             .name = "rms_norm_bwd",
             .CS = evk::loadSpirvFile("shaders/bin/rms_norm_bwd.comp.spv"),
         });
+        pipelines->cross_entropy_accum = {};
         pipelines->flash_scratch = {};
         pipelines->flash_scratch_elems = 0;
     }
@@ -759,26 +766,45 @@ namespace evk::ai {
         assert(targets.shape[0] == totalPositions);
         assert(grad.shape[0] == totalPositions && grad.shape[1] == vocabSize);
 
-        // Zero out the result buffer first
-        float16_t* rp = result.cpu();
-        rp[0] = float16_t(0.0f);
-        result.cpu_upload();
+        // Allocate scratch for loss/count accumulation (float[2])
+        if (!pipelines->cross_entropy_accum) {
+            pipelines->cross_entropy_accum = evk::CreateBuffer({
+                .size = sizeof(float) * 2,
+                .usage = evk::BufferUsage::Storage | evk::BufferUsage::TransferDst,
+            });
+        }
 
         auto& cmd = evk::ai::GetCmd();
+        // Reset accumulators using GPU fill (uint32 pattern)
+        cmd.fill(pipelines->cross_entropy_accum, 0u, sizeof(float) * 2);
+        cmd.barrier();
+
+        // Pass 1: compute logits softmax, unscaled grad, accumulate loss/count
         cmd.bind(pipelines->cross_entropy);
         cmd.push(evk::Constant{
             logits.buffer.GetReference(),
             targets.buffer.GetReference(),
-            result.buffer.GetReference(),
             grad.buffer.GetReference(),
+            pipelines->cross_entropy_accum.GetReference(),
             vocabSize,
             totalPositions,
         });
-        cmd.dispatch(1, 1, 1);
+        cmd.dispatch(totalPositions, 1, 1);
         cmd.barrier();
-        if (!evk::ai::InGraphRecording()) {
-            evk::ai::SubmitCmd(true);
-        }
+
+        // Pass 2: scale gradients and write mean loss
+        uint32_t totalElements = totalPositions * vocabSize;
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        cmd.bind(pipelines->cross_entropy_scale);
+        cmd.push(evk::Constant{
+            grad.buffer.GetReference(),
+            result.buffer.GetReference(),
+            pipelines->cross_entropy_accum.GetReference(),
+            totalElements,
+        });
+        cmd.dispatch(groupsX, 1, 1);
+        cmd.barrier();
     }
 
     void embed(Tensor& embeddings, Tensor& indices, Tensor& out) {
