@@ -14,26 +14,15 @@ PUSH(
     uint totalElements;      // totalPositions * vocabSize
 )
 
-// Scale gradients by mean over valid positions and write mean loss
-COMPUTE(256, 1, 1)
+// Write mean loss (grads are already scaled in cross_entropy.comp)
+COMPUTE(1, 1, 1)
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
-
     float totalLoss = accumBuffer.x[0];
     float validCount = accumBuffer.x[1];
-    float invValid = (validCount > 0.0) ? (1.0 / validCount) : 0.0;
-
-    if (gid < totalElements) {
-        float g = float(gradBuffer.x[gid]) * invValid;
-        gradBuffer.x[gid] = float16_t(g);
+    float loss = (validCount > 0.0) ? totalLoss : 0.0;
+    if (isnan(loss) || isinf(loss)) {
+        loss = 0.0;
     }
-
-    if (gid == 0) {
-        float loss = (validCount > 0.0) ? (totalLoss * invValid) : 0.0;
-        if (isnan(loss) || isinf(loss)) {
-            loss = 0.0;
-        }
-        resultBuffer.x[0] = float16_t(loss);
-    }
+    resultBuffer.x[0] = float16_t(loss);
 }
 

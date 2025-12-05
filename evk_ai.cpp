@@ -751,7 +751,7 @@ namespace evk::ai {
         cmd.dispatch(countGroups, 1, 1);
         cmd.barrier();
 
-        // Pass 2: compute logits softmax, scaled grad, accumulate unscaled loss
+        // Pass 2: Compute logits softmax, unscaled grad, accumulate unscaled loss
         cmd.bind(pipelines->cross_entropy);
         cmd.push(evk::Constant{
             logits.buffer.GetReference(),
@@ -764,14 +764,15 @@ namespace evk::ai {
         cmd.dispatch(totalPositions, 1, 1);
         cmd.barrier();
 
-        // Pass 3: write mean loss (grad already scaled)
+        // Pass 3: Scale gradients and write mean loss
+        uint32_t totalElements = 0u; // grads already scaled; loss only
         uint32_t groupsX = 1u;
         cmd.bind(pipelines->cross_entropy_scale);
         cmd.push(evk::Constant{
             grad.buffer.GetReference(),
             result.buffer.GetReference(),
             pipelines->cross_entropy_accum.GetReference(),
-            0u, // skip grad scaling; only compute loss
+            totalElements,
         });
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
