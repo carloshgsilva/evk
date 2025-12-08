@@ -1,4 +1,5 @@
 #include <iostream>
+#include <algorithm>
 #include <evk_ai.h>
 
 #include "bmp.h"
@@ -388,11 +389,7 @@ struct CircleDataset {
     // Generate a single sample: random circles + sampled points
     // Returns the number of circles generated (1 to n_max_prims)
     uint32_t generate_sample(CircleData* circles_out, PointData* points_out, uint32_t force_num_circles = 0) {
-#if 0 // Enable variable number of circles for more variety
         uint32_t num_circles = force_num_circles ? force_num_circles : (1 + (rand() % n_max_prims));
-#else // Fixed number of circles unless explicitly overridden
-        uint32_t num_circles = force_num_circles ? force_num_circles : n_max_prims;
-#endif
         num_circles = (std::max)(1u, (std::min)(num_circles, n_max_prims));
         
         // Generate random circles (ensuring they fit in grid)
@@ -459,6 +456,11 @@ struct CircleDataset {
                 ++point_idx;
             }
         }
+        
+        std::sort(points_out, points_out + point_idx, [](const PointData& a, const PointData& b) {
+            if (a.x == b.x) return a.y < b.y;
+            return a.x < b.x;
+        });
         
         // Pad remaining slots (should rarely trigger)
         for (; point_idx < n_points; ++point_idx) {
