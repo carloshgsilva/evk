@@ -1,9 +1,16 @@
-@echo off
+
 if not defined INCLUDE (
     call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >NUL 2>&1
 )
 
-cmake --build build -- --quiet
+REM Configure the build and enable the example target
+call cmake -S . -B build -D EVK_BUILD_EXAMPLE=ON -D CMAKE_BUILD_TYPE=Release
+if errorlevel 1 (
+    echo CMake configuration failed!
+    exit /b 1
+)
+
+call cmake --build build --config Release -- --quiet
 
 REM Detect if cmake build failed
 if errorlevel 1 (
@@ -19,4 +26,4 @@ for %%f in (shaders\*.comp) do (
     )
 )
 
-build\evk_example.exe
+call build\evk_example.exe
