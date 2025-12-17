@@ -152,6 +152,53 @@ void benchmark_cross_entropy_loss() {
     delete loss;
 }
 
+void benchmark_graph_matmul_broadcast() {
+    printf("benchmark_graph_matmul_broadcast_graph()\n");
+
+    const uint32_t BATCH = 4u;
+    const uint32_t SIZE = 1024u;
+    const uint32_t TILE = 64u;
+    const uint32_t WARMUP = 2u;
+    const uint32_t ITERS = 8u;
+    const uint32_t SUB_ITER = 4u;
+
+    Graph graph;
+
+    Tensor& a = graph.tensor({BATCH, SIZE, SIZE}).fill(float16_t(1.0f));
+    Tensor& w = graph.tensor({SIZE, SIZE}, true).identity(float16_t(1.0f));
+    Tensor& target = graph.tensor({BATCH, SIZE, SIZE}).fill(float16_t(0.0f));
+    Tensor& out = graph.matmul(a, w, TILE, TILE);
+    Tensor& loss = graph.mse_loss(out, target);
+    (void)loss;
+
+    evk::ai::GetCmd();
+    for (uint32_t i = 0; i < WARMUP; ++i) {
+        graph.eval(true, false, false);
+    }
+    evk::ai::SubmitCmd(true);
+
+    float min_ms = 1e9f;
+    for (uint32_t it = 0; it < ITERS; ++it) {
+        auto& cmd = evk::ai::GetCmd();
+        for (uint32_t i = 0; i < SUB_ITER; ++i) {
+            cmd.timestamp("graph_matmul_broadcast", [&]() {
+                graph.eval(true, false, false);
+            });
+        }
+        evk::ai::SubmitCmd(true);
+        for (const auto& ts : evk::CmdTimestamps()) {
+            if (strcmp(ts.name, "graph_matmul_broadcast") == 0) {
+                min_ms = fminf(min_ms, float(ts.end - ts.start));
+            }
+        }
+    }
+
+    double ops = 6.0 * double(BATCH) * double(SIZE) * double(SIZE) * double(SIZE);
+    double tflops = ops / (double(min_ms) / 1000.0) / 1e12;
+    printf("graph_matmul_broadcast (fwd+bwd): %5.3fms (%7.3ftflops)", min_ms, tflops);
+    printf(" BATCH = %u, SIZE = %u, TILE = %u\n", BATCH, SIZE, TILE);
+}
+
 void bench() {
     // benchmark_matmul();
     // benchmark_matmul_broadcast();
