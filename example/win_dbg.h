@@ -77,8 +77,7 @@ static void PrintStackTraceFromContext(const CONTEXT &context) {
     SymCleanup(hProcess);
 }
 
-#ifdef _MSC_VER
-#ifdef _DEBUG
+#if defined(_MSC_VER) && defined(_DEBUG)
 // CRT report hook implementation. The hook will capture the context and print a stack trace
 static int __cdecl crtReportHook(int reportType, char* message, int* returnValue) {
     if (reportType == _CRT_ASSERT || reportType == _CRT_ERROR || reportType == _CRT_WARN) {
@@ -90,6 +89,7 @@ static int __cdecl crtReportHook(int reportType, char* message, int* returnValue
         PrintStackTraceFromContext(ctx);
         // If a debugger is attached, break to allow inspection; otherwise exit
         fflush(stderr);
+        fflush(stdout);
         if (IsDebuggerPresent()) {
             DebugBreak();
         } else {
@@ -99,29 +99,14 @@ static int __cdecl crtReportHook(int reportType, char* message, int* returnValue
     }
     return 0; // not handled
 }
-#endif
-#endif
-
-LONG WINAPI CustomUnhandledExceptionFilter(EXCEPTION_POINTERS* pExceptionInfo) {
-    printf("Fatal error: Unhandled exception occurred.\n");
-
-    // Generate the stack trace
-    CONTEXT context = *pExceptionInfo->ContextRecord;
-    PrintStackTraceFromContext(context);
-
-    exit(1);
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-
-// (Hook defined above)
 
 void set_unhandled_exception_filter() {
-    // SetUnhandledExceptionFilter(CustomUnhandledExceptionFilter);
-#ifdef _MSC_VER
-    // Hook CRT reports (assert/warn/error) in debug builds
-#ifdef _DEBUG
-    // Install the CRT report hook (stores previous hook if needed)
+    // Install the CRT report hook
     _CrtSetReportHook(crtReportHook);
-#endif
-#endif
 }
+#else
+void set_unhandled_exception_filter() {
+
+}
+#endif
+
