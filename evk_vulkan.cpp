@@ -1150,8 +1150,14 @@ namespace evk {
         }
 
         _EndFrame();
-        _WaitFrameCompletion();
-        _ReleaseResources();
+        CHECK_VK(vkDeviceWaitIdle(S.device));
+
+        for (auto& f : S.frames) {
+            for (int i = 0; i < f.toDelete.size(); i++) {
+                delete f.toDelete[i];
+            }
+            f.toDelete.clear();
+        }
 
         S.frames.clear();
 
