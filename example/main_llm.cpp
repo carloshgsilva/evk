@@ -344,7 +344,7 @@ void main_llm() {
     auto start = std::chrono::high_resolution_clock::now();
     // run_circle_detection(1);
     // run_circle_detection(2);
-    run_circle_detection(4);
+    run_circle_detection(6);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
     printf("run_circle_detection() took %.4f seconds\n", duration.count());
@@ -402,19 +402,14 @@ struct CircleDataset {
             circles_out[c].r = uint16_t(r);
         }
         
-        // Sort circles by (x + y) for simple consistent ordering
-        // This gives a clean diagonal sweep ordering that's easier to learn
-        for (uint32_t i = 0; i < num_circles; ++i) {
-            for (uint32_t j = i + 1; j < num_circles; ++j) {
-                uint32_t sum_i = circles_out[i].x + circles_out[i].y;
-                uint32_t sum_j = circles_out[j].x + circles_out[j].y;
-                if (sum_j < sum_i) {
-                    CircleData tmp = circles_out[i];
-                    circles_out[i] = circles_out[j];
-                    circles_out[j] = tmp;
-                }
-            }
-        }
+        // Sort circles into a canonical, easy-to-learn order.
+        // Lexicographic ordering (x, then y, then r) avoids near-ties from (x+y)
+        // and matches the point sorting bias (points are sorted by x/y below).
+        std::sort(circles_out, circles_out + num_circles, [](const CircleData& a, const CircleData& b) {
+            if (a.x != b.x) return a.x < b.x;
+            if (a.y != b.y) return a.y < b.y;
+            return a.r < b.r;
+        });
         
         // Pad unused circles with zeros (special "no circle" token)
         for (uint32_t c = num_circles; c < n_max_prims; ++c) {
@@ -441,9 +436,12 @@ struct CircleDataset {
             
             for (uint32_t p = 0; p < pts_for_this && point_idx < n_points; ++p) {
                 float angle = base_angle + angle_step * float(p);
-                angle += (float(rand()) / float(RAND_MAX) - 0.5f) * (0.2f * angle_step);
+                // Keep some randomness, but avoid large jitter/bias that makes the exact
+                // generating circle hard to recover from quantized points.
+                angle += (float(rand()) / float(RAND_MAX) - 0.5f) * (0.05f * angle_step);
                 
-                float noise = 0.95f + 0.02f * float(rand()) / float(RAND_MAX);
+                // Radial noise centered around 1.0 (no systematic shrink).
+                float noise = 0.99f + 0.02f * float(rand()) / float(RAND_MAX);
                 float px = cx + cr * noise * cosf(angle);
                 float py = cy + cr * noise * sinf(angle);
                 
@@ -602,8 +600,19 @@ struct CircleDataset {
 
 // Helper functions for computing CircleDetector dimensions
 inline uint32_t compute_vocab_size(uint32_t grid_size) {
-    uint32_t raw_vocab = grid_size + 1;  // +1 for "no value" token (0)
-    return ((raw_vocab + 15) / 16) * 16;  // Pad to multiple of 16
+    // Tokenization uses disjoint ranges for x, y and r so the model doesn't
+    // have to infer "which field am I predicting" purely from position.
+    //
+    // Token IDs:
+    //   0                  : reserved / ignored target
+    //   [1 .. grid_size]    : x values (x = token - 1)
+    //   [1+grid_size .. 2*grid_size] : y values
+    //   [1+2*grid_size .. 3*grid_size] : r values
+    //   plus 2 special tokens at the end: no_circle, start
+    //
+    // We still pad to a multiple of 16 for GPU friendliness.
+    uint32_t raw_vocab = 3 * grid_size + 3; // includes 0 plus room for special tokens
+    return ((raw_vocab + 15) / 16) * 16;
 }
 
 inline uint32_t compute_total_seq_len(uint32_t n_points, uint32_t n_max_prims) {
@@ -652,6 +661,11 @@ struct CircleDetector {
     uint32_t grid_size;         // Discrete coordinate space
     uint16_t start_token;       // Dedicated start token for decoder
     uint16_t no_circle_token;   // Explicit "no circle" token (keeps loss active)
+
+    // Token range bases (disjoint ranges for x/y/r)
+    uint16_t tok_x0;
+    uint16_t tok_y0;
+    uint16_t tok_r0;
     
     // Computed dimensions
     uint32_t vocab_size;        // grid_size for x, y, r
@@ -683,6 +697,11 @@ struct CircleDetector {
     {
         no_circle_token = uint16_t(vocab_size > 2 ? vocab_size - 2 : 0);
         start_token = uint16_t(vocab_size > 1 ? vocab_size - 1 : 0);
+
+        tok_x0 = 1;
+        tok_y0 = uint16_t(1 + grid_size);
+        tok_r0 = uint16_t(1 + 2 * grid_size);
+
         tmp_circles.resize(n_max_prims);
         tmp_points.resize(n_points);
         tmp_full_inp.resize(transformer.batch_size * total_seq_len);
@@ -698,9 +717,8 @@ struct CircleDetector {
     // Encode points into input tokens
     void encode_points(uint16_t* tokens, const PointData* points) {
         for (uint32_t p = 0; p < n_points; ++p) {
-            // +1 because 0 is reserved for "no value"
-            tokens[p * 2 + 0] = points[p].x + 1;
-            tokens[p * 2 + 1] = points[p].y + 1;
+            tokens[p * 2 + 0] = uint16_t(tok_x0 + points[p].x);
+            tokens[p * 2 + 1] = uint16_t(tok_y0 + points[p].y);
         }
     }
     
@@ -708,9 +726,9 @@ struct CircleDetector {
     void encode_circles(uint16_t* tokens, const CircleData* circles, uint32_t num_circles) {
         for (uint32_t c = 0; c < n_max_prims; ++c) {
             if (c < num_circles && circles[c].r > 0) {
-                tokens[c * 3 + 0] = circles[c].x + 1;
-                tokens[c * 3 + 1] = circles[c].y + 1;
-                tokens[c * 3 + 2] = circles[c].r + 1;
+                tokens[c * 3 + 0] = uint16_t(tok_x0 + circles[c].x);
+                tokens[c * 3 + 1] = uint16_t(tok_y0 + circles[c].y);
+                tokens[c * 3 + 2] = uint16_t(tok_r0 + circles[c].r);
             } else {
                 tokens[c * 3 + 0] = no_circle_token;
                 tokens[c * 3 + 1] = no_circle_token;
@@ -725,11 +743,17 @@ struct CircleDetector {
             uint16_t x = tokens[c * 3 + 0];
             uint16_t y = tokens[c * 3 + 1];
             uint16_t r = tokens[c * 3 + 2];
+
             bool is_blank = (x == 0) || (y == 0) || (r == 0) ||
                             (x == no_circle_token) || (y == no_circle_token) || (r == no_circle_token);
-            circles_out[c].x = (!is_blank && x > 0) ? uint16_t(x - 1) : 0;
-            circles_out[c].y = (!is_blank && y > 0) ? uint16_t(y - 1) : 0;
-            circles_out[c].r = (!is_blank && r > 0) ? uint16_t(r - 1) : 0;
+
+            bool x_ok = (x >= tok_x0) && (x < tok_x0 + grid_size);
+            bool y_ok = (y >= tok_y0) && (y < tok_y0 + grid_size);
+            bool r_ok = (r >= tok_r0) && (r < tok_r0 + grid_size);
+
+            circles_out[c].x = (!is_blank && x_ok) ? uint16_t(x - tok_x0) : 0;
+            circles_out[c].y = (!is_blank && y_ok) ? uint16_t(y - tok_y0) : 0;
+            circles_out[c].r = (!is_blank && r_ok) ? uint16_t(r - tok_r0) : 0;
         }
     }
     
@@ -756,6 +780,10 @@ struct CircleDetector {
             // Full input sequence
             memcpy(inp_ptr, point_tokens.data(), input_seq_len * sizeof(uint16_t));
             inp_ptr[input_seq_len] = start_token;  // Start token
+            // Teacher-forced decoder inputs (shifted by 1):
+            //   inp:  [start, y0, y1, ...]
+            //   tgt:  [y0,    y1, y2, ...]
+            // This matches autoregressive inference.
             memcpy(inp_ptr + input_seq_len + 1, circle_tokens.data(), (output_seq_len - 1) * sizeof(uint16_t));
             std::fill(inp_ptr + input_seq_len + output_seq_len, inp_ptr + total_seq_len, 0);
             
@@ -799,46 +827,48 @@ struct CircleDetector {
         for (uint32_t t = input_seq_len + 1; t < total_seq_len; ++t) {
             inp[t] = 0;
         }
-        
+
         std::vector<uint16_t> generated_tokens(output_seq_len);
-        
+
         for (uint32_t out_pos = 0; out_pos < output_seq_len; ++out_pos) {
             transformer.inf_input->cpu_upload();
             transformer.inference.eval(false);
-            
+
             transformer.inf_logits->cpu_download();
             float16_t* logits = transformer.inf_logits->cpu();
-            
+
             // Get prediction at current output position
             uint32_t pos = input_seq_len + out_pos;
             float max_val = -1e9f;
             uint16_t max_idx = 0;
-            for (uint32_t v = 0; v < vocab_size; ++v) {
+
+            // Masked argmax: restrict to the expected token type (x / y / r) plus no-circle.
+            uint32_t slot = out_pos % 3;
+            uint32_t base = (slot == 0) ? tok_x0 : (slot == 1) ? tok_y0 : tok_r0;
+            uint32_t end = base + grid_size; // exclusive
+            for (uint32_t v = base; v < end && v < vocab_size; ++v) {
                 float val = float(logits[pos * vocab_size + v]);
                 if (val > max_val) {
                     max_val = val;
                     max_idx = uint16_t(v);
                 }
             }
-            
-            generated_tokens[out_pos] = max_idx;
-            
-            // Early stop: once a full circle slot starts with a no-circle token,
-            // force the remaining outputs to no-circle to reduce spurious shapes.
-            bool at_circle_start = (out_pos % 3 == 0);
-            if (at_circle_start && max_idx == no_circle_token) {
-                for (uint32_t k = out_pos; k < output_seq_len; ++k) {
-                    generated_tokens[k] = no_circle_token;
+            if (no_circle_token < vocab_size) {
+                float val = float(logits[pos * vocab_size + no_circle_token]);
+                if (val > max_val) {
+                    max_val = val;
+                    max_idx = no_circle_token;
                 }
-                break;
             }
-            
+
+            generated_tokens[out_pos] = max_idx;
+
             // Feed back for next position
             if (out_pos + 1 < output_seq_len) {
                 inp[input_seq_len + out_pos + 1] = max_idx;
             }
         }
-        
+
         decode_circles(generated_tokens.data(), circles_out);
     }
 };
@@ -908,11 +938,11 @@ void run_circle_detection(uint32_t num_layers) {
            detector.input_seq_len, detector.output_seq_len, detector.total_seq_len);
     
     // Training hyperparameters
-    const int EPOCHS = 3000;
-    const float LR = 0.0225f;
-    const int WARMUP_EPOCHS = 120;
-    const float MIN_LR_SCALE = 0.08f;
-    const int LOG_INTERVAL = 500;
+    const int EPOCHS = 24000;
+    const float LR = 0.0125f;
+    const int WARMUP_EPOCHS = 400;
+    const float MIN_LR_SCALE = 0.02f;
+    const int LOG_INTERVAL = 2000;
     
     printf("  Training for %d epochs with LR=%.4f, warmup=%d\n",
            EPOCHS, LR, WARMUP_EPOCHS);
@@ -933,7 +963,12 @@ void run_circle_detection(uint32_t num_layers) {
             effective_lr = min_lr + (LR - min_lr) * 0.5f * (1.0f + cosf(3.14159265f * progress));
         }
         
-        float epoch_loss = detector.train_batch(dataset, effective_lr, 0, &timing_window);
+        // Mixed oversampling strategy:
+        // - mostly train on the hardest 3-circle batches
+        // - periodically use fully-random batches to preserve no-circle behavior
+        uint32_t force_circles = ((epoch % 5) == 0) ? 0u : 3u;
+
+        float epoch_loss = detector.train_batch(dataset, effective_lr, force_circles, &timing_window);
         loss_history.push_back(epoch_loss);
         
         if (epoch % LOG_INTERVAL == 0 || epoch == EPOCHS - 1) {
@@ -958,44 +993,123 @@ void run_circle_detection(uint32_t num_layers) {
     printf("  error must be zero to match exactly the validation\n");
     
     // Generate test samples and visualize predictions
-    const int NUM_TEST = 5;
+    const int NUM_TEST_VIS = 5;
+    const int NUM_TEST = 200;
     std::vector<CircleData> gt_circles(N_MAX_PRIMS);
     std::vector<CircleData> pred_circles(N_MAX_PRIMS);
     std::vector<PointData> points(N_POINTS);
     
     srand(12345);  // Different seed for test samples
 
-    int total_error = 0;
+    struct Bucket {
+        int samples = 0;
+        int exact = 0;
+        long long abs_err = 0;   // sum of L1 error over GT circles
+        long long extra = 0;     // count of extra circles predicted (r>0)
+    } buckets[N_MAX_PRIMS + 1] = {};
+
+    long long total_abs_err = 0;
+    long long total_extra = 0;
+    int total_exact = 0;
     for (int t = 0; t < NUM_TEST; ++t) {
         uint32_t num_gt = dataset.generate_sample(gt_circles.data(), points.data());
         
-        printf("  Test %d (num_circles=%u): \n", t, num_gt);
+        bool verbose = (t < NUM_TEST_VIS);
+        if (verbose) {
+            printf("  Test %d (num_circles=%u): \n", t, num_gt);
+        }
         detector.predict(points.data(), pred_circles.data());
+
+        bool sample_exact = true;
+        int sample_abs_err = 0;
+        int sample_extra = 0;
+
+        auto circle_l1 = [](const CircleData& a, const CircleData& b) {
+            return abs(int(a.x) - int(b.x)) + abs(int(a.y) - int(b.y)) + abs(int(a.r) - int(b.r));
+        };
         
         // Print validation with detailed debug info
         for (uint32_t c = 0; c < num_gt; ++c) {
             int err = abs(gt_circles[c].x - pred_circles[c].x) + 
                       abs(gt_circles[c].y - pred_circles[c].y) + 
                       abs(gt_circles[c].r - pred_circles[c].r);
-            printf("    Circle %d: GT=(%d,%d,r=%d) Pred=(%d,%d,r=%d) error=%d\n", 
-                   c, gt_circles[c].x, gt_circles[c].y, gt_circles[c].r,
-                   pred_circles[c].x, pred_circles[c].y, pred_circles[c].r, err);
-            total_error += err;
+            if (verbose) {
+                printf("    Circle %d: GT=(%d,%d,r=%d) Pred=(%d,%d,r=%d) error=%d\n", 
+                       c, gt_circles[c].x, gt_circles[c].y, gt_circles[c].r,
+                       pred_circles[c].x, pred_circles[c].y, pred_circles[c].r, err);
+            }
+            sample_abs_err += err;
+            if (err != 0) sample_exact = false;
         }
         // Also show any extra predicted circles
         for (uint32_t c = num_gt; c < N_MAX_PRIMS; ++c) {
             if (pred_circles[c].r > 0) {
-                printf("    Circle %d (extra): Pred=(%d,%d,r=%d)\n",
-                       c, pred_circles[c].x, pred_circles[c].y, pred_circles[c].r);
+                if (verbose) {
+                    printf("    Circle %d (extra): Pred=(%d,%d,r=%d)\n",
+                           c, pred_circles[c].x, pred_circles[c].y, pred_circles[c].r);
+                }
+                sample_exact = false;
+                sample_extra++;
             }
         }
 
-        // Save visualization
-        char filename[64];
-        snprintf(filename, sizeof(filename), "circle_test_%d.bmp", t);
-        dataset.save_sample_bmp(filename, gt_circles.data(), num_gt, 
-                               points.data(), N_POINTS,
-                               pred_circles.data(), N_MAX_PRIMS);
+        // Diagnostic: if ordering is the main issue, the best-permutation error can be much smaller
+        // than the fixed-slot error we're training/evaluating on.
+        if (verbose) {
+            int best_perm_err = 0;
+            if (num_gt == 1) {
+                best_perm_err = circle_l1(gt_circles[0], pred_circles[0]);
+            } else if (num_gt == 2) {
+                int e0 = circle_l1(gt_circles[0], pred_circles[0]) + circle_l1(gt_circles[1], pred_circles[1]);
+                int e1 = circle_l1(gt_circles[0], pred_circles[1]) + circle_l1(gt_circles[1], pred_circles[0]);
+                best_perm_err = (std::min)(e0, e1);
+            } else if (num_gt == 3) {
+                const int perms[6][3] = {
+                    {0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}
+                };
+                int best = 1 << 30;
+                for (int pi = 0; pi < 6; ++pi) {
+                    int e = circle_l1(gt_circles[0], pred_circles[perms[pi][0]]) +
+                            circle_l1(gt_circles[1], pred_circles[perms[pi][1]]) +
+                            circle_l1(gt_circles[2], pred_circles[perms[pi][2]]);
+                    best = (std::min)(best, e);
+                }
+                best_perm_err = best;
+            }
+            printf("    best_permutation_error=%d\n", best_perm_err);
+        }
+
+        buckets[num_gt].samples++;
+        buckets[num_gt].abs_err += sample_abs_err;
+        buckets[num_gt].extra += sample_extra;
+        total_abs_err += sample_abs_err;
+        total_extra += sample_extra;
+        if (sample_exact) {
+            buckets[num_gt].exact++;
+            total_exact++;
+        }
+
+        // Save visualization (only for a few examples)
+        if (verbose) {
+            char filename[64];
+            snprintf(filename, sizeof(filename), "circle_test_%d.bmp", t);
+            dataset.save_sample_bmp(filename, gt_circles.data(), num_gt, 
+                                   points.data(), N_POINTS,
+                                   pred_circles.data(), N_MAX_PRIMS);
+        }
     }
-    printf("  Total error: %d\n", total_error);
+    printf("  Total abs error (GT circles): %lld (over %d samples)\n", total_abs_err, NUM_TEST);
+    printf("  Extra circles predicted: %lld (over %d samples)\n", total_extra, NUM_TEST);
+    printf("  Exact samples: %d / %d (%.2f%%)\n", total_exact, NUM_TEST,
+           100.0f * float(total_exact) / float(NUM_TEST));
+    for (uint32_t k = 1; k <= N_MAX_PRIMS; ++k) {
+        if (buckets[k].samples == 0) continue;
+        printf("  num_circles=%u: exact=%d/%d (%.2f%%), avg_abs_err=%.3f, avg_extra=%.3f\n",
+               k,
+               buckets[k].exact,
+               buckets[k].samples,
+               100.0f * float(buckets[k].exact) / float(buckets[k].samples),
+               double(buckets[k].abs_err) / double(buckets[k].samples),
+               double(buckets[k].extra) / double(buckets[k].samples));
+    }
 }
