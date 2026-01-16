@@ -5,6 +5,31 @@
 #include "evk.h"
 
 namespace evk {
+
+#if EVK_DEBUG
+    static VKAPI_ATTR VkBool32 VKAPI_CALL EVK_DebugUtilsCallback(
+        VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+        VkDebugUtilsMessageTypeFlagsEXT type,
+        const VkDebugUtilsMessengerCallbackDataEXT* callbackData,
+        void* userData) {
+        (void)type;
+        (void)userData;
+
+        // Keep logs focused: only warn/error by default.
+        if ((severity & (VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)) == 0) {
+            return VK_FALSE;
+        }
+
+        const char* sev = "INFO";
+        if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) sev = "ERROR";
+        else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) sev = "WARN";
+        else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) sev = "INFO";
+        else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT) sev = "VERBOSE";
+
+        printf("[vulkan] [%s] %s\n", sev, callbackData && callbackData->pMessage ? callbackData->pMessage : "(null)");
+        return VK_FALSE;
+    }
+#endif
     static State* GState;
 
     const VmaMemoryUsage MEMORY_TYPE_VMA[] = {
@@ -765,18 +790,27 @@ namespace evk {
             instanceci.enabledLayerCount = uint32_t(layers.size());
             instanceci.ppEnabledLayerNames = layers.data();
 
-            // #if EVK_DEBUG
-            //     VkValidationFeatureEnableEXT validationEnable[] = { VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT };
-            //     VkValidationFeaturesEXT feature_validation = {VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
-            //     feature_validation.disabledValidationFeatureCount = 0;
-            //     feature_validation.pDisabledValidationFeatures = nullptr;
-            //     feature_validation.enabledValidationFeatureCount = 1;
-            //     feature_validation.pEnabledValidationFeatures = validationEnable;
-            //     feature_validation.pNext = instanceci.pNext;
-            //     instanceci.pNext = &feature_validation;
-            // #endif
 
             CHECK_VK(vkCreateInstance(&instanceci, nullptr, &S.instance));
+
+#if EVK_DEBUG
+            {
+                auto vkCreateDebugUtilsMessengerEXT_fn = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(S.instance, "vkCreateDebugUtilsMessengerEXT");
+                EVK_ASSERT(vkCreateDebugUtilsMessengerEXT_fn, "vkCreateDebugUtilsMessengerEXT not found");
+
+                VkDebugUtilsMessengerCreateInfoEXT messengerCI = {VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+                messengerCI.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+                                             VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+                                             VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                                             VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+                messengerCI.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                                          VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                                          VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+                messengerCI.pfnUserCallback = EVK_DebugUtilsCallback;
+
+                CHECK_VK(vkCreateDebugUtilsMessengerEXT_fn(S.instance, &messengerCI, nullptr, &S.debugMessenger));
+            }
+#endif
         }
 
         // Device and Queues
@@ -1179,6 +1213,17 @@ namespace evk {
         S.commandBuffers.clear();
 
         vmaDestroyAllocator(GetState().allocator);
+
+#if EVK_DEBUG
+        if (S.debugMessenger != VK_NULL_HANDLE) {
+            auto vkDestroyDebugUtilsMessengerEXT_fn = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(S.instance, "vkDestroyDebugUtilsMessengerEXT");
+            if (vkDestroyDebugUtilsMessengerEXT_fn) {
+                vkDestroyDebugUtilsMessengerEXT_fn(S.instance, S.debugMessenger, nullptr);
+            }
+            S.debugMessenger = VK_NULL_HANDLE;
+        }
+#endif
+
         vkDestroyDescriptorPool(S.device, S.descriptorPool, nullptr);
         vkDestroyDescriptorSetLayout(S.device, S.descriptorSetLayout, nullptr);
         vkDestroyPipelineLayout(S.device, S.pipelineLayout, nullptr);
@@ -2110,13 +2155,15 @@ namespace evk {
             EVK_ASSERT(desc.indices, "BLASDesc::indices must not be null");
             EVK_ASSERT(desc.vertices, "BLASDesc::vertices must not be null");
             EVK_ASSERT(desc.triangleCount > 0, "BLASDesc::triangleCount must not be zero");
+            EVK_ASSERT(desc.vertexCount > 0, "BLASDesc::vertexCount must not be zero");
 
             VkAccelerationStructureGeometryTrianglesDataKHR triangles = {
                 .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
                 .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
                 .vertexData = {.deviceAddress = ToInternal(desc.vertices).deviceAddress},
                 .vertexStride = desc.stride,
-                .maxVertex = desc.vertexCount,
+                // maxVertex is the *highest* valid vertex index (inclusive), not the vertex count.
+                .maxVertex = desc.vertexCount - 1,
                 .indexType = VK_INDEX_TYPE_UINT32,
                 .indexData = {.deviceAddress = ToInternal(desc.indices).deviceAddress},
                 .transformData = {.hostAddress = nullptr},  // identity transform // TODO: support multiple geometries
@@ -2163,7 +2210,10 @@ namespace evk {
         res->buildInfo = VkAccelerationStructureBuildGeometryInfoKHR{
             .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
             .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-            .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR|VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR,
+            .flags = VkBuildAccelerationStructureFlagsKHR(
+                VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR
+            ),
             .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
             .geometryCount = static_cast<uint32_t>(res->geometries.size()),
             .pGeometries = res->geometries.data(),
