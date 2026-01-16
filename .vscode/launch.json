@@ -9,14 +9,6 @@
             "cwd": "${workspaceFolder}",
             "requireExactSource": false,
             "console": "integratedTerminal",
-        },
-        {
-            "name": "Cursor",
-            "type": "lldb",
-            "request": "launch",
-            "program": "${command:cmake.launchTargetPath}",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-        },
+        }
     ]
 }
