@@ -872,6 +872,7 @@ namespace evk {
                 VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
                 VK_KHR_RAY_QUERY_EXTENSION_NAME,
                 VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME,
+                VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME,
             };
 
             // Query supported device extensions so we can conditionally enable optional ones
