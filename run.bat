@@ -1,3 +1,4 @@
+@echo off
 
 if not defined INCLUDE (
     call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >NUL 2>&1

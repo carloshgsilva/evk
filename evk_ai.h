@@ -993,7 +993,6 @@ struct Graph {
     // Uses fp16-appropriate epsilon (default 1e-4)
     void step_adam(float lr = 0.001f, float beta1 = 0.9f, float beta2 = 0.999f, float epsilon = 1e-4f) {
         for(auto& param : params) {
-            assert(param->grad_tensor);
             evk::ai::adam(*param, param->grad(), adam_states[param], lr, beta1, beta2, epsilon);
         }
     }
