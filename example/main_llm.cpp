@@ -11,10 +11,10 @@
 // ============================================================================
 
 // Attention block: Query-Only attention + FFN with residuals
-// Uses Query-Only Attention (https://arxiv.org/pdf/2510.00365)
 struct AttentionBlock {
     // Weight tensors (owned by graph)
     Tensor* w_q = nullptr;  // Query projection
+    Tensor* w_o = nullptr;  // Output projection
     Tensor* w1 = nullptr;   // FFN first layer
     Tensor* w2 = nullptr;   // FFN second layer
     
@@ -34,6 +34,7 @@ struct AttentionBlock {
         total_layers = total_layers_;
         
         w_q = &graph.tensor({embed_dim, embed_dim}, true);
+        w_o = &graph.tensor({embed_dim, embed_dim}, true);
         w1 = &graph.tensor({embed_dim, hidden_dim}, true);
         w2 = &graph.tensor({hidden_dim, embed_dim}, true);
     }
@@ -41,16 +42,22 @@ struct AttentionBlock {
     // Initialize weights with random values using proper scaling for deep networks
     // Uses a combination of He initialization with residual scaling
     void init_weights(float base_scale, bool use_residual_scaling = true) {
-        // He initialization: scale by sqrt(2/fan_in)
-        float w_q_scale = base_scale * sqrtf(2.0f / float(embed_dim));
+        // Attention projections are more stable with slightly smaller init than pure He,
+        // especially in fp16 and with Adam at relatively high LR.
+        // Use Xavier-like scaling for Q/K/V/O.
+        float attn_in_scale = base_scale * (1.0f / sqrtf(float(embed_dim)));
+
+        // FFN uses ReLU, so He init is appropriate.
         float w1_scale = base_scale * sqrtf(2.0f / float(embed_dim));
         
         // For the last projection in residual path, scale down to prevent growth
         // This is the "residual scaling" technique from GPT-2 / muP
         float residual_scale = use_residual_scaling ? (1.0f / sqrtf(float(2 * total_layers))) : 1.0f;
+        float w_o_scale = attn_in_scale * residual_scale;
         float w2_scale = base_scale * sqrtf(2.0f / float(hidden_dim)) * residual_scale;
         
-        w_q->random_init(w_q_scale);
+        w_q->random_init(attn_in_scale);
+        w_o->random_init(w_o_scale);
         w1->random_init(w1_scale);
         w2->random_init(w2_scale);
     }
@@ -66,18 +73,21 @@ struct AttentionBlock {
         // 1) Pre-norm attention block
         Tensor& norm1 = graph.rms_norm(input);
         
-        // Attention projections (Query-Only: K and V use the same input)
+        // Attention projections
         Tensor& q = graph.matmul(norm1, *w_q);
-        Tensor& k = norm1;
-        Tensor& v = norm1;
+        Tensor* k = &norm1;
+        Tensor* v = &norm1;
         
         // Causal self-attention with residual
-        Tensor& attn_out = graph.causal_attention(q, k, v);
+        Tensor& attn_out = graph.causal_attention(q, *k, *v);
+
+        // Output projection
+        Tensor& attn_proj = attn_out;//graph.matmul(attn_out, *w_o);
         
         // Optional: scale the attention output before residual (helps with deep networks)
-        Tensor* attn_scaled = &attn_out;
+        Tensor* attn_scaled = &attn_proj;
         if (residual_scale != 1.0f) {
-            attn_scaled = &graph.scale(attn_out, residual_scale);
+            attn_scaled = &graph.scale(attn_proj, residual_scale);
         }
         Tensor& attn_residual = graph.add(input, *attn_scaled);
         
@@ -139,10 +149,24 @@ struct Transformer {
     Transformer(uint32_t vocab_size, uint32_t seq_len, uint32_t embed_dim, 
                 uint32_t hidden_dim, uint32_t batch_size, uint32_t num_layers = 1)
         : vocab_size(vocab_size), seq_len(seq_len), embed_dim(embed_dim),
-          hidden_dim(hidden_dim), batch_size(batch_size), num_layers(num_layers)
+                    hidden_dim(hidden_dim), batch_size(batch_size), num_layers(num_layers)
     {
         build_training_graph();
         build_inference_graph();
+    }
+
+    uint64_t trainable_param_count() const {
+        uint64_t total = 0;
+        if (token_emb) total += token_emb->shape.count();
+        if (pos_emb) total += pos_emb->shape.count();
+        if (w_out) total += w_out->shape.count();
+        for (const auto& b : blocks) {
+            if (b.w_q) total += b.w_q->shape.count();
+            if (b.w_o) total += b.w_o->shape.count();
+            if (b.w1) total += b.w1->shape.count();
+            if (b.w2) total += b.w2->shape.count();
+        }
+        return total;
     }
     
     void build_training_graph() {
@@ -225,7 +249,7 @@ struct Transformer {
         // - Embeddings: use small values to keep activations bounded
         // - Weights: use He-like scaling with residual compensation
         float emb_scale = 0.02f;  // Small embedding init
-        float base_scale = 1.0f;  // Base scale for weights (blocks will apply He scaling)
+        float base_scale = 0.5f;  // Slightly smaller base scale improves fp16 stability
         
         token_emb->random_init(emb_scale);
         pos_emb->random_init(emb_scale);
@@ -249,6 +273,7 @@ struct Transformer {
         // Copy all attention block weights
         for (uint32_t i = 0; i < num_layers; ++i) {
             cmd.copy(blocks[i].w_q->buffer, inf_blocks[i].w_q->buffer, blocks[i].w_q->shape.count() * sizeof(float16_t));
+            cmd.copy(blocks[i].w_o->buffer, inf_blocks[i].w_o->buffer, blocks[i].w_o->shape.count() * sizeof(float16_t));
             cmd.copy(blocks[i].w1->buffer, inf_blocks[i].w1->buffer, blocks[i].w1->shape.count() * sizeof(float16_t));
             cmd.copy(blocks[i].w2->buffer, inf_blocks[i].w2->buffer, blocks[i].w2->shape.count() * sizeof(float16_t));
         }
@@ -342,8 +367,6 @@ void main_llm() {
     // run_next_token_prediction_attention();  // Comment out for now
 
     auto start = std::chrono::high_resolution_clock::now();
-    // run_circle_detection(1);
-    // run_circle_detection(2);
     run_circle_detection(6);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
@@ -684,16 +707,16 @@ struct CircleDetector {
     std::vector<uint16_t> tmp_point_tokens;
     std::vector<uint16_t> tmp_circle_tokens;
 
-    CircleDetector(uint32_t n_points_, uint32_t n_max_prims_, uint32_t grid_size_,
-                   uint32_t embed_dim_, uint32_t hidden_dim_, uint32_t batch_size_,
-                   uint32_t num_layers_ = 2)
+                CircleDetector(uint32_t n_points_, uint32_t n_max_prims_, uint32_t grid_size_,
+                                                                         uint32_t embed_dim_, uint32_t hidden_dim_, uint32_t batch_size_,
+                                                                                                                                                 uint32_t num_layers_ = 2)
         : n_points(n_points_), n_max_prims(n_max_prims_), grid_size(grid_size_),
           vocab_size(compute_vocab_size(grid_size_)),
           input_seq_len(n_points_ * 2),
           output_seq_len(n_max_prims_ * 3),
           total_seq_len(compute_total_seq_len(n_points_, n_max_prims_)),
           transformer(compute_vocab_size(grid_size_), compute_total_seq_len(n_points_, n_max_prims_), 
-                     embed_dim_, hidden_dim_, batch_size_, num_layers_)
+                                                                                 embed_dim_, hidden_dim_, batch_size_, num_layers_)
     {
         no_circle_token = uint16_t(vocab_size > 2 ? vocab_size - 2 : 0);
         start_token = uint16_t(vocab_size > 1 ? vocab_size - 1 : 0);
@@ -807,69 +830,112 @@ struct CircleDetector {
         return loss;
     }
     
-    // Predict circles from points (autoregressive generation)
+    // Predict circles from points (autoregressive greedy decoding with constraints)
     void predict(const PointData* points, CircleData* circles_out) {
-        transformer.copy_weights_to_inference();
-        
         uint16_t* inp = (uint16_t*)transformer.inf_input->cpu();
-        
+
         // Encode input points
-        std::vector<uint16_t> point_tokens(input_seq_len);
-        encode_points(point_tokens.data(), points);
-        
+        encode_points(tmp_point_tokens.data(), points);
+
         // Fill input sequence
         for (uint32_t t = 0; t < input_seq_len; ++t) {
-            inp[t] = point_tokens[t];
+            inp[t] = tmp_point_tokens[t];
         }
-        
+
         // Autoregressive generation for output tokens
         inp[input_seq_len] = start_token;  // Start token
         for (uint32_t t = input_seq_len + 1; t < total_seq_len; ++t) {
             inp[t] = 0;
         }
 
-        std::vector<uint16_t> generated_tokens(output_seq_len);
-
+        std::vector<uint16_t> out_tokens(output_seq_len, 0);
         for (uint32_t out_pos = 0; out_pos < output_seq_len; ++out_pos) {
-            transformer.inf_input->cpu_upload();
-            transformer.inference.eval(false);
-
-            transformer.inf_logits->cpu_download();
-            float16_t* logits = transformer.inf_logits->cpu();
-
-            // Get prediction at current output position
-            uint32_t pos = input_seq_len + out_pos;
-            float max_val = -1e9f;
-            uint16_t max_idx = 0;
-
-            // Masked argmax: restrict to the expected token type (x / y / r) plus no-circle.
+            uint32_t circle_idx = out_pos / 3;
             uint32_t slot = out_pos % 3;
             uint32_t base = (slot == 0) ? tok_x0 : (slot == 1) ? tok_y0 : tok_r0;
             uint32_t end = base + grid_size; // exclusive
+
+            // Output-structure constraints:
+            // - Each circle is either fully present (x,y,r in their ranges) or fully absent (all no_circle).
+            // - Once a circle is absent, all following circles are absent (padding is contiguous).
+            bool prior_no_circle_circle = false;
+            for (uint32_t c = 0; c < circle_idx; ++c) {
+                if (out_tokens[c * 3 + 0] == no_circle_token) {
+                    prior_no_circle_circle = true;
+                    break;
+                }
+            }
+            bool this_circle_absent = (slot > 0) ? (out_tokens[circle_idx * 3 + 0] == no_circle_token) : false;
+
+            auto allow_token = [&](uint16_t tok) {
+                if (prior_no_circle_circle) {
+                    return tok == no_circle_token;
+                }
+                if (slot == 0) {
+                    return tok == no_circle_token || (tok >= base && tok < end);
+                }
+                if (this_circle_absent) {
+                    return tok == no_circle_token;
+                }
+                return (tok >= base && tok < end);
+            };
+
+            // Fill transformer input with current prefix
+            for (uint32_t i = 0; i < out_pos; ++i) {
+                inp[input_seq_len + 1 + i] = out_tokens[i];
+            }
+            // Ensure any remaining future tokens are 0
+            for (uint32_t i = out_pos; i < output_seq_len; ++i) {
+                inp[input_seq_len + 1 + i] = 0;
+            }
+
+            transformer.inf_input->cpu_upload();
+            transformer.inference.eval(false);
+            transformer.inf_logits->cpu_download();
+
+            float16_t* logits = transformer.inf_logits->cpu();
+            uint32_t pos = input_seq_len + out_pos;
+            const float16_t* row = logits + pos * vocab_size;
+
+            // Greedy: pick argmax among allowed tokens.
+            float best_logit = -1e9f;
+            uint16_t best_tok = 0;
             for (uint32_t v = base; v < end && v < vocab_size; ++v) {
-                float val = float(logits[pos * vocab_size + v]);
-                if (val > max_val) {
-                    max_val = val;
-                    max_idx = uint16_t(v);
+                uint16_t tok = uint16_t(v);
+                if (!allow_token(tok)) continue;
+                float lv = float(row[tok]);
+                if (lv > best_logit) {
+                    best_logit = lv;
+                    best_tok = tok;
                 }
             }
-            if (no_circle_token < vocab_size) {
-                float val = float(logits[pos * vocab_size + no_circle_token]);
-                if (val > max_val) {
-                    max_val = val;
-                    max_idx = no_circle_token;
+            if (no_circle_token < vocab_size && allow_token(no_circle_token)) {
+                float lv = float(row[no_circle_token]);
+                if (lv > best_logit) {
+                    best_logit = lv;
+                    best_tok = no_circle_token;
                 }
             }
-
-            generated_tokens[out_pos] = max_idx;
-
-            // Feed back for next position
-            if (out_pos + 1 < output_seq_len) {
-                inp[input_seq_len + out_pos + 1] = max_idx;
+            if (best_tok == 0) {
+                // Fallback (shouldn't happen): choose no_circle.
+                best_tok = no_circle_token;
             }
+            out_tokens[out_pos] = best_tok;
         }
 
-        decode_circles(generated_tokens.data(), circles_out);
+        decode_circles(out_tokens.data(), circles_out);
+
+        // Canonicalize prediction order to match dataset ordering.
+        // This does not use ground-truth; it just applies the same deterministic
+        // ordering rule used when generating targets.
+        std::sort(circles_out, circles_out + n_max_prims, [](const CircleData& a, const CircleData& b) {
+            bool a_blank = (a.r == 0);
+            bool b_blank = (b.r == 0);
+            if (a_blank != b_blank) return b_blank; // non-blank first
+            if (a.x != b.x) return a.x < b.x;
+            if (a.y != b.y) return a.y < b.y;
+            return a.r < b.r;
+        });
     }
 };
 
@@ -898,6 +964,9 @@ void debug_gradients(Transformer& transformer, const char* label) {
         if (block.w_q->grad_tensor) {
             block.w_q->grad().stats().print("w_q.grad");
         }
+        if (block.w_o->grad_tensor) {
+            block.w_o->grad().stats().print("w_o.grad");
+        }
         if (block.w1->grad_tensor) {
             block.w1->grad().stats().print("w1.grad");
         }
@@ -921,28 +990,36 @@ void run_circle_detection(uint32_t num_layers) {
     constexpr uint32_t HIDDEN_DIM = 256;    // FFN hidden dimension
     constexpr uint32_t BATCH_SIZE = 128;    // Batch size
     uint32_t NUM_LAYERS = (std::max)(1u, num_layers); // Number of transformer layers
+        printf("  Config: n_points=%u, n_max_prims=%u, grid=%u, embed=%u, hidden=%u, layers=%u\n",
+            N_POINTS, N_MAX_PRIMS, GRID_SIZE, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS);
     
-    printf("  Config: n_points=%u, n_max_prims=%u, grid=%u, embed=%u, hidden=%u, layers=%u\n",
-           N_POINTS, N_MAX_PRIMS, GRID_SIZE, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS);
-    
-    srand(1337);  // Deterministic training batches for repeatable profiling
+    // RNG seeds
+    // Keep these explicit so experiments are reproducible.
+    const unsigned SEED_WEIGHTS = 42;
+    const unsigned SEED_DATA = 1337;
 
     // Create dataset generator
     CircleDataset dataset(N_POINTS, N_MAX_PRIMS, GRID_SIZE);
     
     // Create model
     CircleDetector detector(N_POINTS, N_MAX_PRIMS, GRID_SIZE, EMBED_DIM, HIDDEN_DIM, BATCH_SIZE, NUM_LAYERS);
-    detector.init_weights(42);
+    detector.init_weights(SEED_WEIGHTS);
+
+    // Deterministic training batches for repeatable profiling.
+    // NOTE: init_weights() uses srand(seed) internally via Tensor::random_init().
+    srand(SEED_DATA);
     
     printf("  Input seq len: %u, Output seq len: %u, Total: %u\n",
            detector.input_seq_len, detector.output_seq_len, detector.total_seq_len);
+
+    printf("  Params: %llu\n", (unsigned long long)detector.transformer.trainable_param_count());
     
     // Training hyperparameters
-    const int EPOCHS = 24000;
-    const float LR = 0.0125f;
-    const int WARMUP_EPOCHS = 400;
+    const int EPOCHS = 30000;
+    const float LR = 0.0040f;
+    const int WARMUP_EPOCHS = 2000;
     const float MIN_LR_SCALE = 0.02f;
-    const int LOG_INTERVAL = 2000;
+    const int LOG_INTERVAL = 3000;
     
     printf("  Training for %d epochs with LR=%.4f, warmup=%d\n",
            EPOCHS, LR, WARMUP_EPOCHS);
@@ -987,18 +1064,20 @@ void run_circle_detection(uint32_t num_layers) {
     }
     timing_total.print("timing total avg");
     
+    // Sync weights once for evaluation (predict() uses the inference graph).
+    detector.transformer.copy_weights_to_inference();
     
     // Evaluation and visualization
     printf("\n  === Evaluation ===\n");
     printf("  error must be zero to match exactly the validation\n");
     
     // Generate test samples and visualize predictions
-    const int NUM_TEST_VIS = 5;
+    const int NUM_TEST_VIS = 0;
     const int NUM_TEST = 200;
     std::vector<CircleData> gt_circles(N_MAX_PRIMS);
     std::vector<CircleData> pred_circles(N_MAX_PRIMS);
     std::vector<PointData> points(N_POINTS);
-    
+
     srand(12345);  // Different seed for test samples
 
     struct Bucket {
@@ -1013,7 +1092,7 @@ void run_circle_detection(uint32_t num_layers) {
     int total_exact = 0;
     for (int t = 0; t < NUM_TEST; ++t) {
         uint32_t num_gt = dataset.generate_sample(gt_circles.data(), points.data());
-        
+
         bool verbose = (t < NUM_TEST_VIS);
         if (verbose) {
             printf("  Test %d (num_circles=%u): \n", t, num_gt);
@@ -1027,14 +1106,14 @@ void run_circle_detection(uint32_t num_layers) {
         auto circle_l1 = [](const CircleData& a, const CircleData& b) {
             return abs(int(a.x) - int(b.x)) + abs(int(a.y) - int(b.y)) + abs(int(a.r) - int(b.r));
         };
-        
+
         // Print validation with detailed debug info
         for (uint32_t c = 0; c < num_gt; ++c) {
-            int err = abs(gt_circles[c].x - pred_circles[c].x) + 
-                      abs(gt_circles[c].y - pred_circles[c].y) + 
+            int err = abs(gt_circles[c].x - pred_circles[c].x) +
+                      abs(gt_circles[c].y - pred_circles[c].y) +
                       abs(gt_circles[c].r - pred_circles[c].r);
             if (verbose) {
-                printf("    Circle %d: GT=(%d,%d,r=%d) Pred=(%d,%d,r=%d) error=%d\n", 
+                printf("    Circle %d: GT=(%d,%d,r=%d) Pred=(%d,%d,r=%d) error=%d\n",
                        c, gt_circles[c].x, gt_circles[c].y, gt_circles[c].r,
                        pred_circles[c].x, pred_circles[c].y, pred_circles[c].r, err);
             }
@@ -1093,7 +1172,7 @@ void run_circle_detection(uint32_t num_layers) {
         if (verbose) {
             char filename[64];
             snprintf(filename, sizeof(filename), "circle_test_%d.bmp", t);
-            dataset.save_sample_bmp(filename, gt_circles.data(), num_gt, 
+            dataset.save_sample_bmp(filename, gt_circles.data(), num_gt,
                                    points.data(), N_POINTS,
                                    pred_circles.data(), N_MAX_PRIMS);
         }
