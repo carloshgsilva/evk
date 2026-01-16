@@ -12,7 +12,11 @@
         abort();                                                                              \
     }
 
-#define CHECK_VK(cmd) EVK_ASSERT(cmd == VK_SUCCESS, #cmd)  // printf("%s\n", #cmd);
+#define CHECK_VK(cmd)                                                                                     \
+    do {                                                                                                  \
+        VkResult _evk_r = (cmd);                                                                           \
+        EVK_ASSERT(_evk_r == VK_SUCCESS, "%s failed with VkResult=%d", #cmd, (int)_evk_r);               \
+    } while (0)
 #else
 #define EVK_ASSERT(cond, message, ...)
 #define CHECK_VK(cmd) cmd
@@ -131,6 +135,9 @@ namespace evk {
         PFN_vkCmdBeginDebugUtilsLabelEXT vkCmdBeginDebugUtilsLabelEXT;
         PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT;
         PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT;
+
+        // Debug
+        VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE;
     };
     State& GetState();
     FrameData& GetFrame();
