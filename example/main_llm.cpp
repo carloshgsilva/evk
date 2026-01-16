@@ -82,7 +82,7 @@ struct AttentionBlock {
         Tensor& attn_out = graph.causal_attention(q, *k, *v);
 
         // Output projection
-        Tensor& attn_proj = attn_out;//graph.matmul(attn_out, *w_o);
+        Tensor& attn_proj = graph.matmul(attn_out, *w_o);
         
         // Optional: scale the attention output before residual (helps with deep networks)
         Tensor* attn_scaled = &attn_proj;
