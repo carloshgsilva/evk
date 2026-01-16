@@ -8,7 +8,9 @@
 #if defined(_DEBUG) || defined(EVK_DEBUG)
 #define EVK_ASSERT(cond, message, ...)                                                        \
     if (!(cond)) {                                                                            \
-        printf("\033[1;33m %s() \033[1;31m" message "\033[0m", __FUNCTION__, ##__VA_ARGS__);  \
+        printf("\033[1;33m %s() \033[1;31m" message "\033[0m\n", __FUNCTION__, ##__VA_ARGS__);  \
+        fflush(stdout);                                                                       \
+        fflush(stderr);                                                                       \
         exit(1);                                                                              \
     }
 
@@ -55,9 +57,16 @@ namespace evk {
         bool insideRenderPass = false;
         bool doingPresent = false;
 
+        // Swapchain image index acquired in beginPresent() (valid only when doingPresent is true)
+        uint32_t swapchainIndex = 0;
+
         // Semaphores for swapchain synchronization (when doingPresent is true)
         VkSemaphore imageReadySemaphore = VK_NULL_HANDLE;  // Wait on this before rendering to swapchain
         VkSemaphore cmdDoneSemaphore = VK_NULL_HANDLE;     // Signal this when done, present waits on it
+
+        // Present semaphore selected for the acquired swapchain image.
+        // This avoids swapchain semaphore reuse issues by using one semaphore per swapchain image.
+        VkSemaphore presentDoneSemaphore = VK_NULL_HANDLE;
 
         // Staging buffer for this command buffer
         Buffer stagingBuffer = {};
@@ -134,6 +143,9 @@ namespace evk {
         VkSwapchainKHR swapchain;
         uint32_t swapchainIndex = 0;
         std::vector<Image> swapchainImages;  // Swapchain images
+
+        // One present-complete semaphore per swapchain image (indexed by acquired image index)
+        std::vector<VkSemaphore> swapchainPresentSemaphores;
 
         // Raytracing
         PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR;

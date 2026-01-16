@@ -1170,6 +1170,10 @@ namespace evk {
             vkWaitForFences(S.device, (uint32_t)fences.size(), fences.data(), VK_TRUE, UINT64_MAX);
         }
 
+        // Fences only cover vkQueueSubmit; presentation is queued separately. Ensure the device is idle
+        // before destroying swapchain-related semaphores and other Vulkan objects.
+        CHECK_VK(vkDeviceWaitIdle(S.device));
+
         // Clean up pending deletions first
         {
             auto pending = std::move(S.pendingDeletions);
@@ -1196,6 +1200,14 @@ namespace evk {
             }
         }
         S.swapchainImages.clear();
+
+        // Destroy swapchain present semaphores
+        for (auto sem : S.swapchainPresentSemaphores) {
+            if (sem != VK_NULL_HANDLE) {
+                vkDestroySemaphore(S.device, sem, nullptr);
+            }
+        }
+        S.swapchainPresentSemaphores.clear();
 
         // Final cleanup of any remaining pending deletions
         auto pending = std::move(S.pendingDeletions);
@@ -1339,6 +1351,21 @@ namespace evk {
         for (uint32_t i = 0; i < swapchainImageCount; i++) {
             S.swapchainImages[i] = CreateImageForSwapchain(images[i], extent.width, extent.height);
         }
+
+        // Recreate swapchain present semaphores (one per swapchain image)
+        for (auto sem : S.swapchainPresentSemaphores) {
+            if (sem != VK_NULL_HANDLE) {
+                vkDestroySemaphore(S.device, sem, nullptr);
+            }
+        }
+        S.swapchainPresentSemaphores.clear();
+        S.swapchainPresentSemaphores.resize(swapchainImageCount);
+        {
+            VkSemaphoreCreateInfo semaphoreci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+            for (uint32_t i = 0; i < swapchainImageCount; i++) {
+                CHECK_VK(vkCreateSemaphore(S.device, &semaphoreci, nullptr, &S.swapchainPresentSemaphores[i]));
+            }
+        }
         S.swapchainIndex = 0;
 
         vkDestroySwapchainKHR(S.device, oldSwapchain, nullptr);
@@ -1376,6 +1403,8 @@ namespace evk {
         }
     }
 
+    static void CleanupPendingDeletions(uint64_t completedSubmissionIndex);
+
     static void CleanupCompletedCommandBuffers() {
         auto& S = GetState();
         
@@ -1388,18 +1417,28 @@ namespace evk {
                     
                     EVK_ASSERT(cb.state == CmdState::Submitted, "Command buffer not submitted for cleanup");
                     cb.state = CmdState::Ready;
-                    
-                    // Also clean up global pending deletions that were waiting on this submission
-                    auto it = S.pendingDeletions.begin();
-                    while (it != S.pendingDeletions.end()) {
-                        if (it->first <= cb.submissionIndex) {
-                            delete it->second;
-                            it = S.pendingDeletions.erase(it);
-                        } else {
-                            ++it;
-                        }
-                    }
+
+                    CleanupPendingDeletions(cb.submissionIndex);
                 }
+            }
+        }
+    }
+
+    static void CleanupPendingDeletions(uint64_t completedSubmissionIndex) {
+        auto& S = GetState();
+        if (S.pendingDeletions.empty()) {
+            return;
+        }
+
+        // Resource destruction can enqueue additional pending deletions.
+        // To avoid iterator invalidation, move the list out, delete eligible resources,
+        // and then re-enqueue the remaining ones.
+        auto pending = std::move(S.pendingDeletions);
+        for (auto& [idx, res] : pending) {
+            if (idx <= completedSubmissionIndex) {
+                delete res;
+            } else {
+                S.pendingDeletions.push_back({idx, res});
             }
         }
     }
@@ -1418,13 +1457,36 @@ namespace evk {
                 break;
             }
         }
-        
+
+        // If none are ready, wait for at least one submitted command buffer to complete.
+        if (cmdData == nullptr) {
+            std::vector<VkFence> fences;
+            fences.reserve(S.commandBuffers.size());
+            for (auto& cb : S.commandBuffers) {
+                if (cb.state == CmdState::Submitted) {
+                    fences.push_back(cb.fence);
+                }
+            }
+            EVK_ASSERT(!fences.empty(), "No available command buffers! (none submitted either)");
+            CHECK_VK(vkWaitForFences(S.device, (uint32_t)fences.size(), fences.data(), VK_TRUE, UINT64_MAX));
+            CleanupCompletedCommandBuffers();
+
+            for (auto& cb : S.commandBuffers) {
+                if (cb.state == CmdState::Ready) {
+                    cmdData = &cb;
+                    break;
+                }
+            }
+        }
+
         EVK_ASSERT(cmdData != nullptr, "No available command buffers! Wait for some to complete.");
         
         EVK_ASSERT(cmdData->state == CmdState::Ready, "Command buffer not ready for begin");
         cmdData->state = CmdState::InUse;
         cmdData->insideRenderPass = false;
         cmdData->doingPresent = false;
+        cmdData->swapchainIndex = 0;
+        cmdData->presentDoneSemaphore = VK_NULL_HANDLE;
         cmdData->stagingOffset = 0;
         cmdData->timestampNames.clear();
         
@@ -1457,17 +1519,8 @@ namespace evk {
                     
                     EVK_ASSERT(cb.state == CmdState::Submitted, "Command buffer not submitted for done");
                     cb.state = CmdState::Ready;
-                    
-                    // Clean up global pending deletions
-                    auto it = S.pendingDeletions.begin();
-                    while (it != S.pendingDeletions.end()) {
-                        if (it->first <= cb.submissionIndex) {
-                            delete it->second;
-                            it = S.pendingDeletions.erase(it);
-                        } else {
-                            ++it;
-                        }
-                    }
+
+                    CleanupPendingDeletions(cb.submissionIndex);
                     return true;
                 }
                 return false;
@@ -1490,17 +1543,8 @@ namespace evk {
                 
                 EVK_ASSERT(cb.state == CmdState::Submitted, "Command buffer not submitted for wait");
                 cb.state = CmdState::Ready;
-                
-                // Also clean up global pending deletions
-                auto it = S.pendingDeletions.begin();
-                while (it != S.pendingDeletions.end()) {
-                    if (it->first <= cb.submissionIndex) {
-                        delete it->second;
-                        it = S.pendingDeletions.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
+
+                CleanupPendingDeletions(cb.submissionIndex);
                 return;
             }
         }
@@ -1563,10 +1607,61 @@ namespace evk {
         barrier.subresourceRange.levelCount = mipCount;
         barrier.subresourceRange.baseMipLevel = mip;
 
-        VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        barrier.srcAccessMask = VK_ACCESS_NONE_KHR;
-        barrier.dstAccessMask = VK_ACCESS_NONE_KHR;
+        auto stage_access_for_layout = [&](ImageLayout layout, bool src, VkPipelineStageFlags& stage, VkAccessFlags& access) {
+            // Conservative defaults: keep it correct even if not perfectly minimal.
+            stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            access = 0;
+
+            switch (layout) {
+                case ImageLayout::Undefined:
+                    stage = src ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+                    access = 0;
+                    break;
+                case ImageLayout::Present:
+                    stage = src ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+                    access = 0;
+                    break;
+                case ImageLayout::TransferSrc:
+                    stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                    access = src ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+                    break;
+                case ImageLayout::TransferDst:
+                    stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                    access = src ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
+                    break;
+                case ImageLayout::Attachment:
+                    if (isDepth) {
+                        stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                        access = src ? (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT)
+                                     : (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+                    } else {
+                        stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                        access = src ? (VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT)
+                                     : (VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT);
+                    }
+                    break;
+                case ImageLayout::ShaderRead:
+                    // Includes fragment/compute/raytracing and any other shader stage that might sample.
+                    stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                    access = VK_ACCESS_SHADER_READ_BIT;
+                    break;
+                case ImageLayout::General:
+                    // Storage image read/write.
+                    stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                    access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                    break;
+            }
+        };
+
+        VkPipelineStageFlags srcStage;
+        VkPipelineStageFlags dstStage;
+        VkAccessFlags srcAccess;
+        VkAccessFlags dstAccess;
+        stage_access_for_layout(oldLayout, true, srcStage, srcAccess);
+        stage_access_for_layout(newLayout, false, dstStage, dstAccess);
+
+        barrier.srcAccessMask = srcAccess;
+        barrier.dstAccessMask = dstAccess;
         
         vkCmdPipelineBarrier(cb->cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     }
@@ -1631,9 +1726,10 @@ namespace evk {
             std::memcpy((void*)staging, src, size);
             copy(tempStaging, dst, size, 0u, dstOffset);
         } else {
-            uint64_t staging = uint64_t(cb->stagingBuffer.GetPtr()) + cb->stagingOffset;
+            uint64_t copyOffset = cb->stagingOffset;
+            uint64_t staging = uint64_t(cb->stagingBuffer.GetPtr()) + copyOffset;
             std::memcpy((void*)staging, src, size);
-            copy(cb->stagingBuffer, dst, size, cb->stagingOffset, dstOffset);
+            copy(cb->stagingBuffer, dst, size, copyOffset, dstOffset);
             cb->stagingOffset += size;
         }
     }
@@ -1737,11 +1833,12 @@ namespace evk {
 
         EVK_ASSERT(cb->stagingOffset + size < 64'000'000, "Staging buffer out of memory");
 
-        uint64_t staging = uint64_t(cb->stagingBuffer.GetPtr()) + cb->stagingOffset;
+        uint64_t copyOffset = cb->stagingOffset;
+        uint64_t staging = uint64_t(cb->stagingBuffer.GetPtr()) + copyOffset;
         std::memcpy((void*)staging, src, size);
 
         VkBufferImageCopy copy = {};
-        copy.bufferOffset = cb->stagingOffset;
+        copy.bufferOffset = copyOffset;
         copy.bufferRowLength = 0;
         copy.bufferImageHeight = 0;
         copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1885,22 +1982,29 @@ namespace evk {
 
         auto& S = GetState();
         // Use the command buffer's own imageReadySemaphore for acquire
-        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &S.swapchainIndex);
+        uint32_t acquiredIndex = 0;
+        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
             RecreateSwapchain();
-            r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &S.swapchainIndex);
+            r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
         }
+
+        cb->swapchainIndex = acquiredIndex;
+        S.swapchainIndex = acquiredIndex;
+        EVK_ASSERT(cb->swapchainIndex < S.swapchainImages.size(), "Swapchain image index out of range");
+        EVK_ASSERT(cb->swapchainIndex < S.swapchainPresentSemaphores.size(), "Swapchain present semaphores out of range");
+        cb->presentDoneSemaphore = S.swapchainPresentSemaphores[cb->swapchainIndex];
         
-        barrier(S.swapchainImages[S.swapchainIndex], ImageLayout::Undefined, ImageLayout::Attachment);
+        barrier(S.swapchainImages[cb->swapchainIndex], ImageLayout::Undefined, ImageLayout::Attachment);
 
         ClearValue clears[] = {ClearColor{0.0f, 0.0f, 0.0f, 1.0f}};
-        beginRender(&S.swapchainImages[S.swapchainIndex], clears, 1);
+        beginRender(&S.swapchainImages[cb->swapchainIndex], clears, 1);
     }
     
     void Cmd::endPresent() {
         CommandBufferData* cb = (CommandBufferData*)_internal;
         endRender();
-        barrier(GetState().swapchainImages[GetState().swapchainIndex], ImageLayout::Attachment, ImageLayout::Present);
+        barrier(GetState().swapchainImages[cb->swapchainIndex], ImageLayout::Attachment, ImageLayout::Present);
     }
     
     void Cmd::viewport(float x, float y, float w, float h, float minDepth, float maxDepth) {
@@ -1999,12 +2103,10 @@ namespace evk {
             .usage = BufferUsage::Storage,
             .memoryType = MemoryType::GPU,
         });
+        EVK_ASSERT(ToInternal(scratchBuffer).deviceAddress != 0u, "BLAS scratch buffer deviceAddress == 0");
 
         for (auto& blasRes : blases) {
             Internal_BLAS& blas = ToInternal(blasRes);
-
-            EVK_ASSERT(update == false && blas.buildInfo.dstAccelerationStructure == VK_NULL_HANDLE, "BLAS is already built, did you meant to build with update == true?");
-
             blas.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
             blas.buildInfo.scratchData = {ToInternal(scratchBuffer).deviceAddress};
             blas.buildInfo.dstAccelerationStructure = blas.accel;
@@ -2073,12 +2175,31 @@ namespace evk {
         }
         WriteBuffer(res.instancesBuffer, res.instances.data(), blasInstances.size() * sizeof(VkAccelerationStructureInstanceKHR));
 
+        // Make host writes to the instances buffer visible to the acceleration-structure build.
+        // Even with host-coherent memory, being explicit avoids relying on implementation details.
+        {
+            VkMemoryBarrier2 barrier2 = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                .srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT,
+            };
+            VkDependencyInfo dependency = {
+                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &barrier2,
+            };
+            vkCmdPipelineBarrier2(cb->cmd, &dependency);
+        }
+
         Buffer scratchBuffer = CreateBuffer({
             .name = "TLAS Scratch",
             .size = res.sizeInfo.buildScratchSize,
             .usage = BufferUsage::Storage,
             .memoryType = MemoryType::GPU,
         });
+        EVK_ASSERT(ToInternal(scratchBuffer).deviceAddress != 0u, "TLAS scratch buffer deviceAddress == 0");
 
         res.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         res.buildInfo.srcAccelerationStructure = res.accel;
@@ -2093,6 +2214,23 @@ namespace evk {
         barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
         vkCmdPipelineBarrier(cb->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
         S.vkCmdBuildAccelerationStructuresKHR(cb->cmd, 1, &res.buildInfo, &pBuildOffsetInfo);
+
+        // Ensure the built TLAS is visible to subsequent reads (ray tracing / shaders) in the same command buffer.
+        {
+            VkMemoryBarrier2 barrier2 = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                .srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                .dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+            };
+            VkDependencyInfo dependency = {
+                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &barrier2,
+            };
+            vkCmdPipelineBarrier2(cb->cmd, &dependency);
+        }
     }
     
     uint64_t Cmd::submit() {
@@ -2109,7 +2247,10 @@ namespace evk {
         submitInfo.waitSemaphoreCount = cb->doingPresent ? 1 : 0;
         submitInfo.pWaitSemaphores = cb->doingPresent ? &cb->imageReadySemaphore : nullptr;
         submitInfo.signalSemaphoreCount = cb->doingPresent ? 1 : 0;
-        submitInfo.pSignalSemaphores = cb->doingPresent ? &cb->cmdDoneSemaphore : nullptr;
+        if (cb->doingPresent) {
+            EVK_ASSERT(cb->presentDoneSemaphore != VK_NULL_HANDLE, "Present semaphore not set - did you call beginPresent()?");
+        }
+        submitInfo.pSignalSemaphores = cb->doingPresent ? &cb->presentDoneSemaphore : nullptr;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &cb->cmd;
         submitInfo.pWaitDstStageMask = &dstStage;
@@ -2118,10 +2259,10 @@ namespace evk {
         if (cb->doingPresent) {
             VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
             present.waitSemaphoreCount = 1;
-            present.pWaitSemaphores = &cb->cmdDoneSemaphore;
+            present.pWaitSemaphores = &cb->presentDoneSemaphore;
             present.swapchainCount = 1;
             present.pSwapchains = &S.swapchain;
-            present.pImageIndices = &S.swapchainIndex;
+            present.pImageIndices = &cb->swapchainIndex;
             VkResult r = vkQueuePresentKHR(S.queue, &present);
 
             if (r == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -2157,6 +2298,8 @@ namespace evk {
             EVK_ASSERT(desc.vertices, "BLASDesc::vertices must not be null");
             EVK_ASSERT(desc.triangleCount > 0, "BLASDesc::triangleCount must not be zero");
             EVK_ASSERT(desc.vertexCount > 0, "BLASDesc::vertexCount must not be zero");
+            EVK_ASSERT(ToInternal(desc.vertices).deviceAddress != 0u, "BLASDesc::vertices has deviceAddress == 0");
+            EVK_ASSERT(ToInternal(desc.indices).deviceAddress != 0u, "BLASDesc::indices has deviceAddress == 0");
 
             VkAccelerationStructureGeometryTrianglesDataKHR triangles = {
                 .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
@@ -2186,6 +2329,7 @@ namespace evk {
         } else if (desc.geometry == GeometryType::AABBs) {
             EVK_ASSERT(desc.aabbs, "BLASDesc::aabbs must not be null");
             EVK_ASSERT(desc.aabbsCount, "BLASDesc::aabbsCount must not be zero");
+            EVK_ASSERT(ToInternal(desc.aabbs).deviceAddress != 0u, "BLASDesc::aabbs has deviceAddress == 0");
 
             VkAccelerationStructureGeometryAabbsDataKHR aabbs = {
                 .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR,
@@ -2255,6 +2399,7 @@ namespace evk {
             .usage = BufferUsage::Storage | BufferUsage::AccelerationStructureInput,
             .memoryType = MemoryType::CPU_TO_GPU,
         });
+        EVK_ASSERT(ToInternal(res->instancesBuffer).deviceAddress != 0u, "TLAS instances buffer deviceAddress == 0");
 
         VkAccelerationStructureGeometryInstancesDataKHR instancesVk = {
             .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,
