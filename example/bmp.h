@@ -4,6 +4,8 @@
 #define _CRT_SECURE_NO_WARNINGS 1
 #endif
 
+#pragma warning(disable : 4996)
+
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
