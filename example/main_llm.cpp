@@ -1052,7 +1052,7 @@ void run_circle_detection(uint32_t num_layers) {
             printf("  epoch %3d: loss = %.4f\n", epoch, epoch_loss);
             fflush(stdout);
             CircleDataset::save_loss_graph("loss_graph.bmp", loss_history);
-            timing_window.print("timing window");
+            // timing_window.print("timing window");
             timing_total.accumulate(timing_window);
             timing_window.reset();
         }
