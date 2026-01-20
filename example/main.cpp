@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <string.h>
 
 #include "win_dbg.h"
 #include "evk.h"
@@ -6,24 +7,69 @@
 #include "bench.h"
 
 void main_llm();
+void evk_tests();
 
-int main() {
-    printf("[test] Starting tests...\n");
-    set_unhandled_exception_filter();
+int main(int argc, char** argv) {
+    // Parse command-line flags: --test, --bench, --llm
+    bool do_test = false;
+    bool do_bench = false;
+    bool do_llm = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--test") == 0) do_test = true;
+        else if (strcmp(argv[i], "--bench") == 0) do_bench = true;
+        else if (strcmp(argv[i], "--llm") == 0) do_llm = true;
+    }
 
-    evk::InitializeEVK({
-        .applicationName = "evk_example",
-        .applicationVersion = 1,
-        .engineName = "evk_example_engine",
-        .engineVersion = 1,
-        .enableSwapchain = false,
-    });
-    evk::ai::initialize();
+    // Default behavior (no flags): run both bench and tests (matches previous behavior)
+    if (!do_test && !do_bench && !do_llm) {
+        do_test = true;
+        do_bench = true;
+    }
 
-    // test_cross_entropy_loss();
-    // bench();
-    main_llm();
+    printf("[run] Options: --test=%s --bench=%s --llm=%s\n",
+           do_test ? "ON" : "OFF",
+           do_bench ? "ON" : "OFF",
+           do_llm ? "ON" : "OFF");
 
+    bool evk_initialized = false;
+    bool ai_initialized = false;
+
+    if (do_test || do_bench || do_llm) {
+        printf("[test] Starting tests...\n");
+        set_unhandled_exception_filter();
+
+        evk::InitializeEVK({
+            .applicationName = "evk_example",
+            .applicationVersion = 1,
+            .engineName = "evk_example_engine",
+            .engineVersion = 1,
+            .enableSwapchain = false,
+        });
+        evk::ai::initialize();
+    }
+
+    // Run benchmarks if requested
+    if (do_bench) {
+        bench();
+    }
+
+    // Run LLM demo if requested
+    if (do_llm) {
+        main_llm();
+    }
+
+    // Run the suite of tests when requested
+    if (do_test) {
+        evk_tests();
+    }
+
+    if (ai_initialized) evk::ai::shutdown();
+    if (evk_initialized) evk::Shutdown();
+    if (do_test) printf("[test] All tests passed successfully!\n");
+    return 0;
+}
+
+void evk_tests() {
     // Test the command buffer API
     {
         // Create a test buffer
@@ -185,9 +231,4 @@ int main() {
             evk::CmdWait(updateIdx);
         }
     }
-
-    evk::ai::shutdown();
-    evk::Shutdown();
-    printf("[test] All tests passed successfully!\n");
-    return 0;
 }

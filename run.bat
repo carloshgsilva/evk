@@ -27,4 +27,4 @@ for %%f in (shaders\*.comp) do (
     )
 )
 
-call build\evk_example.exe
+call build\evk_example.exe %*
