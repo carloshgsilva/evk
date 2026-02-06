@@ -122,9 +122,11 @@ void test_mse_loss() {
 
     grad.cpu_download();
     float16_t* grad_cpu = grad.cpu();
-    TEST(grad_cpu[0] == float16_t(0.0f));
-    TEST(grad_cpu[1] == float16_t(0.0f));
-    TEST(grad_cpu[2] == float16_t(1.0f));
+    // dL/dpred = 2*(pred-target)/N
+    TEST(std::abs(float(grad_cpu[0]) - 0.0f) < 5e-4f);
+    TEST(std::abs(float(grad_cpu[1]) - 0.0f) < 5e-4f);
+    float expected_g2 = 2.0f * (3.0f - 4.0f) / 3.0f; // -2/3
+    TEST(std::abs(float(grad_cpu[2]) - expected_g2) < 5e-3f);
 }
 
 void test_cross_entropy_loss() {

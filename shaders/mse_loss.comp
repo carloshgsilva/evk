@@ -30,15 +30,17 @@ void main() {
     uint lid = gl_LocalInvocationID.x;
 
     float local_sum = 0.0;
+    float grad_scale = 2.0 / float(totalElements);
     for (uint chunk = 0; chunk < totalElements; chunk += 32) {
         uint id = chunk + lid;
         // Load data and compute squared difference
         if (id < totalElements) {
             float predicted = float(predictedBuffer.x[id]);
             float target = float(targetBuffer.x[id]);
-            float diff = target - predicted;
+            float diff = predicted - target;
             local_sum += diff * diff;
-            gradBuffer.x[id] = float16_t(diff);
+            // d/dpred (1/N * sum (pred-target)^2) = 2*(pred-target)/N
+            gradBuffer.x[id] = float16_t(grad_scale * diff);
         }
     }
 

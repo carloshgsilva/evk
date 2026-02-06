@@ -953,20 +953,22 @@ struct Graph {
     // submit/wait control command buffer submission for batching
     void eval(bool backward = false, bool submit = true, bool wait = true) {
         evk::ai::GetCmd();
+
+        // Zero gradients BEFORE running forward when doing a backward pass.
+        if (backward) {
+            for (auto& node : nodes) {
+                if (node->grad_tensor) {
+                    evk::ai::zero(node->grad());
+                }
+            }
+        }
+
         for(auto& node : nodes) {
             if (node->forward_fn) {
                 node->forward_fn();
             }
         }
         if (backward) {
-            // Zero ALL gradient tensors before running backward (GPU)
-            // This includes both parameters and intermediate tensors
-            for (auto& node : nodes) {
-                if (node->grad_tensor) {
-                    evk::ai::zero(node->grad());
-                }
-            }
-
             // Run backward functions in reverse node order so intermediate
             // operators (e.g. matmul) can populate grads for parameters.
             for (int i = int(nodes.size()) - 1; i >= 0; --i) {
@@ -985,7 +987,7 @@ struct Graph {
     void step(float lr = 0.001f) {
         for(auto& param : params) {
             assert(param->grad_tensor);
-            evk::ai::sgd(*param, param->grad(), -lr);
+            evk::ai::sgd(*param, param->grad(), lr);
         }
     }
 
