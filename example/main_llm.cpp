@@ -155,21 +155,21 @@ void generate_batch(const std::vector<std::array<float, 9>>& base,
     for (uint32_t b = 0; b < batch_size; ++b) {
         auto tris = base;
         Mat3 rot = random_rotation(rng);
-        float scale_factor = rand_uniform(rng, 0.7f, 1.3f);
         Vec3 translate{
-            rand_uniform(rng, -0.25f, 0.25f),
-            rand_uniform(rng, -0.25f, 0.25f),
-            rand_uniform(rng, -0.25f, 0.25f)
+            rand_uniform(rng, -0.45f, 0.45f),
+            rand_uniform(rng, -0.45f, 0.45f),
+            rand_uniform(rng, -0.45f, 0.45f)
         };
 
         for (auto& tri : tris) {
-            apply_transform(tri, rot, scale_factor, translate);
+            apply_transform(tri, rot, 1.0f, translate);
         }
 
         std::iota(order.begin(), order.end(), 0);
 
         for (uint32_t t = 0; t < kTrianglesPerMesh; ++t) {
-            const auto& tri = tris[order[t % kCubeTriangleCount]];
+            uint32_t tri_idx = order[t % kCubeTriangleCount];
+            const auto& tri = tris[tri_idx];
             uint32_t base_idx = (b * kTrianglesPerMesh + t) * kTriangleFeatureDim;
 
             for (uint32_t i = 0; i < 9; ++i) {
@@ -203,7 +203,6 @@ void compute_drift(const std::vector<float>& gen,
                    uint32_t batch_size,
                    uint32_t sample_dim,
                    float tau,
-                   float clip_norm,
                    std::vector<float>& drift_out) {
     drift_out.assign(gen.size(), 0.0f);
     tau = (std::max)(tau, 1e-4f);
@@ -231,15 +230,19 @@ void compute_drift(const std::vector<float>& gen,
             max_pos = (std::max)(max_pos, logit_pos);
 
             const float* y_neg = &gen[j * sample_dim];
-            float dist_neg = 0.0f;
-            for (uint32_t d = 0; d < sample_dim; ++d) {
-                float diff = x[d] - y_neg[d];
-                dist_neg += diff * diff;
+            if (j == i) {
+                logits_neg[j] = -1.0e30f;
+            } else {
+                float dist_neg = 0.0f;
+                for (uint32_t d = 0; d < sample_dim; ++d) {
+                    float diff = x[d] - y_neg[d];
+                    dist_neg += diff * diff;
+                }
+                dist_neg = sqrtf(dist_neg + 1e-6f);
+                float logit_neg = -dist_neg / tau;
+                logits_neg[j] = logit_neg;
+                max_neg = (std::max)(max_neg, logit_neg);
             }
-            dist_neg = sqrtf(dist_neg + 1e-6f);
-            float logit_neg = -dist_neg / tau;
-            logits_neg[j] = logit_neg;
-            max_neg = (std::max)(max_neg, logit_neg);
         }
 
         float sum_pos = 0.0f;
@@ -265,20 +268,6 @@ void compute_drift(const std::vector<float>& gen,
                 drift[d] += w_pos * y_pos[d] - w_neg * y_neg[d];
             }
         }
-
-        if (clip_norm > 0.0f) {
-            float norm = 0.0f;
-            for (uint32_t d = 0; d < sample_dim; ++d) {
-                norm += drift[d] * drift[d];
-            }
-            norm = sqrtf(norm + 1e-8f);
-            if (norm > clip_norm) {
-                float scale_factor = clip_norm / norm;
-                for (uint32_t d = 0; d < sample_dim; ++d) {
-                    drift[d] *= scale_factor;
-                }
-            }
-        }
     }
 }
 
@@ -298,6 +287,28 @@ float compute_rms(const std::vector<float>& a) {
         sum += double(v) * double(v);
     }
     return float(std::sqrt(sum / double(a.size())));
+}
+
+float compute_pairwise_seed_mse(const std::vector<std::vector<float>>& seed_preds) {
+    if (seed_preds.size() < 2) {
+        return 0.0f;
+    }
+    const size_t sample_dim = seed_preds[0].size();
+    double total_mse = 0.0;
+    uint32_t pairs = 0;
+    for (size_t i = 0; i < seed_preds.size(); ++i) {
+        for (size_t j = i + 1; j < seed_preds.size(); ++j) {
+            assert(seed_preds[j].size() == sample_dim);
+            double mse = 0.0;
+            for (size_t d = 0; d < sample_dim; ++d) {
+                double diff = double(seed_preds[i][d]) - double(seed_preds[j][d]);
+                mse += diff * diff;
+            }
+            total_mse += mse / double(sample_dim);
+            pairs++;
+        }
+    }
+    return pairs ? float(total_mse / double(pairs)) : 0.0f;
 }
 
 void compute_exist_stats(const std::vector<float>& pred,
@@ -564,14 +575,12 @@ void main_llm() {
 
     constexpr uint32_t kBatchSize = 64;
     constexpr uint32_t kEmbedDim = 16;
-    constexpr uint32_t kHiddenDim = 16;
-    constexpr uint32_t kLayers = 8;
-    constexpr uint32_t kTrainSteps = 5000;
+    constexpr uint32_t kHiddenDim = 64;
+    constexpr uint32_t kLayers = 4;
+    constexpr uint32_t kTrainSteps = 15000;
     constexpr float kLearningRate = 1.0e-3f;
     constexpr float kNoiseScale = 1.0f;
-    constexpr float kDriftTau = 0.08f;
-    constexpr float kDriftScale = 0.5f;
-    constexpr float kDriftClip = 5000000.0f;
+    constexpr float kDriftTau = 0.01f;
 
     MeshCompletionModel model(kBatchSize, kTrianglesPerMesh, kTriangleFeatureDim,
                               kNoiseDim, kEmbedDim, kHiddenDim, kLayers);
@@ -634,10 +643,10 @@ void main_llm() {
         model.graph.eval(false);
         download_tensor(*model.pred, pred);
 
-        compute_drift(pred, batch.target, kBatchSize, sample_dim, kDriftTau, kDriftClip, drift);
+        compute_drift(pred, batch.target, kBatchSize, sample_dim, kDriftTau, drift);
         drift_target = pred;
         for (size_t i = 0; i < drift_target.size(); ++i) {
-            drift_target[i] += kDriftScale * drift[i];
+            drift_target[i] += drift[i];
         }
 
         upload_tensor(*model.target, drift_target);
@@ -659,9 +668,7 @@ void main_llm() {
             // append the predicted mesh snapshot into the evolution OBJ
             download_tensor(*model.pred, pred);
             float val_loss = float(model.loss->item());
-            printf("step %4u | train_drift_loss %.6f | pred_mse %.6f | drift_rms %.6f | val_mse %.6f\n",
-                   step, train_loss, pred_mse, drift_rms, val_loss);
-            fflush(stdout);
+            std::vector<std::vector<float>> seed_preds(kValSeeds, std::vector<float>(sample_dim));
 
             // append prediction snapshot for each validation seed in its own row
             for (uint32_t s = 0; s < kValSeeds; ++s) {
@@ -673,11 +680,16 @@ void main_llm() {
                 for (uint32_t i = 0; i < sample_dim; ++i) {
                     val_pred_single[i] = pred[i];
                 }
+                seed_preds[s] = val_pred_single;
                 float y_offset = -float(s) * row_spacing;
                 append_obj(evo_path, val_pred_single, kTrianglesPerMesh, evo_vertex_index,
                            mesh_spacing * float(evo_snapshot_count + 1), y_offset,
                            evo_exist_threshold);
             }
+            float seed_div_mse = compute_pairwise_seed_mse(seed_preds);
+            printf("step %4u | train_drift_loss %.6f | pred_mse %.6f | drift_rms %.6f | val_mse %.6f | seed_div_mse %.6f\n",
+                   step, train_loss, pred_mse, drift_rms, val_loss, seed_div_mse);
+            fflush(stdout);
             evo_snapshot_count++;
         }
     }
@@ -702,6 +714,7 @@ void main_llm() {
         target_features[i] = val_batches[0].target[i];
     }
 
+    std::vector<std::vector<float>> final_seed_preds(kValSeeds, std::vector<float>(sample_dim));
     // append the final validation prediction snapshot for each seed (rows)
     for (uint32_t s = 0; s < kValSeeds; ++s) {
         upload_tensor(*model.input, val_batches[s].noise);
@@ -712,11 +725,16 @@ void main_llm() {
         for (uint32_t i = 0; i < sample_dim; ++i) {
             final_pred_single[i] = pred[i];
         }
+        final_seed_preds[s] = final_pred_single;
         float y_offset = -float(s) * row_spacing;
         append_obj(evo_path, final_pred_single, kTrianglesPerMesh, evo_vertex_index,
                    mesh_spacing * float(evo_snapshot_count + 1), y_offset,
                    evo_exist_threshold);
+        export_obj(std::filesystem::path("output") / ("mesh_pred_seed" + std::to_string(s) + ".obj"),
+                   final_pred_single, kTrianglesPerMesh);
     }
+    float final_seed_div_mse = compute_pairwise_seed_mse(final_seed_preds);
+    printf("final seed_div_mse: %.6f\n", final_seed_div_mse);
     evo_snapshot_count++;
 
     export_obj("output/mesh_target.obj", target_features, kTrianglesPerMesh);
