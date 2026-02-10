@@ -17,7 +17,9 @@ namespace {
 constexpr uint32_t kCubeTriangleCount = 12;
 constexpr uint32_t kTrianglesPerMesh = 16; // padded to satisfy matmul tile constraints
 constexpr uint32_t kTriangleFeatureDim = 16; // padded feature dim
+constexpr uint32_t kUsedFeatureDim = 10; // 9 coords + exist
 constexpr uint32_t kNoiseDim = 16;
+constexpr uint32_t kTimeChannel = kTriangleFeatureDim - 1;
 constexpr float kExistScale = 4.0f;
 constexpr float kPi = 3.14159265358979323846f;
 
@@ -142,6 +144,20 @@ void generate_noise(uint32_t batch_size, float noise_scale, std::mt19937& rng, M
     for (uint32_t i = 0; i < count; ++i) {
         batch.noise[i] = dist(rng) * noise_scale;
     }
+
+    // Zero out padded feature channels (including the time channel).
+    if (kNoiseDim == kTriangleFeatureDim) {
+        uint32_t sample_dim = kTrianglesPerMesh * kNoiseDim;
+        for (uint32_t b = 0; b < batch_size; ++b) {
+            uint32_t base = b * sample_dim;
+            for (uint32_t t = 0; t < kTrianglesPerMesh; ++t) {
+                uint32_t offset = base + t * kNoiseDim;
+                for (uint32_t d = kUsedFeatureDim; d < kNoiseDim; ++d) {
+                    batch.noise[offset + d] = 0.0f;
+                }
+            }
+        }
+    }
 }
 
 void generate_batch(const std::vector<std::array<float, 9>>& base,
@@ -198,75 +214,52 @@ void download_tensor(Tensor& t, std::vector<float>& data) {
     }
 }
 
-void compute_drift(const std::vector<float>& gen,
-                   const std::vector<float>& real,
-                   uint32_t batch_size,
-                   uint32_t sample_dim,
-                   float tau,
-                   std::vector<float>& drift_out) {
-    drift_out.assign(gen.size(), 0.0f);
-    tau = (std::max)(tau, 1e-4f);
+void build_flow_matching_targets(const std::vector<float>& x0,
+                                 const std::vector<float>& x1,
+                                 uint32_t batch_size,
+                                 uint32_t tri_count,
+                                 uint32_t feature_dim,
+                                 std::mt19937& rng,
+                                 std::vector<float>& x_t,
+                                 std::vector<float>& v_target,
+                                 std::vector<float>& t_batch) {
+    assert(x0.size() == x1.size());
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    uint32_t sample_dim = tri_count * feature_dim;
 
-    std::vector<float> logits_pos(batch_size, 0.0f);
-    std::vector<float> logits_neg(batch_size, 0.0f);
-    std::vector<float> weights_pos(batch_size, 0.0f);
-    std::vector<float> weights_neg(batch_size, 0.0f);
+    x_t.resize(x0.size());
+    v_target.resize(x0.size());
+    t_batch.resize(batch_size);
 
-    for (uint32_t i = 0; i < batch_size; ++i) {
-        const float* x = &gen[i * sample_dim];
-        float max_pos = -1e9f;
-        float max_neg = -1e9f;
-
-        for (uint32_t j = 0; j < batch_size; ++j) {
-            const float* y_pos = &real[j * sample_dim];
-            float dist_pos = 0.0f;
-            for (uint32_t d = 0; d < sample_dim; ++d) {
-                float diff = x[d] - y_pos[d];
-                dist_pos += diff * diff;
-            }
-            dist_pos = sqrtf(dist_pos + 1e-6f);
-            float logit_pos = -dist_pos / tau;
-            logits_pos[j] = logit_pos;
-            max_pos = (std::max)(max_pos, logit_pos);
-
-            const float* y_neg = &gen[j * sample_dim];
-            if (j == i) {
-                logits_neg[j] = -1.0e30f;
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        float t = dist(rng);
+        t_batch[b] = t;
+        uint32_t base = b * sample_dim;
+        for (uint32_t i = 0; i < sample_dim; ++i) {
+            uint32_t channel = i % feature_dim;
+            float x0v = x0[base + i];
+            float x1v = x1[base + i];
+            if (channel == kTimeChannel) {
+                x_t[base + i] = t;
+                v_target[base + i] = 0.0f;
             } else {
-                float dist_neg = 0.0f;
-                for (uint32_t d = 0; d < sample_dim; ++d) {
-                    float diff = x[d] - y_neg[d];
-                    dist_neg += diff * diff;
-                }
-                dist_neg = sqrtf(dist_neg + 1e-6f);
-                float logit_neg = -dist_neg / tau;
-                logits_neg[j] = logit_neg;
-                max_neg = (std::max)(max_neg, logit_neg);
+                x_t[base + i] = (1.0f - t) * x0v + t * x1v;
+                v_target[base + i] = x1v - x0v;
             }
         }
+    }
+}
 
-        float sum_pos = 0.0f;
-        float sum_neg = 0.0f;
-        for (uint32_t j = 0; j < batch_size; ++j) {
-            weights_pos[j] = expf(logits_pos[j] - max_pos);
-            weights_neg[j] = expf(logits_neg[j] - max_neg);
-            
-            sum_pos += weights_pos[j];
-            sum_neg += weights_neg[j];
-        }
-
-        float inv_pos = 1.0f / (sum_pos + 1e-6f);
-        float inv_neg = 1.0f / (sum_neg + 1e-6f);
-        float* drift = &drift_out[i * sample_dim];
-
-        for (uint32_t j = 0; j < batch_size; ++j) {
-            float w_pos = weights_pos[j] * inv_pos;
-            float w_neg = weights_neg[j] * inv_neg;
-            const float* y_pos = &real[j * sample_dim];
-            const float* y_neg = &gen[j * sample_dim];
-            for (uint32_t d = 0; d < sample_dim; ++d) {
-                drift[d] += w_pos * y_pos[d] - w_neg * y_neg[d];
-            }
+void inject_time_channel(std::vector<float>& data,
+                         uint32_t batch_size,
+                         uint32_t tri_count,
+                         uint32_t feature_dim,
+                         float t) {
+    uint32_t sample_dim = tri_count * feature_dim;
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        uint32_t base = b * sample_dim;
+        for (uint32_t tri = 0; tri < tri_count; ++tri) {
+            data[base + tri * feature_dim + kTimeChannel] = t;
         }
     }
 }
@@ -479,15 +472,17 @@ struct CrossAttentionBlock {
     }
 
     Tensor& forward(Graph& graph, Tensor& input, float residual_scale = 1.0f) {
-        Tensor& q = graph.matmul(input, *w_q);
-        Tensor& k = graph.matmul(input, *w_k);
-        Tensor& v = graph.matmul(input, *w_v);
+        Tensor& norm_in = graph.rms_norm(input);
+        Tensor& q = graph.matmul(norm_in, *w_q);
+        Tensor& k = graph.matmul(norm_in, *w_k);
+        Tensor& v = graph.matmul(norm_in, *w_v);
         Tensor& attn_out = cross_attention(graph, q, k, v);
         Tensor& attn_proj = graph.matmul(attn_out, *w_o);
 
         Tensor& attn_residual = graph.add(input, attn_proj);
 
-        Tensor& hidden = graph.matmul(attn_residual, *w1);
+        Tensor& norm_ffn = graph.rms_norm(attn_residual);
+        Tensor& hidden = graph.matmul(norm_ffn, *w1);
         Tensor& hidden_relu = graph.relu(hidden);
         Tensor& hidden_proj = graph.matmul(hidden_relu, *w2);
 
@@ -513,6 +508,7 @@ struct MeshCompletionModel {
 
     Tensor* w_in = nullptr;
     Tensor* tri_emb = nullptr;
+    Tensor* w_out = nullptr;
     std::vector<CrossAttentionBlock> blocks;
 
     MeshCompletionModel(uint32_t batch_size_, uint32_t tri_count_, uint32_t feature_dim_,
@@ -534,6 +530,7 @@ struct MeshCompletionModel {
 
         w_in = &graph.tensor({noise_dim, embed_dim}, true);
         tri_emb = &graph.tensor({tri_count, embed_dim}, true);
+        w_out = &graph.tensor({embed_dim, feature_dim}, true);
 
         blocks.resize(num_layers);
         for (uint32_t i = 0; i < num_layers; ++i) {
@@ -549,7 +546,8 @@ struct MeshCompletionModel {
             x = &blocks[i].forward(graph, *x, residual_scale);
         }
 
-        pred = x;
+        Tensor& out = graph.matmul(*x, *w_out);
+        pred = &out;
         loss = &graph.mse_loss(*pred, *target);
     }
 
@@ -562,25 +560,62 @@ struct MeshCompletionModel {
         for (auto& block : blocks) {
             block.init_weights(base_scale);
         }
+        float out_scale = base_scale * sqrtf(2.0f / float(embed_dim));
+        w_out->random_init(out_scale);
     }
 };
+
+void flow_match_sample(MeshCompletionModel& model,
+                       const std::vector<float>& x0,
+                       uint32_t steps,
+                       std::vector<float>& x_out) {
+    if (steps == 0) {
+        x_out = x0;
+        return;
+    }
+
+    x_out = x0;
+    std::vector<float> vel;
+    std::vector<float> dummy_target(x_out.size(), 0.0f);
+    upload_tensor(*model.target, dummy_target);
+
+    float dt = 1.0f / float(steps);
+    for (uint32_t s = 0; s < steps; ++s) {
+        float t = (float(s) + 0.5f) * dt;
+        inject_time_channel(x_out, model.batch_size, model.tri_count, model.feature_dim, t);
+
+        upload_tensor(*model.input, x_out);
+        model.graph.eval(false);
+        download_tensor(*model.pred, vel);
+
+        for (size_t i = 0; i < x_out.size(); ++i) {
+            if ((i % model.feature_dim) == kTimeChannel) {
+                x_out[i] = t;
+                continue;
+            }
+            x_out[i] += dt * vel[i];
+        }
+    }
+
+    inject_time_channel(x_out, model.batch_size, model.tri_count, model.feature_dim, 0.0f);
+}
 
 } // namespace
 
 void main_llm() {
     evk::ai::initialize();
-    printf("=== main_llm: unconditional mesh generation via drifting ===\n");
+    printf("=== main_llm: unconditional mesh generation via flow matching ===\n");
 
     auto start = std::chrono::high_resolution_clock::now();
 
     constexpr uint32_t kBatchSize = 64;
-    constexpr uint32_t kEmbedDim = 16;
-    constexpr uint32_t kHiddenDim = 64;
+    constexpr uint32_t kEmbedDim = 32;
+    constexpr uint32_t kHiddenDim = 128;
     constexpr uint32_t kLayers = 4;
-    constexpr uint32_t kTrainSteps = 15000;
+    constexpr uint32_t kTrainSteps = 10000;
+    constexpr uint32_t kSampleSteps = 10;
     constexpr float kLearningRate = 1.0e-3f;
     constexpr float kNoiseScale = 1.0f;
-    constexpr float kDriftTau = 0.01f;
 
     MeshCompletionModel model(kBatchSize, kTrianglesPerMesh, kTriangleFeatureDim,
                               kNoiseDim, kEmbedDim, kHiddenDim, kLayers);
@@ -628,57 +663,48 @@ void main_llm() {
                    0.0f, y_offset, evo_exist_threshold);
     }
 
-    std::vector<float> pred;
-    std::vector<float> drift;
-    std::vector<float> drift_target;
+    std::vector<float> pred_velocity;
+    std::vector<float> flow_x;
+    std::vector<float> flow_v_target;
+    std::vector<float> flow_t_batch;
+    std::vector<float> pred_mesh;
+
+    uint32_t log_interval = (kTrainSteps <= 20) ? 1u : 200u;
 
     for (uint32_t step = 1; step <= kTrainSteps; ++step) {
         MeshBatch batch;
         generate_batch(base, kBatchSize, train_rng, batch);
         generate_noise(kBatchSize, kNoiseScale, train_rng, batch);
 
-        upload_tensor(*model.input, batch.noise);
-        upload_tensor(*model.target, batch.target);
+        build_flow_matching_targets(batch.noise, batch.target,
+                                    kBatchSize, kTrianglesPerMesh, kTriangleFeatureDim,
+                                    train_rng, flow_x, flow_v_target, flow_t_batch);
 
-        model.graph.eval(false);
-        download_tensor(*model.pred, pred);
+        upload_tensor(*model.input, flow_x);
+        upload_tensor(*model.target, flow_v_target);
 
-        compute_drift(pred, batch.target, kBatchSize, sample_dim, kDriftTau, drift);
-        drift_target = pred;
-        for (size_t i = 0; i < drift_target.size(); ++i) {
-            drift_target[i] += drift[i];
-        }
-
-        upload_tensor(*model.target, drift_target);
         model.graph.eval(true);
         model.graph.step_adam(kLearningRate, 0.9f, 0.98f, 1e-4f);
         evk::ai::SubmitCmd(true);
 
+        download_tensor(*model.pred, pred_velocity);
         float train_loss = float(model.loss->item());
 
-        if (step % 500 == 0 || step == 1) {
-            float pred_mse = compute_mse(pred, batch.target);
-            float drift_rms = compute_rms(drift);
-
-            // evaluate on the first validation seed to obtain a val_loss value
-            upload_tensor(*model.input, val_batches[0].noise);
-            upload_tensor(*model.target, val_batches[0].target);
-            model.graph.eval(false);
-            // download validation predictions so we can both report metrics and
-            // append the predicted mesh snapshot into the evolution OBJ
-            download_tensor(*model.pred, pred);
-            float val_loss = float(model.loss->item());
+        if (step % log_interval == 0 || step == 1 || step == kTrainSteps) {
+            float velocity_mse = compute_mse(pred_velocity, flow_v_target);
+            float val_mse = 0.0f;
             std::vector<std::vector<float>> seed_preds(kValSeeds, std::vector<float>(sample_dim));
 
             // append prediction snapshot for each validation seed in its own row
             for (uint32_t s = 0; s < kValSeeds; ++s) {
-                upload_tensor(*model.input, val_batches[s].noise);
-                upload_tensor(*model.target, val_batches[s].target);
-                model.graph.eval(false);
-                download_tensor(*model.pred, pred);
+                flow_match_sample(model, val_batches[s].noise, kSampleSteps, pred_mesh);
+                if (s == 0) {
+                    val_mse = compute_mse(pred_mesh, val_batches[s].target);
+                }
+
                 std::vector<float> val_pred_single(sample_dim);
                 for (uint32_t i = 0; i < sample_dim; ++i) {
-                    val_pred_single[i] = pred[i];
+                    val_pred_single[i] = pred_mesh[i];
                 }
                 seed_preds[s] = val_pred_single;
                 float y_offset = -float(s) * row_spacing;
@@ -687,24 +713,21 @@ void main_llm() {
                            evo_exist_threshold);
             }
             float seed_div_mse = compute_pairwise_seed_mse(seed_preds);
-            printf("step %4u | train_drift_loss %.6f | pred_mse %.6f | drift_rms %.6f | val_mse %.6f | seed_div_mse %.6f\n",
-                   step, train_loss, pred_mse, drift_rms, val_loss, seed_div_mse);
+            printf("step %4u | flow_loss %.6f | vel_mse %.6f | val_mse %.6f | seed_div_mse %.6f\n",
+                   step, train_loss, velocity_mse, val_mse, seed_div_mse);
             fflush(stdout);
             evo_snapshot_count++;
         }
     }
 
     // evaluate metrics on the first validation seed
-    upload_tensor(*model.input, val_batches[0].noise);
-    upload_tensor(*model.target, val_batches[0].target);
-    model.graph.eval(false);
-    download_tensor(*model.pred, pred);
+    flow_match_sample(model, val_batches[0].noise, kSampleSteps, pred_mesh);
     // save seed-0 prediction for export
-    std::vector<float> pred_seed0 = pred;
+    std::vector<float> pred_seed0 = pred_mesh;
 
-    float final_val_mse = compute_mse(pred, val_batches[0].target);
+    float final_val_mse = compute_mse(pred_mesh, val_batches[0].target);
     float exist_mean = 0.0f;
-    compute_exist_stats(pred, kBatchSize, kTrianglesPerMesh,
+    compute_exist_stats(pred_mesh, kBatchSize, kTrianglesPerMesh,
                         kTriangleFeatureDim, kExistScale, exist_mean);
     printf("validation mse: %.6f | exist mean: %.3f\n",
         final_val_mse, exist_mean);
@@ -717,13 +740,10 @@ void main_llm() {
     std::vector<std::vector<float>> final_seed_preds(kValSeeds, std::vector<float>(sample_dim));
     // append the final validation prediction snapshot for each seed (rows)
     for (uint32_t s = 0; s < kValSeeds; ++s) {
-        upload_tensor(*model.input, val_batches[s].noise);
-        upload_tensor(*model.target, val_batches[s].target);
-        model.graph.eval(false);
-        download_tensor(*model.pred, pred);
+        flow_match_sample(model, val_batches[s].noise, kSampleSteps, pred_mesh);
         std::vector<float> final_pred_single(sample_dim);
         for (uint32_t i = 0; i < sample_dim; ++i) {
-            final_pred_single[i] = pred[i];
+            final_pred_single[i] = pred_mesh[i];
         }
         final_seed_preds[s] = final_pred_single;
         float y_offset = -float(s) * row_spacing;
