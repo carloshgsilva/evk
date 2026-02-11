@@ -58,6 +58,9 @@ For each training step:
   - `output/mesh_val_evolution.obj` (target + prediction snapshots over time)
 
 Sampling uses a short Euler rollout (default 10 steps) from noise to data.
+The denoising rollout uses a power-biased $t$ schedule (controlled by
+`kSampleSchedulePower`) to spend more steps near $t = 1$ for improved
+final precision.
 
 ### Run
 Use:

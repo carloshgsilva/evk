@@ -22,6 +22,7 @@ constexpr uint32_t kNoiseDim = 16;
 constexpr uint32_t kTimeChannel = kTriangleFeatureDim - 1;
 constexpr float kExistScale = 4.0f;
 constexpr float kPi = 3.14159265358979323846f;
+constexpr float kSampleSchedulePower = 3.0f;
 
 struct Vec3 {
     float x;
@@ -262,6 +263,17 @@ void inject_time_channel(std::vector<float>& data,
             data[base + tri * feature_dim + kTimeChannel] = t;
         }
     }
+}
+
+std::vector<float> build_time_schedule(uint32_t steps, float power) {
+    std::vector<float> schedule(steps + 1, 0.0f);
+    schedule[0] = 0.0f;
+    for (uint32_t i = 1; i < steps; ++i) {
+        float s = float(i) / float(steps);
+        schedule[i] = 1.0f - powf(1.0f - s, power);
+    }
+    schedule[steps] = 1.0f;
+    return schedule;
 }
 
 float compute_mse(const std::vector<float>& a, const std::vector<float>& b) {
@@ -579,9 +591,12 @@ void flow_match_sample(MeshCompletionModel& model,
     std::vector<float> dummy_target(x_out.size(), 0.0f);
     upload_tensor(*model.target, dummy_target);
 
-    float dt = 1.0f / float(steps);
+    std::vector<float> schedule = build_time_schedule(steps, kSampleSchedulePower);
     for (uint32_t s = 0; s < steps; ++s) {
-        float t = (float(s) + 0.5f) * dt;
+        float t0 = schedule[s];
+        float t1 = schedule[s + 1];
+        float dt = t1 - t0;
+        float t = 0.5f * (t0 + t1);
         inject_time_channel(x_out, model.batch_size, model.tri_count, model.feature_dim, t);
 
         upload_tensor(*model.input, x_out);
@@ -612,9 +627,9 @@ void main_llm() {
     constexpr uint32_t kEmbedDim = 32;
     constexpr uint32_t kHiddenDim = 128;
     constexpr uint32_t kLayers = 4;
-    constexpr uint32_t kTrainSteps = 10000;
+    constexpr uint32_t kTrainSteps = 15000;
     constexpr uint32_t kSampleSteps = 10;
-    constexpr float kLearningRate = 1.0e-3f;
+    constexpr float kLearningRate = 2.5e-3f;
     constexpr float kNoiseScale = 1.0f;
 
     MeshCompletionModel model(kBatchSize, kTrianglesPerMesh, kTriangleFeatureDim,
@@ -669,7 +684,7 @@ void main_llm() {
     std::vector<float> flow_t_batch;
     std::vector<float> pred_mesh;
 
-    uint32_t log_interval = (kTrainSteps <= 20) ? 1u : 200u;
+    uint32_t log_interval = (kTrainSteps <= 20) ? 1u : 500u;
 
     for (uint32_t step = 1; step <= kTrainSteps; ++step) {
         MeshBatch batch;
@@ -677,8 +692,8 @@ void main_llm() {
         generate_noise(kBatchSize, kNoiseScale, train_rng, batch);
 
         build_flow_matching_targets(batch.noise, batch.target,
-                                    kBatchSize, kTrianglesPerMesh, kTriangleFeatureDim,
-                                    train_rng, flow_x, flow_v_target, flow_t_batch);
+                        kBatchSize, kTrianglesPerMesh, kTriangleFeatureDim,
+                        train_rng, flow_x, flow_v_target, flow_t_batch);
 
         upload_tensor(*model.input, flow_x);
         upload_tensor(*model.target, flow_v_target);
