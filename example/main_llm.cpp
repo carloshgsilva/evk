@@ -16,13 +16,13 @@
 namespace {
 constexpr uint32_t kCubeTriangleCount = 12;
 constexpr uint32_t kTrianglesPerMesh = 16; // padded to satisfy matmul tile constraints
-constexpr uint32_t kTriangleFeatureDim = 16; // padded feature dim
+constexpr uint32_t kEmbedDim = 32;
 constexpr uint32_t kUsedFeatureDim = 10; // 9 coords + exist
-constexpr uint32_t kNoiseDim = 16;
-constexpr uint32_t kTimeChannel = kTriangleFeatureDim - 1;
-constexpr float kExistScale = 4.0f;
-constexpr float kPi = 3.14159265358979323846f;
+constexpr uint32_t kTimeChannel = kEmbedDim - 1;
+constexpr float kExistScale = 1.0f;
+constexpr float kPi = 3.14159265358979323800046f;
 constexpr float kSampleSchedulePower = 3.0f;
+constexpr float kBasedVelScale = 1.0f;
 
 struct Vec3 {
     float x;
@@ -140,22 +140,21 @@ struct MeshBatch {
 
 void generate_noise(uint32_t batch_size, float noise_scale, std::mt19937& rng, MeshBatch& batch) {
     std::normal_distribution<float> dist(0.0f, 1.0f);
-    uint32_t count = batch_size * kTrianglesPerMesh * kNoiseDim;
+    uint32_t count = batch_size * kTrianglesPerMesh * kEmbedDim;
     batch.noise.resize(count);
     for (uint32_t i = 0; i < count; ++i) {
         batch.noise[i] = dist(rng) * noise_scale;
     }
 
-    // Zero out padded feature channels (including the time channel).
-    if (kNoiseDim == kTriangleFeatureDim) {
-        uint32_t sample_dim = kTrianglesPerMesh * kNoiseDim;
-        for (uint32_t b = 0; b < batch_size; ++b) {
-            uint32_t base = b * sample_dim;
-            for (uint32_t t = 0; t < kTrianglesPerMesh; ++t) {
-                uint32_t offset = base + t * kNoiseDim;
-                for (uint32_t d = kUsedFeatureDim; d < kNoiseDim; ++d) {
-                    batch.noise[offset + d] = 0.0f;
-                }
+    // Keep non-mesh channels deterministic (zero), including the reserved time slot.
+    // This prevents unconstrained latent channels from injecting random geometry drift.
+    uint32_t sample_dim = kTrianglesPerMesh * kEmbedDim;
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        uint32_t base = b * sample_dim;
+        for (uint32_t t = 0; t < kTrianglesPerMesh; ++t) {
+            uint32_t tri_offset = base + t * kEmbedDim;
+            for (uint32_t d = kUsedFeatureDim; d < kEmbedDim; ++d) {
+                batch.noise[tri_offset + d] = 0.0f;
             }
         }
     }
@@ -165,7 +164,7 @@ void generate_batch(const std::vector<std::array<float, 9>>& base,
                     uint32_t batch_size,
                     std::mt19937& rng,
                     MeshBatch& batch) {
-    uint32_t sample_dim = kTrianglesPerMesh * kTriangleFeatureDim;
+    uint32_t sample_dim = kTrianglesPerMesh * kEmbedDim;
     batch.target.assign(batch_size * sample_dim, 0.0f);
 
     std::vector<uint32_t> order(kCubeTriangleCount);
@@ -187,7 +186,7 @@ void generate_batch(const std::vector<std::array<float, 9>>& base,
         for (uint32_t t = 0; t < kTrianglesPerMesh; ++t) {
             uint32_t tri_idx = order[t % kCubeTriangleCount];
             const auto& tri = tris[tri_idx];
-            uint32_t base_idx = (b * kTrianglesPerMesh + t) * kTriangleFeatureDim;
+            uint32_t base_idx = (b * kTrianglesPerMesh + t) * kEmbedDim;
 
             for (uint32_t i = 0; i < 9; ++i) {
                 batch.target[base_idx + i] = tri[i];
@@ -349,7 +348,7 @@ void export_obj(const std::filesystem::path& path,
 
     uint32_t vertex_index = 1;
     for (uint32_t t = 0; t < tri_count; ++t) {
-        uint32_t base_idx = t * kTriangleFeatureDim;
+        uint32_t base_idx = t * kEmbedDim;
         float exist = features[base_idx + 9] / kExistScale;
         if (exist < exist_threshold) {
             continue;
@@ -387,7 +386,7 @@ void append_obj(const std::filesystem::path& path,
     }
 
     for (uint32_t t = 0; t < tri_count; ++t) {
-        uint32_t base_idx = t * kTriangleFeatureDim;
+        uint32_t base_idx = t * kEmbedDim;
         float exist = features[base_idx + 9] / kExistScale;
         // Passing a very low threshold disables exist culling entirely.
         if (exist_threshold > -1.0e8f && exist < exist_threshold) {
@@ -506,8 +505,6 @@ struct CrossAttentionBlock {
 struct MeshCompletionModel {
     uint32_t batch_size;
     uint32_t tri_count;
-    uint32_t feature_dim;
-    uint32_t noise_dim;
     uint32_t embed_dim;
     uint32_t hidden_dim;
     uint32_t num_layers;
@@ -518,18 +515,13 @@ struct MeshCompletionModel {
     Tensor* pred = nullptr;
     Tensor* loss = nullptr;
 
-    Tensor* w_in = nullptr;
     Tensor* tri_emb = nullptr;
-    Tensor* w_out = nullptr;
     std::vector<CrossAttentionBlock> blocks;
 
-    MeshCompletionModel(uint32_t batch_size_, uint32_t tri_count_, uint32_t feature_dim_,
-                        uint32_t noise_dim_, uint32_t embed_dim_, uint32_t hidden_dim_,
+    MeshCompletionModel(uint32_t batch_size_, uint32_t tri_count_, uint32_t embed_dim_, uint32_t hidden_dim_,
                         uint32_t num_layers_)
         : batch_size(batch_size_),
           tri_count(tri_count_),
-          feature_dim(feature_dim_),
-          noise_dim(noise_dim_),
           embed_dim(embed_dim_),
           hidden_dim(hidden_dim_),
           num_layers(num_layers_) {
@@ -537,20 +529,17 @@ struct MeshCompletionModel {
     }
 
     void build_graph() {
-        input = &graph.tensor({batch_size, tri_count, noise_dim});
-        target = &graph.tensor({batch_size, tri_count, feature_dim});
+        input = &graph.tensor({batch_size, tri_count, embed_dim});
+        target = &graph.tensor({batch_size, tri_count, embed_dim});
 
-        w_in = &graph.tensor({noise_dim, embed_dim}, true);
         tri_emb = &graph.tensor({tri_count, embed_dim}, true);
-        w_out = &graph.tensor({embed_dim, feature_dim}, true);
 
         blocks.resize(num_layers);
         for (uint32_t i = 0; i < num_layers; ++i) {
             blocks[i].init(graph, embed_dim, hidden_dim);
         }
 
-        Tensor& input_emb = graph.matmul(*input, *w_in);
-        Tensor& x0 = graph.add_position_embedding(input_emb, *tri_emb, batch_size, tri_count);
+        Tensor& x0 = graph.add_position_embedding(*input, *tri_emb, batch_size, tri_count);
 
         Tensor* x = &x0;
         float residual_scale = 1.0f;
@@ -558,22 +547,20 @@ struct MeshCompletionModel {
             x = &blocks[i].forward(graph, *x, residual_scale);
         }
 
-        Tensor& out = graph.matmul(*x, *w_out);
-        pred = &out;
+        Tensor& neg_input = graph.scale(*input, -1.0f);
+        Tensor& vel = graph.add(*x, neg_input);
+        pred = &vel;
         loss = &graph.mse_loss(*pred, *target);
     }
 
     void init_weights(uint32_t seed = 42) {
         srand(seed);
         float base_scale = 0.2f;
-        w_in->random_init(base_scale / sqrtf(float(noise_dim)));
         tri_emb->random_init(0.02f);
 
         for (auto& block : blocks) {
             block.init_weights(base_scale);
         }
-        float out_scale = base_scale * sqrtf(2.0f / float(embed_dim));
-        w_out->random_init(out_scale);
     }
 };
 
@@ -597,14 +584,17 @@ void flow_match_sample(MeshCompletionModel& model,
         float t1 = schedule[s + 1];
         float dt = t1 - t0;
         float t = 0.5f * (t0 + t1);
-        inject_time_channel(x_out, model.batch_size, model.tri_count, model.feature_dim, t);
+        inject_time_channel(x_out, model.batch_size, model.tri_count, model.embed_dim, t);
 
         upload_tensor(*model.input, x_out);
         model.graph.eval(false);
         download_tensor(*model.pred, vel);
+        for(float& v : vel) {
+            v /= kBasedVelScale;
+        }
 
         for (size_t i = 0; i < x_out.size(); ++i) {
-            if ((i % model.feature_dim) == kTimeChannel) {
+            if ((i % model.embed_dim) == kTimeChannel) {
                 x_out[i] = t;
                 continue;
             }
@@ -612,7 +602,7 @@ void flow_match_sample(MeshCompletionModel& model,
         }
     }
 
-    inject_time_channel(x_out, model.batch_size, model.tri_count, model.feature_dim, 0.0f);
+    inject_time_channel(x_out, model.batch_size, model.tri_count, model.embed_dim, 0.0f);
 }
 
 } // namespace
@@ -624,22 +614,20 @@ void main_llm() {
     auto start = std::chrono::high_resolution_clock::now();
 
     constexpr uint32_t kBatchSize = 64;
-    constexpr uint32_t kEmbedDim = 32;
-    constexpr uint32_t kHiddenDim = 128;
-    constexpr uint32_t kLayers = 4;
+    constexpr uint32_t kHiddenDim = kEmbedDim;
+    constexpr uint32_t kLayers = 8;
     constexpr uint32_t kTrainSteps = 15000;
     constexpr uint32_t kSampleSteps = 10;
     constexpr float kLearningRate = 2.5e-3f;
-    constexpr float kNoiseScale = 1.0f;
+    constexpr float kNoiseScale = 0.5f;
 
-    MeshCompletionModel model(kBatchSize, kTrianglesPerMesh, kTriangleFeatureDim,
-                              kNoiseDim, kEmbedDim, kHiddenDim, kLayers);
+    MeshCompletionModel model(kBatchSize, kTrianglesPerMesh, kEmbedDim, kHiddenDim, kLayers);
     model.init_weights(42);
 
     std::mt19937 train_rng(1337);
     auto base = make_cube_triangles();
 
-    uint32_t sample_dim = kTrianglesPerMesh * kTriangleFeatureDim;
+    uint32_t sample_dim = kTrianglesPerMesh * kEmbedDim;
 
     // Create multiple validation seeds so we can visualize several
     // generated meshes in separate rows of the evolution OBJ.
@@ -692,10 +680,13 @@ void main_llm() {
         generate_noise(kBatchSize, kNoiseScale, train_rng, batch);
 
         build_flow_matching_targets(batch.noise, batch.target,
-                        kBatchSize, kTrianglesPerMesh, kTriangleFeatureDim,
+                        kBatchSize, kTrianglesPerMesh, kEmbedDim,
                         train_rng, flow_x, flow_v_target, flow_t_batch);
 
         upload_tensor(*model.input, flow_x);
+        for(float& f : flow_v_target) {
+            f *= kBasedVelScale;
+        }
         upload_tensor(*model.target, flow_v_target);
 
         model.graph.eval(true);
@@ -743,7 +734,7 @@ void main_llm() {
     float final_val_mse = compute_mse(pred_mesh, val_batches[0].target);
     float exist_mean = 0.0f;
     compute_exist_stats(pred_mesh, kBatchSize, kTrianglesPerMesh,
-                        kTriangleFeatureDim, kExistScale, exist_mean);
+                        kEmbedDim, kExistScale, exist_mean);
     printf("validation mse: %.6f | exist mean: %.3f\n",
         final_val_mse, exist_mean);
 

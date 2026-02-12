@@ -9,31 +9,38 @@ This document summarizes what `main_llm.cpp` now does.
 
 ### Data representation
 - A mesh is a fixed list of `kTrianglesPerMesh = 16` triangle slots.
-- Each triangle slot uses `kTriangleFeatureDim = 16` features (logical 10 used):
+- Each triangle slot uses `kEmbedDim` channels (logical mesh channels: 10 used):
   - 9 values for 3D triangle coordinates (3 vertices x 3 coords)
-  - 1 existence flag (`exist`) scaled by `kExistScale = 4.0`
-  - remaining padded values are zero (the last padded slot is reused to carry time $t$ during training/sampling)
+  - 1 existence flag (`exist`) scaled by `kExistScale`
+  - remaining channels are available latent channels (the final channel is reserved for time $t$ during training/sampling)
 - All `kTrianglesPerMesh` slots are enabled by default.
-- Base cube triangles (`kCubeTriangleCount = 12`) are repeated to fill the 16 slots.
+- Base cube triangles (`kCubeTriangleCount`) are repeated to fill the 16 slots.
 
 ### Batch format
 `MeshBatch` contains only:
-- `noise`: Gaussian noise tensor (`batch_size x tri_count x kNoiseDim`)
-- `target`: full triangle feature tensor (`batch_size x tri_count x feature_dim`)
+- `noise`: Gaussian noise tensor (`batch_size x tri_count x kEmbedDim`)
+- `target`: full triangle feature tensor (`batch_size x tri_count x kEmbedDim`)
 
 There is no conditional/partial mesh tensor.
 
 ### Model
-- Input tensor shape: `[B, T, noise_dim]`
-- Output tensor shape: `[B, T, feature_dim]`
+- Input tensor shape: `[B, T, kEmbedDim]`
+- Output tensor shape: `[B, T, kEmbedDim]`
 - Pipeline:
-  - linear projection of noise (`w_in`)
   - positional triangle embedding (`tri_emb`)
   - stack of attention blocks
   - RMSNorm before attention/FFN blocks
-  - output projection (`w_out`) back to feature_dim
-  - output predicted flow velocity
+  - output predicted flow velocity as a residual delta head: `pred = x - input`
 - Loss: MSE against the flow-matching velocity target.
+
+The model uses a single shared embedding width end-to-end (input/noise/features/output),
+so residual paths do not pass through separate input/output projection layers.
+
+### Stability notes from debugging
+- Non-mesh channels (`[kUsedFeatureDim, kEmbedDim)`) in the initial noise are explicitly zeroed,
+  including the reserved time channel. This avoids random latent drift from unconstrained channels.
+- The velocity head uses `x - input` to prevent identity leakage through deep residual stacks
+  after removing `w_out`.
 
 ### Flow matching training logic
 For each training step:
