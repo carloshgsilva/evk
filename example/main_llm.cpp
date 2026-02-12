@@ -515,7 +515,7 @@ struct MeshCompletionModel {
     Tensor* pred = nullptr;
     Tensor* loss = nullptr;
 
-    Tensor* tri_emb = nullptr;
+    Tensor* pos_emb = nullptr;
     std::vector<CrossAttentionBlock> blocks;
 
     MeshCompletionModel(uint32_t batch_size_, uint32_t tri_count_, uint32_t embed_dim_, uint32_t hidden_dim_,
@@ -532,14 +532,14 @@ struct MeshCompletionModel {
         input = &graph.tensor({batch_size, tri_count, embed_dim});
         target = &graph.tensor({batch_size, tri_count, embed_dim});
 
-        tri_emb = &graph.tensor({tri_count, embed_dim}, true);
+        pos_emb = &graph.tensor({tri_count, embed_dim}, true);
 
         blocks.resize(num_layers);
         for (uint32_t i = 0; i < num_layers; ++i) {
             blocks[i].init(graph, embed_dim, hidden_dim);
         }
 
-        Tensor& x0 = graph.add_position_embedding(*input, *tri_emb, batch_size, tri_count);
+        Tensor& x0 = graph.add_position_embedding(*input, *pos_emb, batch_size, tri_count);
 
         Tensor* x = &x0;
         float residual_scale = 1.0f;
@@ -556,7 +556,7 @@ struct MeshCompletionModel {
     void init_weights(uint32_t seed = 42) {
         srand(seed);
         float base_scale = 0.2f;
-        tri_emb->random_init(0.02f);
+        pos_emb->random_init(0.02f);
 
         for (auto& block : blocks) {
             block.init_weights(base_scale);
