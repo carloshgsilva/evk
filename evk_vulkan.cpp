@@ -739,9 +739,30 @@ namespace evk {
             }
 
 #if EVK_DEBUG
-            printf("[evk] validation layers enabled!\n");
             extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-            layers.push_back("VK_LAYER_KHRONOS_validation");
+
+            bool validation_available = false;
+            {
+                uint32_t count = 0;
+                if (vkEnumerateInstanceLayerProperties(&count, nullptr) == VK_SUCCESS && count > 0) {
+                    std::vector<VkLayerProperties> available_layers(count);
+                    if (vkEnumerateInstanceLayerProperties(&count, available_layers.data()) == VK_SUCCESS) {
+                        for (const auto& layer : available_layers) {
+                            if (strcmp(layer.layerName, "VK_LAYER_KHRONOS_validation") == 0) {
+                                validation_available = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (validation_available) {
+                printf("[evk] validation layers enabled!\n");
+                layers.push_back("VK_LAYER_KHRONOS_validation");
+            } else {
+                printf("[evk] validation layer not found; continuing without it.\n");
+            }
 #endif
 
             // Validate instance layers
