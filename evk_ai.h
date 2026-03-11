@@ -694,6 +694,12 @@ struct Graph {
     }
 
     Tensor& mse_loss(Tensor& predicted, Tensor& target) {
+        // Ensure predicted and target have identical shapes
+        assert(predicted.shape.rank() == target.shape.rank() && "mse_loss: predicted and target must have the same rank");
+        for (uint32_t i = 0; i < predicted.shape.rank(); ++i) {
+            assert(predicted.shape[i] == target.shape[i] && "mse_loss: predicted and target dimensions must match");
+        }
+
         nodes.push_back(std::make_unique<Tensor>(Shape({1})));
         Tensor& tensor = *nodes.back();
         tensor.forward_fn = [this, &predicted, &target, &tensor]() {
