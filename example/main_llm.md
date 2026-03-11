@@ -1,73 +1,61 @@
-﻿## main_llm.cpp - Unconditional mesh generation via flow matching
+## `main_llm.cpp` — Causal autoregressive mesh generation (cross-entropy)
 
-This document summarizes what `main_llm.cpp` now does.
+This demo now trains a **token autoregressive model** for meshes instead of flow matching.
 
 ### Objective
-- Train a small generative model that maps random noise directly to triangle meshes.
-- Use flow matching targets to learn a vector field from noise to data.
-- Time conditioning is injected through a reserved feature channel.
+- Learn mesh generation with a causal transformer-style stack.
+- Train with next-token prediction and cross-entropy.
+- Use explicit sequence markers:
+  - `BOS` (beginning of sequence)
+  - `EOS` (end of sequence)
 
-### Data representation
-- A mesh is a fixed list of `kTrianglesPerMesh = 16` triangle slots.
-- Each triangle slot uses `kEmbedDim` channels (logical mesh channels: 10 used):
-  - 9 values for 3D triangle coordinates (3 vertices x 3 coords)
-  - 1 existence flag (`exist`) scaled by `kExistScale`
-  - remaining channels are available latent channels (the final channel is reserved for time $t$ during training/sampling)
-- All `kTrianglesPerMesh` slots are enabled by default.
-- Base cube triangles (`kCubeTriangleCount`) are repeated to fill the 16 slots.
+### Tokenization
+Coordinates are quantized into **128 bins**:
+- Coordinate range: `[-1.25, 1.25]`
+- Tokens:
+  - `0` = PAD / IGNORE
+  - `1` = BOS
+  - `2` = EOS
+  - `3..130` = coordinate bins (128 values)
 
-### Batch format
-`MeshBatch` contains only:
-- `noise`: Gaussian noise tensor (`batch_size x tri_count x kEmbedDim`)
-- `target`: full triangle feature tensor (`batch_size x tri_count x kEmbedDim`)
+Vocabulary is padded to a tile-friendly size (`144`) for GPU matmul constraints.
 
-There is no conditional/partial mesh tensor.
+### Sequence layout
+For each mesh:
+- 16 triangle slots
+- 9 coordinate values per triangle
+- coordinate token count = `16 * 9 = 144`
+
+Sequence (active part):
+- `BOS` + 144 coord tokens + `EOS` = 146 tokens
+
+Sequence tensor length is padded to `160` (multiple of 16) for compute kernel alignment.
 
 ### Model
-- Input tensor shape: `[B, T, kEmbedDim]`
-- Output tensor shape: `[B, T, kEmbedDim]`
-- Pipeline:
-  - positional triangle embedding (`tri_emb`)
-  - stack of attention blocks
-  - RMSNorm before attention/FFN blocks
-  - output predicted flow velocity as a residual delta head: `pred = x - input`
-- Loss: MSE against the flow-matching velocity target.
+- Embedding lookup for token IDs
+- Learned positional embedding
+- Stack of causal attention blocks (RMSNorm + attention + FFN + residual)
+- Output projection to vocabulary logits
+- Loss: cross entropy (`target=0` positions ignored)
 
-The model uses a single shared embedding width end-to-end (input/noise/features/output),
-so residual paths do not pass through separate input/output projection layers.
+### Training and metrics
+The run prints:
+- `train_ce`: training cross-entropy
+- `val_ce`: validation cross-entropy
+- `tf_err`: teacher-forced token error rate
+- `noise_rate`: autoregressive run-to-run token jitter (instability)
+- `noise_mse`: autoregressive run-to-run coordinate jitter MSE
+- `fit_mse`: decoded autoregressive coordinate MSE vs validation targets
 
-### Stability notes from debugging
-- Non-mesh channels (`[kUsedFeatureDim, kEmbedDim)`) in the initial noise are explicitly zeroed,
-  including the reserved time channel. This avoids random latent drift from unconstrained channels.
-- The velocity head uses `x - input` to prevent identity leakage through deep residual stacks
-  after removing `w_out`.
+`noise_rate` and `noise_mse` are expected to be near zero with greedy decoding.
 
-### Flow matching training logic
-For each training step:
-1. Generate target meshes $x_1$ and noise $x_0$.
-2. Sample $t \sim U(0,1)$ per mesh.
-3. Build $x_t = (1 - t) x_0 + t x_1$ and inject $t$ into the reserved feature slot.
-4. Target velocity is $v = x_1 - x_0$ (time slot target is $0$).
-5. Train with MSE between predicted velocity and $v$.
-
-### Validation and outputs
-- Logs include:
-  - `flow_loss`
-  - `vel_mse`
-  - `val_mse`
-  - `seed_div_mse`
-- Final report includes:
-  - `validation mse`
-  - mean predicted `exist` over all triangle slots
-- OBJ outputs:
-  - `output/mesh_target.obj`
-  - `output/mesh_pred.obj`
-  - `output/mesh_val_evolution.obj` (target + prediction snapshots over time)
-
-Sampling uses a short Euler rollout (default 10 steps) from noise to data.
-The denoising rollout uses a power-biased $t$ schedule (controlled by
-`kSampleSchedulePower`) to spend more steps near $t = 1$ for improved
-final precision.
+### Outputs
+After training, the demo exports:
+- `output/mesh_target.obj`
+- `output/mesh_pred.obj`
+- `output/mesh_pred_seed0.obj`
+- `output/mesh_pred_seed1.obj`
+- `output/mesh_pred_seed2.obj`
 
 ### Run
 Use:
@@ -76,4 +64,4 @@ Use:
 .\run.bat --llm
 ```
 
-This configures/builds, runs training, and writes OBJ outputs under `output/`.
+This configures/builds the project and runs the LLM demo.
