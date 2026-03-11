@@ -3,6 +3,13 @@
 namespace evk::ai {
     static evk::Cmd* g_cmd = nullptr;
 
+    static evk::Pipeline create_named_compute_pipeline(const char* name) {
+        return evk::CreatePipeline({
+            .name = name,
+            .CS = evk::loadSpirvFile(std::string("shaders/bin/") + name + ".comp.spv"),
+        });
+    }
+
     evk::Cmd& GetCmd() {
         if (!g_cmd) {
             g_cmd = &evk::CmdBegin(evk::Queue::Graphics);
@@ -172,98 +179,29 @@ namespace evk::ai {
 
     void initialize() {
         pipelines = std::make_unique<Pipelines>();
-        pipelines->flash_attn = evk::CreatePipeline({
-            .name = "flash_attention",
-            .CS = evk::loadSpirvFile("shaders/bin/flash_attention.comp.spv"),
-        });
-        pipelines->flash_attn_bwd = evk::CreatePipeline({
-            .name = "flash_attention_bwd",
-            .CS = evk::loadSpirvFile("shaders/bin/flash_attention_bwd.comp.spv"),
-        });
-        pipelines->mse_loss = evk::CreatePipeline({
-            .name = "mse_loss",
-            .CS = evk::loadSpirvFile("shaders/bin/mse_loss.comp.spv"),
-        });
-        pipelines->sgd = evk::CreatePipeline({
-            .name = "sgd",
-            .CS = evk::loadSpirvFile("shaders/bin/sgd.comp.spv"),
-        });
-        pipelines->adam = evk::CreatePipeline({
-            .name = "adam",
-            .CS = evk::loadSpirvFile("shaders/bin/adam.comp.spv"),
-        });
-        pipelines->add = evk::CreatePipeline({
-            .name = "add",
-            .CS = evk::loadSpirvFile("shaders/bin/add.comp.spv"),
-        });
-        pipelines->softmax = evk::CreatePipeline({
-            .name = "softmax",
-            .CS = evk::loadSpirvFile("shaders/bin/softmax.comp.spv"),
-        });
-        pipelines->softmax_bwd = evk::CreatePipeline({
-            .name = "softmax_bwd",
-            .CS = evk::loadSpirvFile("shaders/bin/softmax_bwd.comp.spv"),
-        });
-        pipelines->cross_entropy = evk::CreatePipeline({
-            .name = "cross_entropy",
-            .CS = evk::loadSpirvFile("shaders/bin/cross_entropy.comp.spv"),
-        });
-        pipelines->cross_entropy_count = evk::CreatePipeline({
-            .name = "cross_entropy_count",
-            .CS = evk::loadSpirvFile("shaders/bin/cross_entropy_count.comp.spv"),
-        });
-        pipelines->cross_entropy_scale = evk::CreatePipeline({
-            .name = "cross_entropy_scale",
-            .CS = evk::loadSpirvFile("shaders/bin/cross_entropy_scale.comp.spv"),
-        });
-        pipelines->embed = evk::CreatePipeline({
-            .name = "embed",
-            .CS = evk::loadSpirvFile("shaders/bin/embed.comp.spv"),
-        });
-        pipelines->embed_bwd = evk::CreatePipeline({
-            .name = "embed_bwd",
-            .CS = evk::loadSpirvFile("shaders/bin/embed_bwd.comp.spv"),
-        });
-        pipelines->position_add = evk::CreatePipeline({
-            .name = "position_add",
-            .CS = evk::loadSpirvFile("shaders/bin/position_add.comp.spv"),
-        });
-        pipelines->position_add_bwd = evk::CreatePipeline({
-            .name = "position_add_bwd",
-            .CS = evk::loadSpirvFile("shaders/bin/position_add_bwd.comp.spv"),
-        });
-        pipelines->causal_mask = evk::CreatePipeline({
-            .name = "causal_mask",
-            .CS = evk::loadSpirvFile("shaders/bin/causal_mask.comp.spv"),
-        });
-        pipelines->relu = evk::CreatePipeline({
-            .name = "relu",
-            .CS = evk::loadSpirvFile("shaders/bin/relu.comp.spv"),
-        });
-        pipelines->relu_bwd = evk::CreatePipeline({
-            .name = "relu_bwd",
-            .CS = evk::loadSpirvFile("shaders/bin/relu_bwd.comp.spv"),
-        });
-        pipelines->scale = evk::CreatePipeline({
-            .name = "scale",
-            .CS = evk::loadSpirvFile("shaders/bin/scale.comp.spv"),
-        });
-        pipelines->zero = evk::CreatePipeline({
-            .name = "zero",
-            .CS = evk::loadSpirvFile("shaders/bin/zero.comp.spv"),
-        });
-        pipelines->sum_batch = evk::CreatePipeline({
-            .name = "sum_batch",
-            .CS = evk::loadSpirvFile("shaders/bin/sum_batch.comp.spv"),
-        });
-        pipelines->rms_norm = evk::CreatePipeline({
-            .name = "rms_norm",
-            .CS = evk::loadSpirvFile("shaders/bin/rms_norm.comp.spv"),
-        });
-        pipelines->rms_norm_bwd = evk::CreatePipeline({
-            .name = "rms_norm_bwd",
-            .CS = evk::loadSpirvFile("shaders/bin/rms_norm_bwd.comp.spv"),
-        });
+        pipelines->flash_attn = create_named_compute_pipeline("flash_attention");
+        pipelines->flash_attn_bwd = create_named_compute_pipeline("flash_attention_bwd");
+        pipelines->mse_loss = create_named_compute_pipeline("mse_loss");
+        pipelines->sgd = create_named_compute_pipeline("sgd");
+        pipelines->adam = create_named_compute_pipeline("adam");
+        pipelines->add = create_named_compute_pipeline("add");
+        pipelines->softmax = create_named_compute_pipeline("softmax");
+        pipelines->softmax_bwd = create_named_compute_pipeline("softmax_bwd");
+        pipelines->cross_entropy = create_named_compute_pipeline("cross_entropy");
+        pipelines->cross_entropy_count = create_named_compute_pipeline("cross_entropy_count");
+        pipelines->cross_entropy_scale = create_named_compute_pipeline("cross_entropy_scale");
+        pipelines->embed = create_named_compute_pipeline("embed");
+        pipelines->embed_bwd = create_named_compute_pipeline("embed_bwd");
+        pipelines->position_add = create_named_compute_pipeline("position_add");
+        pipelines->position_add_bwd = create_named_compute_pipeline("position_add_bwd");
+        pipelines->causal_mask = create_named_compute_pipeline("causal_mask");
+        pipelines->relu = create_named_compute_pipeline("relu");
+        pipelines->relu_bwd = create_named_compute_pipeline("relu_bwd");
+        pipelines->scale = create_named_compute_pipeline("scale");
+        pipelines->zero = create_named_compute_pipeline("zero");
+        pipelines->sum_batch = create_named_compute_pipeline("sum_batch");
+        pipelines->rms_norm = create_named_compute_pipeline("rms_norm");
+        pipelines->rms_norm_bwd = create_named_compute_pipeline("rms_norm_bwd");
         pipelines->cross_entropy_accum = {};
         pipelines->flash_scratch = {};
         pipelines->flash_scratch_elems = 0;
