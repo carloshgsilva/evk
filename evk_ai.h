@@ -542,6 +542,14 @@ namespace evk::ai {
     // out: (B, N, embed_dim)
     void embed(Tensor& embeddings, Tensor& indices, Tensor& out);
 
+    // Greedy sampling over one sequence position.
+    // logits: (B, S, V)
+    // out_tokens: (B) token ids written as raw uint16 values in fp16 payload storage
+    void greedy_sample(Tensor& logits, Tensor& out_tokens,
+                       uint32_t position,
+                       uint16_t token_base,
+                       uint16_t token_count);
+
     // Embedding backward: accumulates gradients into embedding table
     // grad_out: (B, N, embed_dim) gradient from downstream
     // indices: (B, N) same indices used in forward
@@ -857,15 +865,9 @@ struct Graph {
             evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, loss);
         };
         loss.backward_fn = [&logits, &targets, &loss, &flat_grad, B, N, V]() {
-            // Re-compute gradient (since eval() zeroes gradients before backward)
             Tensor flat_logits = Tensor::alias(Shape({B * N, V}), logits.buffer);
             Tensor flat_targets = Tensor::alias(Shape({B * N}), targets.buffer);
-            Tensor dummy_loss({1});
-            
-            // Compute gradient into flat_grad, then copy to logits.grad()
-            evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, dummy_loss);
-            
-            // Copy flat gradient back to 3D logits gradient (same memory layout)
+            evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, loss);
             auto& cmd = evk::ai::GetCmd();
             cmd.copy(flat_grad.buffer, logits.grad().buffer, logits.shape.count() * sizeof(float16_t));
         };
@@ -974,6 +976,7 @@ struct Graph {
                 node->forward_fn();
             }
         }
+
         if (backward) {
             // Run backward functions in reverse node order so intermediate
             // operators (e.g. matmul) can populate grads for parameters.
@@ -984,6 +987,7 @@ struct Graph {
                 }
             }
         }
+
         if (submit) {
             evk::ai::SubmitCmd(wait);
         }

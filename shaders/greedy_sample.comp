@@ -1,0 +1,65 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+layout(buffer_reference) buffer BufferU16 { uint16_t x[]; };
+
+PUSH(
+    BufferFp16 logitsBuffer;   // (B, S, V)
+    BufferU16 outTokensBuffer; // (B)
+    uint batchSize;
+    uint seqLen;
+    uint vocabSize;
+    uint position;
+    uint tokenBase;
+    uint tokenCount;
+)
+
+shared float sharedBestValue[256];
+shared uint sharedBestToken[256];
+
+COMPUTE(256, 1, 1)
+void main() {
+    uint batch = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+
+    if (batch >= batchSize) {
+        return;
+    }
+
+    uint rowStart = (batch * seqLen + position) * vocabSize;
+    float bestValue = -3.402823466e+38;
+    uint bestToken = tokenBase;
+
+    for (uint j = lid; j < tokenCount; j += gl_WorkGroupSize.x) {
+        uint token = tokenBase + j;
+        float value = float(logitsBuffer.x[rowStart + token]);
+        if (value > bestValue) {
+            bestValue = value;
+            bestToken = token;
+        }
+    }
+
+    sharedBestValue[lid] = bestValue;
+    sharedBestToken[lid] = bestToken;
+    barrier();
+
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            float otherValue = sharedBestValue[lid + stride];
+            uint otherToken = sharedBestToken[lid + stride];
+            if (otherValue > sharedBestValue[lid]) {
+                sharedBestValue[lid] = otherValue;
+                sharedBestToken[lid] = otherToken;
+            }
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        outTokensBuffer.x[batch] = uint16_t(sharedBestToken[0]);
+    }
+}

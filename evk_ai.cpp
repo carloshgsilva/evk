@@ -41,6 +41,7 @@ namespace evk::ai {
         evk::Pipeline softmax_bwd;
         evk::Pipeline embed;
         evk::Pipeline embed_bwd;
+        evk::Pipeline greedy_sample;
         evk::Pipeline position_add;
         evk::Pipeline position_add_bwd;
         evk::Pipeline causal_mask;
@@ -192,6 +193,7 @@ namespace evk::ai {
         pipelines->cross_entropy_scale = create_named_compute_pipeline("cross_entropy_scale");
         pipelines->embed = create_named_compute_pipeline("embed");
         pipelines->embed_bwd = create_named_compute_pipeline("embed_bwd");
+        pipelines->greedy_sample = create_named_compute_pipeline("greedy_sample");
         pipelines->position_add = create_named_compute_pipeline("position_add");
         pipelines->position_add_bwd = create_named_compute_pipeline("position_add_bwd");
         pipelines->causal_mask = create_named_compute_pipeline("causal_mask");
@@ -735,6 +737,37 @@ namespace evk::ai {
         const uint32_t WORKGROUP_SIZE = 256u;
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
+        cmd.barrier();
+    }
+
+    void greedy_sample(Tensor& logits, Tensor& out_tokens,
+                       uint32_t position,
+                       uint16_t token_base,
+                       uint16_t token_count) {
+        assert(logits.shape.rank() == 3);
+        assert(out_tokens.shape.rank() == 1);
+
+        uint32_t batch_size = logits.shape[0];
+        uint32_t seq_len = logits.shape[1];
+        uint32_t vocab_size = logits.shape[2];
+
+        assert(out_tokens.shape[0] == batch_size);
+        assert(position < seq_len);
+        assert(uint32_t(token_base) + uint32_t(token_count) <= vocab_size);
+
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(pipelines->greedy_sample);
+        cmd.push(evk::Constant{
+            logits.buffer.GetReference(),
+            out_tokens.buffer.GetReference(),
+            batch_size,
+            seq_len,
+            vocab_size,
+            position,
+            uint32_t(token_base),
+            uint32_t(token_count),
+        });
+        cmd.dispatch(batch_size, 1, 1);
         cmd.barrier();
     }
 

@@ -1,0 +1,72 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 qBuffer;    // (1, 1, D)
+    BufferFp16 kBuffer;    // (1, maxSeqLen, D)
+    BufferFp16 vBuffer;    // (1, maxSeqLen, D)
+    BufferFp16 outBuffer;  // (1, 1, D)
+    uint maxSeqLen;
+    uint dim;
+    uint currentLength;
+)
+
+const uint MAX_SEQ_LEN = 160u;
+const uint MAX_DIM = 64u;
+shared float sharedQ[MAX_DIM];
+shared float sharedScores[MAX_SEQ_LEN];
+shared float sharedWeights[MAX_SEQ_LEN];
+shared float sharedOut[MAX_DIM];
+
+COMPUTE(256, 1, 1)
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+
+    if (lid < dim) {
+        sharedQ[lid] = float(qBuffer.x[lid]);
+    }
+    barrier();
+
+    if (lid < currentLength) {
+        float score = 0.0;
+        uint kvBase = lid * dim;
+        for (uint d = 0u; d < dim; ++d) {
+            score += sharedQ[d] * float(kBuffer.x[kvBase + d]);
+        }
+        sharedScores[lid] = score * inversesqrt(float(dim));
+    }
+    barrier();
+
+    if (lid == 0u) {
+        float maxScore = -3.402823466e+38;
+        for (uint i = 0u; i < currentLength; ++i) {
+            maxScore = max(maxScore, sharedScores[i]);
+        }
+
+        float sumWeights = 0.0;
+        for (uint i = 0u; i < currentLength; ++i) {
+            float w = exp(sharedScores[i] - maxScore);
+            sharedWeights[i] = w;
+            sumWeights += w;
+        }
+
+        float invSum = (sumWeights > 0.0) ? (1.0 / sumWeights) : 0.0;
+        for (uint d = 0u; d < dim; ++d) {
+            float acc = 0.0;
+            for (uint i = 0u; i < currentLength; ++i) {
+                acc += (sharedWeights[i] * invSum) * float(vBuffer.x[i * dim + d]);
+            }
+            sharedOut[d] = acc;
+        }
+    }
+    barrier();
+
+    if (lid < dim) {
+        outBuffer.x[lid] = float16_t(sharedOut[lid]);
+    }
+}

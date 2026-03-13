@@ -236,22 +236,46 @@ void build_token_batch(const std::vector<float>& mesh_target,
     }
 }
 
-void upload_token_tensor(Tensor& t, const std::vector<uint16_t>& data) {
+void upload_token_tensor(Tensor& t,
+                         const std::vector<uint16_t>& data,
+                         bool submit = true) {
     assert(t.shape.count() == data.size());
-    float16_t* ptr = t.cpu();
-    for (uint32_t i = 0; i < t.shape.count(); ++i) {
-        ptr[i].value = data[i];
+    auto& cmd = evk::ai::GetCmd();
+    cmd.copy((void*)data.data(), t.buffer, t.shape.count() * sizeof(uint16_t));
+    if (submit) {
+        evk::ai::SubmitCmd(true);
     }
-    t.cpu_upload();
 }
 
-void download_float_tensor(Tensor& t, std::vector<float>& data) {
-    t.cpu_download();
+void queue_tensor_download(Tensor& t) {
+    t.cpu();
+    auto& cmd = evk::ai::GetCmd();
+    cmd.copy(t.buffer, t.cpu_buffer, t.shape.count() * sizeof(float16_t));
+}
+
+void read_float_tensor_from_cpu_buffer(Tensor& t, std::vector<float>& data) {
     float16_t* ptr = t.cpu();
     data.resize(t.shape.count());
     for (uint32_t i = 0; i < t.shape.count(); ++i) {
         data[i] = float(ptr[i]);
     }
+}
+
+void download_float_tensor(Tensor& t, std::vector<float>& data) {
+    queue_tensor_download(t);
+    evk::ai::SubmitCmd(true);
+    read_float_tensor_from_cpu_buffer(t, data);
+}
+
+float read_scalar_tensor_from_cpu_buffer(Tensor& t) {
+    assert(t.shape.count() == 1);
+    return float(t.cpu()[0]);
+}
+
+float download_scalar_tensor(Tensor& t) {
+    queue_tensor_download(t);
+    evk::ai::SubmitCmd(true);
+    return read_scalar_tensor_from_cpu_buffer(t);
 }
 
 void decode_generated_mesh(const std::vector<uint16_t>& generated_inputs,
@@ -271,13 +295,6 @@ void decode_generated_mesh(const std::vector<uint16_t>& generated_inputs,
         mesh_features_out[tri * kMeshFeatureDim + 9] = kExistScale;
     }
 }
-
-void sample_greedy_autoregressive(struct MeshTokenModel& model,
-                                  uint32_t batch_size,
-                                  std::vector<uint16_t>& generated_inputs,
-                                  std::vector<uint16_t>& scratch_targets,
-                                  std::vector<float>& logits_cpu);
-
 void export_obj(const std::filesystem::path& path,
                 const std::vector<float>& features,
                 uint32_t tri_count,
@@ -412,6 +429,7 @@ struct MeshTokenModel {
     Tensor* token_emb = nullptr;     // [V, D]
     Tensor* pos_emb = nullptr;       // [S, D]
     Tensor* w_out = nullptr;         // [D, V]
+    Tensor* sampled_token_ids = nullptr;
 
     Tensor* logits = nullptr;        // [B, S, V]
     Tensor* loss = nullptr;          // scalar
@@ -452,6 +470,7 @@ struct MeshTokenModel {
 
         Tensor& x_norm = graph.rms_norm(*x);
         w_out = &graph.tensor({model_dim, vocab_size}, true);
+        sampled_token_ids = &graph.tensor({batch_size});
         logits = &graph.matmul(x_norm, *w_out, 16, 16);
         loss = &graph.cross_entropy_loss(*logits, *target_tokens);
     }
@@ -472,8 +491,7 @@ struct MeshTokenModel {
 void sample_greedy_autoregressive(MeshTokenModel& model,
                                   uint32_t batch_size,
                                   std::vector<uint16_t>& generated_inputs,
-                                  std::vector<uint16_t>& scratch_targets,
-                                  std::vector<float>& logits_cpu) {
+                                  std::vector<uint16_t>& scratch_targets) {
     generated_inputs.assign(batch_size * kSeqLen, kPadToken);
     scratch_targets.assign(batch_size * kSeqLen, kPadToken);
 
@@ -481,33 +499,24 @@ void sample_greedy_autoregressive(MeshTokenModel& model,
         generated_inputs[b * kSeqLen + 0] = kBosToken;
     }
 
-    upload_token_tensor(*model.target_tokens, scratch_targets);
+    upload_token_tensor(*model.target_tokens, scratch_targets, false);
 
-    for (uint32_t pos = 0; pos <= kCoordTokenCount; ++pos) {
-        upload_token_tensor(*model.input_tokens, generated_inputs);
-        model.graph.eval(false);
-        download_float_tensor(*model.logits, logits_cpu);
+    for (uint32_t pos = 0; pos < kCoordTokenCount; ++pos) {
+        upload_token_tensor(*model.input_tokens, generated_inputs, false);
+        model.graph.eval(false, false, false);
+        evk::ai::greedy_sample(*model.logits, *model.sampled_token_ids, pos, kCoordTokenBase, uint16_t(kCoordBins));
+        queue_tensor_download(*model.sampled_token_ids);
+        evk::ai::SubmitCmd(true);
+
+        float16_t* sampled_ptr = model.sampled_token_ids->cpu();
 
         for (uint32_t b = 0; b < batch_size; ++b) {
-            uint16_t next_tok = kPadToken;
-
-            if (pos < kCoordTokenCount) {
-                const float* row = logits_cpu.data() + ((b * kSeqLen + pos) * kVocabSize);
-                uint16_t best_tok = kCoordTokenBase;
-                float best = row[best_tok];
-                for (uint16_t tok = uint16_t(kCoordTokenBase + 1); tok < uint16_t(kCoordTokenBase + kCoordBins); ++tok) {
-                    if (row[tok] > best) {
-                        best = row[tok];
-                        best_tok = tok;
-                    }
-                }
-                next_tok = best_tok;
-            } else {
-                next_tok = kEosToken;
-            }
-
-            generated_inputs[b * kSeqLen + (pos + 1)] = next_tok;
+            generated_inputs[b * kSeqLen + (pos + 1)] = sampled_ptr[b].value;
         }
+    }
+
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        generated_inputs[b * kSeqLen + (kCoordTokenCount + 1)] = kEosToken;
     }
 }
 
@@ -576,38 +585,45 @@ void main_llm() {
 
     std::vector<uint16_t> train_input_tokens;
     std::vector<uint16_t> train_target_tokens;
-    std::vector<float> logits_cpu;
-
     std::vector<uint16_t> sampled_tokens;
     std::vector<uint16_t> scratch_targets;
 
     for (uint32_t step = 1; step <= kTrainSteps; ++step) {
+        bool should_log = (step == 1 || step % kLogInterval == 0 || step == kTrainSteps);
+
         MeshBatch batch;
         generate_batch(base, kBatchSize, train_rng, batch);
         build_token_batch(batch.target, kBatchSize, train_input_tokens, train_target_tokens);
+        upload_token_tensor(*model.input_tokens, train_input_tokens, false);
+        upload_token_tensor(*model.target_tokens, train_target_tokens, false);
 
-        upload_token_tensor(*model.input_tokens, train_input_tokens);
-        upload_token_tensor(*model.target_tokens, train_target_tokens);
-
-        model.graph.eval(true);
+        model.graph.eval(true, false, false);
         model.graph.step_adam(kLearningRate, 0.9f, 0.98f, 1e-4f);
-        evk::ai::SubmitCmd(true);
 
-        if (step == 1 || step % kLogInterval == 0 || step == kTrainSteps) {
-            float train_loss = float(model.loss->item());
+        if (should_log) {
+            queue_tensor_download(*model.loss);
+        }
 
+        evk::ai::SubmitCmd(should_log);
+
+        if (should_log) {
+            float train_loss = read_scalar_tensor_from_cpu_buffer(*model.loss);
             float val_loss = 0.0f;
 
             for (uint32_t s = 0; s < kValSeeds; ++s) {
-                upload_token_tensor(*model.input_tokens, val[s].input_tokens);
-                upload_token_tensor(*model.target_tokens, val[s].target_tokens);
-                model.graph.eval(false);
-                val_loss += float(model.loss->item());
+                upload_token_tensor(*model.input_tokens, val[s].input_tokens, false);
+                upload_token_tensor(*model.target_tokens, val[s].target_tokens, false);
+                model.graph.eval(false, false, false);
+                queue_tensor_download(*model.loss);
+                evk::ai::SubmitCmd(true);
+                val_loss += read_scalar_tensor_from_cpu_buffer(*model.loss);
+            }
 
-                sample_greedy_autoregressive(model, kBatchSize, sampled_tokens, scratch_targets, logits_cpu);
+            sample_greedy_autoregressive(model, kBatchSize, sampled_tokens, scratch_targets);
 
-                std::vector<float> pred_first_mesh;
-                decode_generated_mesh(sampled_tokens, 0, pred_first_mesh);
+            std::vector<float> pred_first_mesh;
+            decode_generated_mesh(sampled_tokens, 0, pred_first_mesh);
+            for (uint32_t s = 0; s < kValSeeds; ++s) {
                 float y_offset = -float(s) * row_spacing;
                 append_obj(evo_path,
                            pred_first_mesh,
@@ -620,15 +636,16 @@ void main_llm() {
 
             val_loss /= float(kValSeeds);
 
-                 printf("step %4u | train_ce %.6f | val_ce %.6f\n",
-                     step, train_loss, val_loss);
+            printf("step %4u | train_ce %.6f | val_ce %.6f\n",
+                   step, train_loss, val_loss);
             fflush(stdout);
             evo_snapshot_count++;
         }
     }
 
-    // Final sample/export from seed 0
-    sample_greedy_autoregressive(model, kBatchSize, sampled_tokens, scratch_targets, logits_cpu);
+    if (sampled_tokens.empty()) {
+        sample_greedy_autoregressive(model, kBatchSize, sampled_tokens, scratch_targets);
+    }
 
     std::vector<float> pred_first_mesh;
     decode_generated_mesh(sampled_tokens, 0, pred_first_mesh);
@@ -636,7 +653,6 @@ void main_llm() {
     export_obj("output/mesh_target.obj", val[0].first_target_mesh, kTrianglesPerMesh);
     export_obj("output/mesh_pred.obj", pred_first_mesh, kTrianglesPerMesh);
 
-    // Also save a few independent greedy samples (all start at BOS)
     for (uint32_t s = 0; s < 3; ++s) {
         decode_generated_mesh(sampled_tokens, s, pred_first_mesh);
         export_obj(std::filesystem::path("output") / ("mesh_pred_seed" + std::to_string(s) + ".obj"),
