@@ -1,0 +1,41 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 inputBuffer;   // (batch_size, seq_len, embed_dim)
+    BufferFp16 outputBuffer;  // (batch_size, seq_len, embed_dim)
+    uint batchSize;
+    uint seqLen;
+    uint embedDim;
+    float rotaryBase;
+)
+
+COMPUTE(256, 1, 1)
+void main() {
+    uint pairCount = embedDim >> 1u;
+    uint gid = gl_GlobalInvocationID.x;
+    uint totalPairs = batchSize * seqLen * pairCount;
+    if (gid >= totalPairs) return;
+
+    uint pair = gid % pairCount;
+    uint temp = gid / pairCount;
+    uint t = temp % seqLen;
+    uint b = temp / seqLen;
+
+    uint baseIdx = (b * seqLen + t) * embedDim + pair * 2u;
+    float x0 = float(inputBuffer.x[baseIdx + 0u]);
+    float x1 = float(inputBuffer.x[baseIdx + 1u]);
+
+    float invFreq = pow(rotaryBase, -2.0f * float(pair) / float(embedDim));
+    float angle = float(t) * invFreq;
+    float c = cos(angle);
+    float s = sin(angle);
+
+    outputBuffer.x[baseIdx + 0u] = float16_t(x0 * c - x1 * s);
+    outputBuffer.x[baseIdx + 1u] = float16_t(x0 * s + x1 * c);
+}

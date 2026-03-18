@@ -569,6 +569,17 @@ namespace evk::ai {
     void position_add_backward(Tensor& grad_out, Tensor& grad_input, Tensor& grad_pos,
                                uint32_t batch_size, uint32_t seq_len, uint32_t embed_dim);
 
+    // Rotary position encoding over the last dimension.
+    // input, out: (B, N, D), D must be even.
+    void rope(Tensor& input, Tensor& out,
+              uint32_t batch_size, uint32_t seq_len, uint32_t embed_dim,
+              float rotary_base = 10000.0f);
+
+    // Rotary position encoding backward.
+    void rope_backward(Tensor& grad_out, Tensor& grad_input,
+                       uint32_t batch_size, uint32_t seq_len, uint32_t embed_dim,
+                       float rotary_base = 10000.0f);
+
     // In-place scale: tensor *= scale_factor
     void scale(Tensor& tensor, float scale_factor);
 
@@ -804,6 +815,28 @@ struct Graph {
                                            batch_size, seq_len, embed_dim);
         };
         
+        return out;
+    }
+
+    Tensor& rope(Tensor& input, float rotary_base = 10000.0f) {
+        assert(input.shape.rank() == 3 && "rope expects (B, N, D)");
+        assert((input.shape[2] % 2u) == 0u && "rope requires an even embedding dimension");
+
+        uint32_t batch_size = input.shape[0];
+        uint32_t seq_len = input.shape[1];
+        uint32_t embed_dim = input.shape[2];
+
+        nodes.push_back(std::make_unique<Tensor>(input.shape));
+        Tensor& out = *nodes.back();
+
+        out.forward_fn = [&input, &out, batch_size, seq_len, embed_dim, rotary_base]() {
+            evk::ai::rope(input, out, batch_size, seq_len, embed_dim, rotary_base);
+        };
+
+        out.backward_fn = [&input, &out, batch_size, seq_len, embed_dim, rotary_base]() {
+            evk::ai::rope_backward(out.grad(), input.grad(), batch_size, seq_len, embed_dim, rotary_base);
+        };
+
         return out;
     }
 

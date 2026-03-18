@@ -44,6 +44,8 @@ namespace evk::ai {
         evk::Pipeline greedy_sample;
         evk::Pipeline position_add;
         evk::Pipeline position_add_bwd;
+        evk::Pipeline rope;
+        evk::Pipeline rope_bwd;
         evk::Pipeline causal_mask;
         evk::Pipeline relu;
         evk::Pipeline relu_bwd;
@@ -196,6 +198,8 @@ namespace evk::ai {
         pipelines->greedy_sample = create_named_compute_pipeline("greedy_sample");
         pipelines->position_add = create_named_compute_pipeline("position_add");
         pipelines->position_add_bwd = create_named_compute_pipeline("position_add_bwd");
+        pipelines->rope = create_named_compute_pipeline("rope");
+        pipelines->rope_bwd = create_named_compute_pipeline("rope_bwd");
         pipelines->causal_mask = create_named_compute_pipeline("causal_mask");
         pipelines->relu = create_named_compute_pipeline("relu");
         pipelines->relu_bwd = create_named_compute_pipeline("relu_bwd");
@@ -873,6 +877,52 @@ namespace evk::ai {
             1u, // mode = 1
         });
         groupsX = (posElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        cmd.dispatch(groupsX, 1, 1);
+        cmd.barrier();
+    }
+
+    void rope(Tensor& input, Tensor& out,
+              uint32_t batch_size, uint32_t seq_len, uint32_t embed_dim,
+              float rotary_base) {
+        assert((embed_dim % 2u) == 0u);
+        uint32_t totalPairs = batch_size * seq_len * (embed_dim / 2u);
+
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(pipelines->rope);
+        cmd.push(evk::Constant{
+            input.buffer.GetReference(),
+            out.buffer.GetReference(),
+            batch_size,
+            seq_len,
+            embed_dim,
+            rotary_base,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalPairs + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        cmd.dispatch(groupsX, 1, 1);
+        cmd.barrier();
+    }
+
+    void rope_backward(Tensor& grad_out, Tensor& grad_input,
+                       uint32_t batch_size, uint32_t seq_len, uint32_t embed_dim,
+                       float rotary_base) {
+        assert((embed_dim % 2u) == 0u);
+        uint32_t totalPairs = batch_size * seq_len * (embed_dim / 2u);
+
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(pipelines->rope_bwd);
+        cmd.push(evk::Constant{
+            grad_out.buffer.GetReference(),
+            grad_input.buffer.GetReference(),
+            batch_size,
+            seq_len,
+            embed_dim,
+            rotary_base,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalPairs + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
     }
