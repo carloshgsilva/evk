@@ -33,7 +33,7 @@ Sequence tensor length is padded to `160` (multiple of 16) for compute kernel al
 
 ### Model
 - Embedding lookup for token IDs
-- Learned positional embedding
+- Rotary position encoding (RoPE) applied to attention `q` and `k`
 - Stack of causal attention blocks (RMSNorm + attention + FFN + residual)
 - Output projection to vocabulary logits
 - Loss: cross entropy (`target=0` positions ignored)

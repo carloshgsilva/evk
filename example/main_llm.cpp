@@ -369,10 +369,12 @@ struct CausalAttentionBlock {
 
     uint32_t model_dim = 0;
     uint32_t hidden_dim = 0;
+    float rope_base = 10000.0f;
 
-    void init(Graph& graph, uint32_t model_dim_, uint32_t hidden_dim_) {
+    void init(Graph& graph, uint32_t model_dim_, uint32_t hidden_dim_, float rope_base_) {
         model_dim = model_dim_;
         hidden_dim = hidden_dim_;
+        rope_base = rope_base_;
 
         w_q = &graph.tensor({model_dim, model_dim}, true);
         w_k = &graph.tensor({model_dim, model_dim}, true);
@@ -400,8 +402,10 @@ struct CausalAttentionBlock {
         Tensor& q = graph.matmul(norm_in, *w_q);
         Tensor& k = graph.matmul(norm_in, *w_k);
         Tensor& v = graph.matmul(norm_in, *w_v);
+        Tensor& q_rope = graph.rope(q, rope_base);
+        Tensor& k_rope = graph.rope(k, rope_base);
 
-        Tensor& attn = graph.causal_attention(q, k, v);
+        Tensor& attn = graph.causal_attention(q_rope, k_rope, v);
         Tensor& attn_proj = graph.matmul(attn, *w_o);
         Tensor& res1 = graph.residual(input, attn_proj);
 
@@ -421,13 +425,13 @@ struct MeshTokenModel {
     uint32_t model_dim;
     uint32_t hidden_dim;
     uint32_t num_layers;
+    float rope_base;
 
     Graph graph;
 
     Tensor* input_tokens = nullptr;  // [B, S], uint16 in fp16 payload
     Tensor* target_tokens = nullptr; // [B, S], uint16 in fp16 payload
     Tensor* token_emb = nullptr;     // [V, D]
-    Tensor* pos_emb = nullptr;       // [S, D]
     Tensor* w_out = nullptr;         // [D, V]
     Tensor* sampled_token_ids = nullptr;
 
@@ -441,13 +445,15 @@ struct MeshTokenModel {
                    uint32_t vocab_size_,
                    uint32_t model_dim_,
                    uint32_t hidden_dim_,
-                   uint32_t num_layers_)
+                   uint32_t num_layers_,
+                   float rope_base_)
         : batch_size(batch_size_),
           seq_len(seq_len_),
           vocab_size(vocab_size_),
           model_dim(model_dim_),
           hidden_dim(hidden_dim_),
-          num_layers(num_layers_) {
+          num_layers(num_layers_),
+          rope_base(rope_base_) {
         build_graph();
     }
 
@@ -456,15 +462,11 @@ struct MeshTokenModel {
         target_tokens = &graph.tensor({batch_size, seq_len});
 
         token_emb = &graph.tensor({vocab_size, model_dim}, true);
-        pos_emb = &graph.tensor({seq_len, model_dim}, true);
-
         Tensor& x_emb = graph.embed(*token_emb, *input_tokens);
-        Tensor& x_pos = graph.add_position_embedding(x_emb, *pos_emb, batch_size, seq_len);
-
         blocks.resize(num_layers);
-        Tensor* x = &x_pos;
+        Tensor* x = &x_emb;
         for (uint32_t i = 0; i < num_layers; ++i) {
-            blocks[i].init(graph, model_dim, hidden_dim);
+            blocks[i].init(graph, model_dim, hidden_dim, rope_base);
             x = &blocks[i].forward(graph, *x);
         }
 
@@ -479,7 +481,6 @@ struct MeshTokenModel {
         srand(seed);
 
         token_emb->random_init(0.08f);
-        pos_emb->random_init(0.02f);
         w_out->random_init(0.06f);
 
         for (auto& block : blocks) {
@@ -524,19 +525,20 @@ void sample_greedy_autoregressive(MeshTokenModel& model,
 
 void main_llm() {
     evk::ai::initialize();
-    printf("=== main_llm: causal autoregressive mesh tokens (CE, BOS/EOS, 128 bins) ===\n");
+    printf("=== main_llm: causal autoregressive mesh tokens (RoPE, CE, BOS/EOS, 128 bins) ===\n");
 
     auto start = std::chrono::high_resolution_clock::now();
 
     constexpr uint32_t kBatchSize = 16;
-    constexpr uint32_t kModelDim = 32;
-    constexpr uint32_t kHiddenDim = 64;
-    constexpr uint32_t kLayers = 6;
-    constexpr uint32_t kTrainSteps = 3000;
+    constexpr uint32_t kModelDim = 48;
+    constexpr uint32_t kHiddenDim = 96;
+    constexpr uint32_t kLayers = 8;
+    constexpr uint32_t kTrainSteps = 5000;
     constexpr uint32_t kLogInterval = 200;
-    constexpr float kLearningRate = 2.0e-3f;
+    constexpr float kLearningRate = 1.25e-3f;
+    constexpr float kRopeBase = 16.0f;
 
-    MeshTokenModel model(kBatchSize, kSeqLen, kVocabSize, kModelDim, kHiddenDim, kLayers);
+    MeshTokenModel model(kBatchSize, kSeqLen, kVocabSize, kModelDim, kHiddenDim, kLayers, kRopeBase);
     model.init_weights(42);
 
     std::mt19937 train_rng(1337);
@@ -620,7 +622,6 @@ void main_llm() {
             }
 
             sample_greedy_autoregressive(model, kBatchSize, sampled_tokens, scratch_targets);
-
             std::vector<float> pred_first_mesh;
             decode_generated_mesh(sampled_tokens, 0, pred_first_mesh);
             for (uint32_t s = 0; s < kValSeeds; ++s) {
@@ -633,7 +634,6 @@ void main_llm() {
                            y_offset,
                            -1.0e9f);
             }
-
             val_loss /= float(kValSeeds);
 
             printf("step %4u | train_ce %.6f | val_ce %.6f\n",
