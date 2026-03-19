@@ -1,5 +1,8 @@
 
+#if defined(_MSC_VER)
+
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <dbghelp.h>
 #ifdef _MSC_VER
@@ -77,7 +80,6 @@ static void PrintStackTraceFromContext(const CONTEXT &context) {
     SymCleanup(hProcess);
 }
 
-#if defined(_MSC_VER) && defined(_DEBUG)
 // CRT report hook implementation. The hook will capture the context and print a stack trace
 static int __cdecl crtReportHook(int reportType, char* message, int* returnValue) {
     if (reportType == _CRT_ASSERT || reportType == _CRT_ERROR || reportType == _CRT_WARN) {
