@@ -384,13 +384,13 @@ struct CausalAttentionBlock {
         w2 = &graph.tensor({hidden_dim, model_dim}, true);
     }
 
-    void init_weights(float residual_gain) {
-        w_q->xavier_normal_init(residual_gain);
-        w_k->xavier_normal_init(residual_gain);
-        w_v->xavier_normal_init(residual_gain);
-        w_o->xavier_normal_init(residual_gain);
-        w1->he_normal_init(residual_gain);
-        w2->xavier_normal_init(residual_gain);
+    void init_weights(float weight_stddev, float residual_proj_stddev) {
+        w_q->random_init(weight_stddev);
+        w_k->random_init(weight_stddev);
+        w_v->random_init(weight_stddev);
+        w_o->random_init(residual_proj_stddev);
+        w1->random_init(weight_stddev);
+        w2->random_init(residual_proj_stddev);
     }
 
     Tensor& forward(Graph& graph, Tensor& input) {
@@ -476,22 +476,13 @@ struct MeshTokenModel {
     void init_weights(uint32_t seed = 42) {
         srand(seed);
 
-        constexpr float residual_gain = 0.2f;
-        constexpr float reference_model_dim = 48.0f;
-        constexpr float token_embedding_std_at_reference_width = 0.08f;
-        constexpr float output_projection_std_at_reference_width = 0.06f;
-        token_emb->variance_normal_init(
-            VarianceScaleMode::FanOut,
-            token_embedding_std_at_reference_width * sqrtf(reference_model_dim));
-        w_out->variance_normal_init(
-            VarianceScaleMode::FanIn,
-            output_projection_std_at_reference_width * sqrtf(reference_model_dim));
-
-        // token_emb->random_init(0.02f);
-        // w_out->random_init(0.02f);
+        constexpr float transformer_weight_stddev = 0.02f;
+        float residual_proj_stddev = transformer_weight_stddev / sqrtf(2.0f * float(num_layers));
+        token_emb->random_init(transformer_weight_stddev);
+        w_out->random_init(transformer_weight_stddev);
 
         for (auto& block : blocks) {
-            block.init_weights(residual_gain);
+            block.init_weights(transformer_weight_stddev, residual_proj_stddev);
         }
     }
 };
@@ -542,7 +533,7 @@ void main_llm() {
     constexpr uint32_t kLayers = 8;
     constexpr uint32_t kTrainSteps = 5000;
     constexpr uint32_t kLogInterval = 200;
-    constexpr float kLearningRate = 8.5e-4f;
+    constexpr float kLearningRate = 1.0e-4f;
     constexpr float kRopeBase = 16.0f;
 
     MeshTokenModel model(kBatchSize, kSeqLen, kVocabSize, kModelDim, kHiddenDim, kLayers, kRopeBase);

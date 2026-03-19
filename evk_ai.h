@@ -343,32 +343,6 @@ struct Tensor {
         return *this;
     }
 
-    Tensor& variance_normal_init(VarianceScaleMode mode, float gain = 1.0f) {
-        uint32_t fan_in = (shape.rank() >= 2) ? shape[-2] : shape.count();
-        uint32_t fan_out = (shape.rank() >= 2) ? shape[-1] : shape.count();
-        float denom = 1.0f;
-        switch (mode) {
-            case VarianceScaleMode::FanIn:
-                denom = float(fan_in);
-                break;
-            case VarianceScaleMode::FanOut:
-                denom = float(fan_out);
-                break;
-            case VarianceScaleMode::FanAverage:
-                denom = 0.5f * float(fan_in + fan_out);
-                break;
-        }
-        return random_init(gain / sqrtf(denom));
-    }
-
-    Tensor& xavier_normal_init(float gain = 1.0f) {
-        return variance_normal_init(VarianceScaleMode::FanAverage, gain);
-    }
-
-    Tensor& he_normal_init(float gain = 1.0f) {
-        return variance_normal_init(VarianceScaleMode::FanIn, gain * sqrtf(2.0f));
-    }
-
     float16_t item() {
         assert(shape.count() == 1);
         cpu_download();
