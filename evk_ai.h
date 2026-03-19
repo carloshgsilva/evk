@@ -233,6 +233,12 @@ struct GradStats {
     }
 };
 
+enum class VarianceScaleMode {
+    FanIn,
+    FanOut,
+    FanAverage,
+};
+
 struct Tensor {
     evk::Buffer buffer;
     evk::Buffer cpu_buffer;
@@ -322,19 +328,45 @@ struct Tensor {
         return *this;
     }
 
-    // Initialize with scaled Gaussian random values (for weight initialization)
-    // Uses Box-Muller transform for Gaussian distribution
-    Tensor& random_init(float scale = 0.1f) {
+    // Initialize with scaled Gaussian random values.
+    // stddev controls the standard deviation of the sampled weights.
+    Tensor& random_init(float stddev = 0.1f) {
         float16_t* data = cpu();
         for (uint32_t i = 0; i < shape.count(); ++i) {
             // Box-Muller transform for Gaussian
             float u1 = float(rand() + 1) / float(RAND_MAX + 1);
             float u2 = float(rand()) / float(RAND_MAX);
             float z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265f * u2);
-            data[i] = float16_t(z * scale);
+            data[i] = float16_t(z * stddev);
         }
         cpu_upload();
         return *this;
+    }
+
+    Tensor& variance_normal_init(VarianceScaleMode mode, float gain = 1.0f) {
+        uint32_t fan_in = (shape.rank() >= 2) ? shape[-2] : shape.count();
+        uint32_t fan_out = (shape.rank() >= 2) ? shape[-1] : shape.count();
+        float denom = 1.0f;
+        switch (mode) {
+            case VarianceScaleMode::FanIn:
+                denom = float(fan_in);
+                break;
+            case VarianceScaleMode::FanOut:
+                denom = float(fan_out);
+                break;
+            case VarianceScaleMode::FanAverage:
+                denom = 0.5f * float(fan_in + fan_out);
+                break;
+        }
+        return random_init(gain / sqrtf(denom));
+    }
+
+    Tensor& xavier_normal_init(float gain = 1.0f) {
+        return variance_normal_init(VarianceScaleMode::FanAverage, gain);
+    }
+
+    Tensor& he_normal_init(float gain = 1.0f) {
+        return variance_normal_init(VarianceScaleMode::FanIn, gain * sqrtf(2.0f));
     }
 
     float16_t item() {

@@ -384,17 +384,13 @@ struct CausalAttentionBlock {
         w2 = &graph.tensor({hidden_dim, model_dim}, true);
     }
 
-    void init_weights(float base_scale) {
-        float attn_scale = base_scale * (1.0f / sqrtf(float(model_dim)));
-        float ffn_scale = base_scale * sqrtf(2.0f / float(model_dim));
-        float out_scale = base_scale * sqrtf(2.0f / float(hidden_dim));
-
-        w_q->random_init(attn_scale);
-        w_k->random_init(attn_scale);
-        w_v->random_init(attn_scale);
-        w_o->random_init(attn_scale);
-        w1->random_init(ffn_scale);
-        w2->random_init(out_scale);
+    void init_weights(float residual_gain) {
+        w_q->xavier_normal_init(residual_gain);
+        w_k->xavier_normal_init(residual_gain);
+        w_v->xavier_normal_init(residual_gain);
+        w_o->xavier_normal_init(residual_gain);
+        w1->he_normal_init(residual_gain);
+        w2->xavier_normal_init(residual_gain);
     }
 
     Tensor& forward(Graph& graph, Tensor& input) {
@@ -480,11 +476,22 @@ struct MeshTokenModel {
     void init_weights(uint32_t seed = 42) {
         srand(seed);
 
-        token_emb->random_init(0.08f);
-        w_out->random_init(0.06f);
+        constexpr float residual_gain = 0.2f;
+        constexpr float reference_model_dim = 48.0f;
+        constexpr float token_embedding_std_at_reference_width = 0.08f;
+        constexpr float output_projection_std_at_reference_width = 0.06f;
+        token_emb->variance_normal_init(
+            VarianceScaleMode::FanOut,
+            token_embedding_std_at_reference_width * sqrtf(reference_model_dim));
+        w_out->variance_normal_init(
+            VarianceScaleMode::FanIn,
+            output_projection_std_at_reference_width * sqrtf(reference_model_dim));
+
+        // token_emb->random_init(0.02f);
+        // w_out->random_init(0.02f);
 
         for (auto& block : blocks) {
-            block.init_weights(0.2f);
+            block.init_weights(residual_gain);
         }
     }
 };
@@ -530,12 +537,12 @@ void main_llm() {
     auto start = std::chrono::high_resolution_clock::now();
 
     constexpr uint32_t kBatchSize = 16;
-    constexpr uint32_t kModelDim = 48;
-    constexpr uint32_t kHiddenDim = 96;
+    constexpr uint32_t kModelDim = 128;
+    constexpr uint32_t kHiddenDim = 256;
     constexpr uint32_t kLayers = 8;
     constexpr uint32_t kTrainSteps = 5000;
     constexpr uint32_t kLogInterval = 200;
-    constexpr float kLearningRate = 1.25e-3f;
+    constexpr float kLearningRate = 8.5e-4f;
     constexpr float kRopeBase = 16.0f;
 
     MeshTokenModel model(kBatchSize, kSeqLen, kVocabSize, kModelDim, kHiddenDim, kLayers, kRopeBase);
