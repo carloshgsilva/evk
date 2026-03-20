@@ -5,17 +5,15 @@
 #include <chrono>
 #include <fstream>
 #include <filesystem>
-#include <numeric>
 #include <cmath>
 #include <algorithm>
 #include <cassert>
-#include <limits>
 
 #include <evk_ai.h>
 
 namespace {
 constexpr uint32_t kCubeTriangleCount = 12;
-constexpr uint32_t kTrianglesPerMesh = 16;
+constexpr uint32_t kTrianglesPerMesh = kCubeTriangleCount;
 constexpr uint32_t kCoordsPerTriangle = 9;
 constexpr uint32_t kMeshFeatureDim = 10; // 9 coords + exist
 
@@ -24,14 +22,17 @@ constexpr uint16_t kBosToken = 1;
 constexpr uint16_t kEosToken = 2;
 constexpr uint16_t kCoordTokenBase = 3;
 constexpr uint32_t kCoordBins = 128;
+constexpr uint32_t kConditionTriangles = 2;
+constexpr uint32_t kConditionCoordTokens = kConditionTriangles * kCoordsPerTriangle; // 18
 
-constexpr uint32_t kCoordTokenCount = kTrianglesPerMesh * kCoordsPerTriangle; // 144
-constexpr uint32_t kSeqActiveLen = 1 + kCoordTokenCount + 1; // BOS + coords + EOS = 146
+constexpr uint32_t kCoordTokenCount = kTrianglesPerMesh * kCoordsPerTriangle; // 108
+constexpr uint32_t kSeqActiveLen = 1 + kCoordTokenCount + 1; // BOS + coords + EOS = 110
 constexpr uint32_t kSeqLen = 160; // tile-aligned (matmul requires multiples of 16)
 constexpr uint32_t kVocabSize = 144; // tile-aligned, uses ids [0..130]
 
-constexpr float kCoordMin = -1.25f;
-constexpr float kCoordMax = 1.25f;
+// Covers the full transformed cube support: +/-0.45 translation plus sqrt(3)/2 rotation extent.
+constexpr float kCoordMin = -1.32f;
+constexpr float kCoordMax = 1.32f;
 constexpr float kExistScale = 1.0f;
 constexpr float kPi = 3.14159265358979323846f;
 
@@ -154,8 +155,6 @@ void generate_batch(const std::vector<std::array<float, 9>>& base,
                     MeshBatch& batch) {
     batch.target.assign(batch_size * kTrianglesPerMesh * kMeshFeatureDim, 0.0f);
 
-    std::vector<uint32_t> order(kCubeTriangleCount);
-
     for (uint32_t b = 0; b < batch_size; ++b) {
         auto tris = base;
         Mat3 rot = random_rotation(rng);
@@ -169,11 +168,8 @@ void generate_batch(const std::vector<std::array<float, 9>>& base,
             apply_transform(tri, rot, 1.0f, translate);
         }
 
-        std::iota(order.begin(), order.end(), 0);
-
         for (uint32_t t = 0; t < kTrianglesPerMesh; ++t) {
-            uint32_t tri_idx = order[t % kCubeTriangleCount];
-            const auto& tri = tris[tri_idx];
+            const auto& tri = tris[t];
             uint32_t base_idx = (b * kTrianglesPerMesh + t) * kMeshFeatureDim;
 
             for (uint32_t i = 0; i < 9; ++i) {
@@ -227,11 +223,16 @@ void build_token_batch(const std::vector<float>& mesh_target,
             in_ptr[1 + i] = quantize_coord_to_token(mesh_target[idx]);
         }
 
-        in_ptr[1 + kCoordTokenCount] = kEosToken;
+        in_ptr[kSeqActiveLen - 1] = kEosToken;
 
         // Teacher-forcing target: predict next token.
-        for (uint32_t p = 0; p <= kCoordTokenCount; ++p) {
+        for (uint32_t p = 0; p < kSeqActiveLen - 1; ++p) {
             tgt_ptr[p] = in_ptr[p + 1];
+        }
+
+        // The first two triangles are provided as conditioning prefix.
+        for (uint32_t p = 0; p < kConditionCoordTokens; ++p) {
+            tgt_ptr[p] = kPadToken;
         }
     }
 }
@@ -253,29 +254,29 @@ void queue_tensor_download(Tensor& t) {
     cmd.copy(t.buffer, t.cpu_buffer, t.shape.count() * sizeof(float16_t));
 }
 
-void read_float_tensor_from_cpu_buffer(Tensor& t, std::vector<float>& data) {
-    float16_t* ptr = t.cpu();
-    data.resize(t.shape.count());
-    for (uint32_t i = 0; i < t.shape.count(); ++i) {
-        data[i] = float(ptr[i]);
-    }
-}
-
-void download_float_tensor(Tensor& t, std::vector<float>& data) {
-    queue_tensor_download(t);
-    evk::ai::SubmitCmd(true);
-    read_float_tensor_from_cpu_buffer(t, data);
-}
-
 float read_scalar_tensor_from_cpu_buffer(Tensor& t) {
     assert(t.shape.count() == 1);
     return float(t.cpu()[0]);
 }
 
-float download_scalar_tensor(Tensor& t) {
-    queue_tensor_download(t);
-    evk::ai::SubmitCmd(true);
-    return read_scalar_tensor_from_cpu_buffer(t);
+void seed_condition_prefix_tokens(const std::vector<float>& condition_meshes,
+                                  uint32_t batch_size,
+                                  std::vector<uint16_t>& generated_inputs) {
+    assert(condition_meshes.size() >= size_t(batch_size) * kTrianglesPerMesh * kMeshFeatureDim);
+    generated_inputs.assign(batch_size * kSeqLen, kPadToken);
+
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        uint16_t* in_ptr = generated_inputs.data() + b * kSeqLen;
+        in_ptr[0] = kBosToken;
+        in_ptr[kSeqActiveLen - 1] = kEosToken;
+
+        for (uint32_t i = 0; i < kConditionCoordTokens; ++i) {
+            uint32_t tri = i / kCoordsPerTriangle;
+            uint32_t coord = i % kCoordsPerTriangle;
+            uint32_t idx = (b * kTrianglesPerMesh + tri) * kMeshFeatureDim + coord;
+            in_ptr[1 + i] = quantize_coord_to_token(condition_meshes[idx]);
+        }
+    }
 }
 
 void decode_generated_mesh(const std::vector<uint16_t>& generated_inputs,
@@ -295,6 +296,43 @@ void decode_generated_mesh(const std::vector<uint16_t>& generated_inputs,
         mesh_features_out[tri * kMeshFeatureDim + 9] = kExistScale;
     }
 }
+
+void copy_condition_prefix(const std::vector<float>& condition_mesh,
+                           std::vector<float>& mesh_features_io) {
+    assert(condition_mesh.size() >= kTrianglesPerMesh * kMeshFeatureDim);
+    assert(mesh_features_io.size() >= kTrianglesPerMesh * kMeshFeatureDim);
+
+    for (uint32_t tri = 0; tri < kConditionTriangles; ++tri) {
+        uint32_t base_idx = tri * kMeshFeatureDim;
+        for (uint32_t i = 0; i < kMeshFeatureDim; ++i) {
+            mesh_features_io[base_idx + i] = condition_mesh[base_idx + i];
+        }
+    }
+}
+
+float completion_mse(const std::vector<float>& pred_mesh,
+                     const std::vector<float>& target_mesh) {
+    assert(pred_mesh.size() >= kTrianglesPerMesh * kMeshFeatureDim);
+    assert(target_mesh.size() >= kTrianglesPerMesh * kMeshFeatureDim);
+
+    double sum_sq = 0.0;
+    uint32_t count = 0;
+
+    for (uint32_t tri = kConditionTriangles; tri < kTrianglesPerMesh; ++tri) {
+        uint32_t base_idx = tri * kMeshFeatureDim;
+        for (uint32_t coord = 0; coord < kCoordsPerTriangle; ++coord) {
+            double diff = double(pred_mesh[base_idx + coord] - target_mesh[base_idx + coord]);
+            sum_sq += diff * diff;
+            count++;
+        }
+    }
+
+    if (count == 0) {
+        return 0.0f;
+    }
+    return float(sum_sq / double(count));
+}
+
 void export_obj(const std::filesystem::path& path,
                 const std::vector<float>& features,
                 uint32_t tri_count,
@@ -407,7 +445,7 @@ struct CausalAttentionBlock {
 
         Tensor& norm_ffn = graph.rms_norm(res1);
         Tensor& hidden = graph.matmul(norm_ffn, *w1);
-        Tensor& hidden_relu = graph.relu(hidden);
+        Tensor& hidden_relu = graph.gelu(hidden);
         Tensor& hidden_proj = graph.matmul(hidden_relu, *w2);
         Tensor& out = graph.residual(res1, hidden_proj);
         return out;
@@ -429,7 +467,7 @@ struct MeshTokenModel {
     Tensor* target_tokens = nullptr; // [B, S], uint16 in fp16 payload
     Tensor* token_emb = nullptr;     // [V, D]
     Tensor* w_out = nullptr;         // [D, V]
-    Tensor* sampled_token_ids = nullptr;
+    Tensor* sampled_token_ids = nullptr; // [B], raw uint16 token ids in fp16 payload storage
 
     Tensor* logits = nullptr;        // [B, S, V]
     Tensor* loss = nullptr;          // scalar
@@ -487,23 +525,25 @@ struct MeshTokenModel {
     }
 };
 
-void sample_greedy_autoregressive(MeshTokenModel& model,
-                                  uint32_t batch_size,
-                                  std::vector<uint16_t>& generated_inputs,
-                                  std::vector<uint16_t>& scratch_targets) {
-    generated_inputs.assign(batch_size * kSeqLen, kPadToken);
+void sample_autoregressive(MeshTokenModel& model,
+                           const std::vector<float>& condition_meshes,
+                           std::vector<uint16_t>& generated_inputs,
+                           std::vector<uint16_t>& scratch_targets) {
+    const uint32_t batch_size = model.batch_size;
     scratch_targets.assign(batch_size * kSeqLen, kPadToken);
 
-    for (uint32_t b = 0; b < batch_size; ++b) {
-        generated_inputs[b * kSeqLen + 0] = kBosToken;
-    }
+    seed_condition_prefix_tokens(condition_meshes, batch_size, generated_inputs);
 
     upload_token_tensor(*model.target_tokens, scratch_targets, false);
 
-    for (uint32_t pos = 0; pos < kCoordTokenCount; ++pos) {
+    for (uint32_t pos = kConditionCoordTokens; pos < kCoordTokenCount; ++pos) {
         upload_token_tensor(*model.input_tokens, generated_inputs, false);
         model.graph.eval(false, false, false);
-        evk::ai::greedy_sample(*model.logits, *model.sampled_token_ids, pos, kCoordTokenBase, uint16_t(kCoordBins));
+        evk::ai::greedy_sample(*model.logits,
+                               *model.sampled_token_ids,
+                               pos,
+                               kCoordTokenBase,
+                               uint16_t(kCoordBins));
         queue_tensor_download(*model.sampled_token_ids);
         evk::ai::SubmitCmd(true);
 
@@ -515,26 +555,25 @@ void sample_greedy_autoregressive(MeshTokenModel& model,
     }
 
     for (uint32_t b = 0; b < batch_size; ++b) {
-        generated_inputs[b * kSeqLen + (kCoordTokenCount + 1)] = kEosToken;
+        generated_inputs[b * kSeqLen + (kSeqActiveLen - 1)] = kEosToken;
     }
 }
 
 } // namespace
 
 void main_llm() {
-    evk::ai::initialize();
-    printf("=== main_llm: causal autoregressive mesh tokens (RoPE, CE, BOS/EOS, 128 bins) ===\n");
+    printf("=== main_llm: causal autoregressive mesh completion (2-triangle prefix, CE, BOS/EOS, 128 bins) ===\n");
 
     auto start = std::chrono::high_resolution_clock::now();
 
     constexpr uint32_t kBatchSize = 16;
-    constexpr uint32_t kModelDim = 128;
-    constexpr uint32_t kHiddenDim = 256;
+    constexpr uint32_t kModelDim = 256;
+    constexpr uint32_t kHiddenDim = 512;
     constexpr uint32_t kLayers = 8;
-    constexpr uint32_t kTrainSteps = 5000;
-    constexpr uint32_t kLogInterval = 200;
+    constexpr uint32_t kTrainSteps = 10000;
+    constexpr uint32_t kLogInterval = 500;
     constexpr float kLearningRate = 1.0e-4f;
-    constexpr float kRopeBase = 16.0f;
+    constexpr float kRopeBase = 10000.0f;
 
     MeshTokenModel model(kBatchSize, kSeqLen, kVocabSize, kModelDim, kHiddenDim, kLayers, kRopeBase);
     model.init_weights(42);
@@ -557,10 +596,9 @@ void main_llm() {
         generate_batch(base, kBatchSize, rng_val, val[s].batch);
         build_token_batch(val[s].batch.target, kBatchSize, val[s].input_tokens, val[s].target_tokens);
 
-        val[s].first_target_mesh.assign(kTrianglesPerMesh * kMeshFeatureDim, 0.0f);
-        for (uint32_t i = 0; i < kTrianglesPerMesh * kMeshFeatureDim; ++i) {
-            val[s].first_target_mesh[i] = val[s].batch.target[i];
-        }
+        val[s].first_target_mesh.assign(
+            val[s].batch.target.begin(),
+            val[s].batch.target.begin() + (kTrianglesPerMesh * kMeshFeatureDim));
     }
 
     std::filesystem::path evo_path("output/mesh_val_evolution.obj");
@@ -587,6 +625,13 @@ void main_llm() {
     std::vector<uint16_t> train_target_tokens;
     std::vector<uint16_t> sampled_tokens;
     std::vector<uint16_t> scratch_targets;
+    std::vector<float> sample_condition_meshes(kBatchSize * kTrianglesPerMesh * kMeshFeatureDim, 0.0f);
+
+    for (uint32_t b = 0; b < kBatchSize; ++b) {
+        const auto& src = val[b % kValSeeds].first_target_mesh;
+        float* dst = sample_condition_meshes.data() + b * kTrianglesPerMesh * kMeshFeatureDim;
+        std::copy(src.begin(), src.end(), dst);
+    }
 
     for (uint32_t step = 1; step <= kTrainSteps; ++step) {
         bool should_log = (step == 1 || step % kLogInterval == 0 || step == kTrainSteps);
@@ -619,13 +664,16 @@ void main_llm() {
                 val_loss += read_scalar_tensor_from_cpu_buffer(*model.loss);
             }
 
-            sample_greedy_autoregressive(model, kBatchSize, sampled_tokens, scratch_targets);
-            std::vector<float> pred_first_mesh;
-            decode_generated_mesh(sampled_tokens, 0, pred_first_mesh);
+            sample_autoregressive(model, sample_condition_meshes, sampled_tokens, scratch_targets);
+            std::vector<float> pred_mesh;
+            float val_completion_loss = 0.0f;
             for (uint32_t s = 0; s < kValSeeds; ++s) {
+                decode_generated_mesh(sampled_tokens, s, pred_mesh);
+                copy_condition_prefix(val[s].first_target_mesh, pred_mesh);
+                val_completion_loss += completion_mse(pred_mesh, val[s].first_target_mesh);
                 float y_offset = -float(s) * row_spacing;
                 append_obj(evo_path,
-                           pred_first_mesh,
+                           pred_mesh,
                            kTrianglesPerMesh,
                            evo_vertex_index,
                            mesh_spacing * float(evo_snapshot_count + 1),
@@ -633,26 +681,29 @@ void main_llm() {
                            -1.0e9f);
             }
             val_loss /= float(kValSeeds);
+            val_completion_loss /= float(kValSeeds);
 
-            printf("step %4u | train_ce %.6f | val_ce %.6f\n",
-                   step, train_loss, val_loss);
+            printf("step %4u | train_ce %.6f | val_ce %.6f | val_completion_mse %.6f\n",
+                   step, train_loss, val_loss, val_completion_loss);
             fflush(stdout);
             evo_snapshot_count++;
         }
     }
 
     if (sampled_tokens.empty()) {
-        sample_greedy_autoregressive(model, kBatchSize, sampled_tokens, scratch_targets);
+        sample_autoregressive(model, sample_condition_meshes, sampled_tokens, scratch_targets);
     }
 
     std::vector<float> pred_first_mesh;
     decode_generated_mesh(sampled_tokens, 0, pred_first_mesh);
+    copy_condition_prefix(val[0].first_target_mesh, pred_first_mesh);
 
     export_obj("output/mesh_target.obj", val[0].first_target_mesh, kTrianglesPerMesh);
     export_obj("output/mesh_pred.obj", pred_first_mesh, kTrianglesPerMesh);
 
     for (uint32_t s = 0; s < 3; ++s) {
         decode_generated_mesh(sampled_tokens, s, pred_first_mesh);
+        copy_condition_prefix(val[s].first_target_mesh, pred_first_mesh);
         export_obj(std::filesystem::path("output") / ("mesh_pred_seed" + std::to_string(s) + ".obj"),
                    pred_first_mesh,
                    kTrianglesPerMesh);
@@ -661,6 +712,4 @@ void main_llm() {
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
     printf("main_llm() took %.4f seconds\n", duration.count());
-
-    evk::ai::shutdown();
 }
