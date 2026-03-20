@@ -49,6 +49,8 @@ namespace evk::ai {
         evk::Pipeline causal_mask;
         evk::Pipeline relu;
         evk::Pipeline relu_bwd;
+        evk::Pipeline gelu;
+        evk::Pipeline gelu_bwd;
         evk::Pipeline scale;
         evk::Pipeline zero;
         evk::Pipeline sum_batch;
@@ -203,6 +205,8 @@ namespace evk::ai {
         pipelines->causal_mask = create_named_compute_pipeline("causal_mask");
         pipelines->relu = create_named_compute_pipeline("relu");
         pipelines->relu_bwd = create_named_compute_pipeline("relu_bwd");
+        pipelines->gelu = create_named_compute_pipeline("gelu");
+        pipelines->gelu_bwd = create_named_compute_pipeline("gelu_bwd");
         pipelines->scale = create_named_compute_pipeline("scale");
         pipelines->zero = create_named_compute_pipeline("zero");
         pipelines->sum_batch = create_named_compute_pipeline("sum_batch");
@@ -645,6 +649,49 @@ namespace evk::ai {
 
         auto& cmd = evk::ai::GetCmd();
         cmd.bind(pipelines->relu_bwd);
+        cmd.push(evk::Constant{
+            grad_out.buffer.GetReference(),
+            in.buffer.GetReference(),
+            grad_in.buffer.GetReference(),
+            totalElements,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        cmd.dispatch(groupsX, 1, 1);
+        cmd.barrier();
+    }
+
+    void gelu(Tensor& in, Tensor& out) {
+        assert(in.shape.rank() == out.shape.rank());
+        for (uint32_t i = 0; i < in.shape.rank(); ++i) {
+            assert(in.shape[i] == out.shape[i]);
+        }
+
+        uint32_t totalElements = in.shape.count();
+
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(pipelines->gelu);
+        cmd.push(evk::Constant{
+            in.buffer.GetReference(),
+            out.buffer.GetReference(),
+            totalElements,
+        });
+
+        const uint32_t WORKGROUP_SIZE = 256u;
+        uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
+        cmd.dispatch(groupsX, 1, 1);
+        cmd.barrier();
+    }
+
+    void gelu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in) {
+        assert(grad_out.shape.rank() == in.shape.rank());
+        assert(grad_in.shape.rank() == in.shape.rank());
+
+        uint32_t totalElements = in.shape.count();
+
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(pipelines->gelu_bwd);
         cmd.push(evk::Constant{
             grad_out.buffer.GetReference(),
             in.buffer.GetReference(),

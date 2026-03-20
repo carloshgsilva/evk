@@ -533,6 +533,13 @@ namespace evk::ai {
     // ReLU backward: grad_in = grad_out * (in > 0 ? 1 : 0)
     void relu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in);
 
+    // GELU activation (tanh approximation)
+    // out = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    void gelu(Tensor& in, Tensor& out);
+
+    // GELU backward: grad_in += grad_out * dgelu/dx
+    void gelu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in);
+
     // Cross entropy loss for classification
     // logits: (B*N, V) unnormalized log probabilities
     // targets: (B*N) target class indices stored as uint16
@@ -744,6 +751,21 @@ struct Graph {
 
         out.backward_fn = [&a, &out]() {
             evk::ai::relu_backward(out.grad(), a, a.grad());
+        };
+
+        return out;
+    }
+
+    Tensor& gelu(Tensor& a) {
+        nodes.push_back(std::make_unique<Tensor>(a.shape));
+        Tensor& out = *nodes.back();
+
+        out.forward_fn = [&a, &out]() {
+            evk::ai::gelu(a, out);
+        };
+
+        out.backward_fn = [&a, &out]() {
+            evk::ai::gelu_backward(out.grad(), a, a.grad());
         };
 
         return out;
@@ -1004,9 +1026,7 @@ struct Graph {
         // Zero gradients BEFORE running forward when doing a backward pass.
         if (backward) {
             for (auto& node : nodes) {
-                if (node->grad_tensor) {
-                    evk::ai::zero(node->grad());
-                }
+                evk::ai::zero(node->grad());
             }
         }
 

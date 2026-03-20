@@ -1,0 +1,30 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 inputBuffer;
+    BufferFp16 outputBuffer;
+    uint totalElements;
+)
+
+float gelu_approx(float x) {
+    const float kAlpha = 0.7978845608028654;
+    const float kBeta = 0.044715;
+    float x3 = x * x * x;
+    float u = kAlpha * (x + kBeta * x3);
+    return 0.5 * x * (1.0 + tanh(u));
+}
+
+COMPUTE(256, 1, 1)
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= totalElements) return;
+
+    float x = float(inputBuffer.x[gid]);
+    outputBuffer.x[gid] = float16_t(gelu_approx(x));
+}
