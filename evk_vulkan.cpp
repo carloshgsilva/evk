@@ -58,6 +58,11 @@ namespace evk {
         return -1;
     }
     const VkFilter FILTER_VK[] = {VK_FILTER_NEAREST, VK_FILTER_LINEAR};
+    const VkSamplerAddressMode ADDRESS_MODE_VK[] = {
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+    };
     const VkPipelineStageFlagBits STAGE_VK[] = {
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,              // TopOfPipe,
         VK_PIPELINE_STAGE_HOST_BIT,                     // Host,
@@ -261,9 +266,9 @@ namespace evk {
             VkSamplerCreateInfo samplerci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
             samplerci.minFilter = FILTER_VK[(int)state->desc.filter];
             samplerci.magFilter = FILTER_VK[(int)state->desc.filter];
-            samplerci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            samplerci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            samplerci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerci.addressModeU = ADDRESS_MODE_VK[(int)state->desc.addressModeU];
+            samplerci.addressModeV = ADDRESS_MODE_VK[(int)state->desc.addressModeV];
+            samplerci.addressModeW = ADDRESS_MODE_VK[(int)state->desc.addressModeW];
             samplerci.anisotropyEnable = false;
             samplerci.maxAnisotropy = 0.0f;
             samplerci.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;

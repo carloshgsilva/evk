@@ -64,6 +64,7 @@ namespace evk {
         }
     };
     enum class Filter { Nearest, Linear };
+    enum class AddressMode { ClampToEdge, Repeat, MirroredRepeat };
     enum class MemoryType {
         CPU,         // TODO: completely remove the CPU memory type
         GPU,         // lives in the GPU's memory
@@ -219,6 +220,9 @@ namespace evk {
         Extent extent = {};
         Format format = Format::Undefined;
         Filter filter = Filter::Linear;
+        AddressMode addressModeU = AddressMode::ClampToEdge;
+        AddressMode addressModeV = AddressMode::ClampToEdge;
+        AddressMode addressModeW = AddressMode::ClampToEdge;
         ImageUsage usage = ImageUsage::Sampled;
         uint32_t mipCount = 1;
         uint32_t layerCount = 1;
