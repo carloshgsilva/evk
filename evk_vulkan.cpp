@@ -1721,7 +1721,7 @@ namespace evk {
             attach.resolveMode = VK_RESOLVE_MODE_NONE_KHR;
             attach.resolveImageView = VK_NULL_HANDLE;
             attach.resolveImageLayout = {};
-            attach.loadOp = clearValues ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attach.loadOp = clearValues ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
             attach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             if (clearValues) {
                 if (isDepthStencil || isStencil) {
