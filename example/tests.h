@@ -3,6 +3,30 @@
 
 #define TEST(expr) if((expr)) { printf(" TEST(" #expr ") [PASS]\n"); } else { printf(" TEST(" #expr ") [FAIL] [%s:%d]\n", __FILE__, __LINE__); exit(1); }
 
+static bool approx_eq(float a, float b, float tol = 1e-2f) {
+    return std::abs(a - b) <= tol;
+}
+
+static float gelu_approx_cpu(float x) {
+    const float kAlpha = 0.7978845608028654f;
+    const float kBeta = 0.044715f;
+    float x3 = x * x * x;
+    float u = kAlpha * (x + kBeta * x3);
+    return 0.5f * x * (1.0f + std::tanh(u));
+}
+
+static float gelu_grad_approx_cpu(float x) {
+    const float kAlpha = 0.7978845608028654f;
+    const float kBeta = 0.044715f;
+    float x2 = x * x;
+    float x3 = x2 * x;
+    float u = kAlpha * (x + kBeta * x3);
+    float t = std::tanh(u);
+    float sech2 = 1.0f - t * t;
+    float du_dx = kAlpha * (1.0f + 3.0f * kBeta * x2);
+    return 0.5f * (1.0f + t) + 0.5f * x * sech2 * du_dx;
+}
+
 void test_add() {
     printf("test_add()\n");
     Tensor a({4});
@@ -835,4 +859,481 @@ void test_adam_batched_matmul() {
     TEST(final_loss < initial_loss * 0.01f);
     // Test: final loss should be very low
     TEST(final_loss < 0.001f);
+}
+
+void test_sgd() {
+    printf("test_sgd()\n");
+
+    Tensor param({4});
+    Tensor grad({4});
+
+    float16_t* pp = param.cpu();
+    float16_t* gp = grad.cpu();
+    pp[0] = float16_t(1.0f);
+    pp[1] = float16_t(-2.0f);
+    pp[2] = float16_t(0.5f);
+    pp[3] = float16_t(4.0f);
+    gp[0] = float16_t(0.5f);
+    gp[1] = float16_t(-1.0f);
+    gp[2] = float16_t(2.0f);
+    gp[3] = float16_t(0.0f);
+    param.cpu_upload();
+    grad.cpu_upload();
+
+    evk::ai::sgd(param, grad, 0.1f);
+    param.cpu_download();
+
+    TEST(approx_eq(float(param.cpu()[0]), 0.95f, 2e-2f));
+    TEST(approx_eq(float(param.cpu()[1]), -1.9f, 2e-2f));
+    TEST(approx_eq(float(param.cpu()[2]), 0.3f, 2e-2f));
+    TEST(approx_eq(float(param.cpu()[3]), 4.0f, 2e-2f));
+}
+
+void test_relu() {
+    printf("test_relu()\n");
+
+    Tensor input({4});
+    Tensor output({4});
+    Tensor grad_out({4});
+    Tensor grad_in({4});
+
+    float16_t* ip = input.cpu();
+    ip[0] = float16_t(-2.0f);
+    ip[1] = float16_t(0.0f);
+    ip[2] = float16_t(1.5f);
+    ip[3] = float16_t(3.0f);
+    input.cpu_upload();
+    grad_out.fill(float16_t(1.0f));
+    grad_in.fill(float16_t(0.0f));
+
+    evk::ai::relu(input, output);
+    output.cpu_download();
+    TEST(approx_eq(float(output.cpu()[0]), 0.0f));
+    TEST(approx_eq(float(output.cpu()[1]), 0.0f));
+    TEST(approx_eq(float(output.cpu()[2]), 1.5f));
+    TEST(approx_eq(float(output.cpu()[3]), 3.0f));
+
+    evk::ai::relu_backward(grad_out, input, grad_in);
+    grad_in.cpu_download();
+    TEST(approx_eq(float(grad_in.cpu()[0]), 0.0f));
+    TEST(approx_eq(float(grad_in.cpu()[1]), 0.0f));
+    TEST(approx_eq(float(grad_in.cpu()[2]), 1.0f));
+    TEST(approx_eq(float(grad_in.cpu()[3]), 1.0f));
+}
+
+void test_gelu() {
+    printf("test_gelu()\n");
+
+    Tensor input({3});
+    Tensor output({3});
+    Tensor grad_out({3});
+    Tensor grad_in({3});
+
+    float values[3] = {-1.0f, 0.0f, 1.0f};
+    float16_t* ip = input.cpu();
+    for (uint32_t i = 0; i < 3; ++i) {
+        ip[i] = float16_t(values[i]);
+    }
+    input.cpu_upload();
+    grad_out.fill(float16_t(1.0f));
+    grad_in.fill(float16_t(0.0f));
+
+    evk::ai::gelu(input, output);
+    output.cpu_download();
+    for (uint32_t i = 0; i < 3; ++i) {
+        TEST(approx_eq(float(output.cpu()[i]), gelu_approx_cpu(values[i]), 2e-2f));
+    }
+
+    evk::ai::gelu_backward(grad_out, input, grad_in);
+    grad_in.cpu_download();
+    for (uint32_t i = 0; i < 3; ++i) {
+        TEST(approx_eq(float(grad_in.cpu()[i]), gelu_grad_approx_cpu(values[i]), 3e-2f));
+    }
+}
+
+void test_scale_zero() {
+    printf("test_scale_zero()\n");
+
+    Tensor tensor({4});
+    float16_t* tp = tensor.cpu();
+    tp[0] = float16_t(2.0f);
+    tp[1] = float16_t(-4.0f);
+    tp[2] = float16_t(1.0f);
+    tp[3] = float16_t(0.5f);
+    tensor.cpu_upload();
+
+    evk::ai::scale(tensor, 0.5f);
+    tensor.cpu_download();
+    TEST(approx_eq(float(tensor.cpu()[0]), 1.0f));
+    TEST(approx_eq(float(tensor.cpu()[1]), -2.0f));
+    TEST(approx_eq(float(tensor.cpu()[2]), 0.5f));
+    TEST(approx_eq(float(tensor.cpu()[3]), 0.25f, 2e-2f));
+
+    evk::ai::zero(tensor);
+    tensor.cpu_download();
+    for (uint32_t i = 0; i < 4; ++i) {
+        TEST(approx_eq(float(tensor.cpu()[i]), 0.0f));
+    }
+}
+
+void test_embed_and_backward() {
+    printf("test_embed_and_backward()\n");
+
+    const uint32_t vocab_size = 4u;
+    const uint32_t embed_dim = 3u;
+
+    Tensor embeddings({vocab_size, embed_dim});
+    Tensor indices({2});
+    Tensor output({2, embed_dim});
+    Tensor grad_out({2, embed_dim});
+    Tensor grad_embeddings({vocab_size, embed_dim});
+
+    float16_t* ep = embeddings.cpu();
+    for (uint32_t i = 0; i < vocab_size * embed_dim; ++i) {
+        ep[i] = float16_t(float(i + 1));
+    }
+    embeddings.cpu_upload();
+
+    float16_t* ip = indices.cpu();
+    ip[0].value = 1u;
+    ip[1].value = 3u;
+    indices.cpu_upload();
+
+    evk::ai::embed(embeddings, indices, output);
+    output.cpu_download();
+    for (uint32_t d = 0; d < embed_dim; ++d) {
+        TEST(approx_eq(float(output.cpu()[d]), float(ep[embed_dim + d])));
+        TEST(approx_eq(float(output.cpu()[embed_dim + d]), float(ep[3u * embed_dim + d])));
+    }
+
+    float16_t* gop = grad_out.cpu();
+    for (uint32_t i = 0; i < 2u * embed_dim; ++i) {
+        gop[i] = float16_t(float(i + 1));
+    }
+    grad_out.cpu_upload();
+    grad_embeddings.fill(float16_t(0.0f));
+
+    evk::ai::embed_backward(grad_out, indices, grad_embeddings);
+    grad_embeddings.cpu_download();
+
+    for (uint32_t token = 0; token < vocab_size; ++token) {
+        for (uint32_t d = 0; d < embed_dim; ++d) {
+            float expected = 0.0f;
+            if (token == 1u) expected = float(d + 1u);
+            if (token == 3u) expected = float(embed_dim + d + 1u);
+            TEST(approx_eq(float(grad_embeddings.cpu()[token * embed_dim + d]), expected));
+        }
+    }
+}
+
+void test_position_add_and_backward() {
+    printf("test_position_add_and_backward()\n");
+
+    const uint32_t B = 2u;
+    const uint32_t N = 2u;
+    const uint32_t D = 3u;
+
+    Tensor input({B, N, D});
+    Tensor pos_emb({N, D});
+    Tensor output({B, N, D});
+    Tensor grad_out({B, N, D});
+    Tensor grad_input({B, N, D});
+    Tensor grad_pos({N, D});
+
+    input.fill(float16_t(0.0f));
+    float16_t* pp = pos_emb.cpu();
+    for (uint32_t i = 0; i < N * D; ++i) {
+        pp[i] = float16_t(float(i + 1));
+    }
+    pos_emb.cpu_upload();
+
+    evk::ai::position_add(input, pos_emb, output, B, N, D);
+    output.cpu_download();
+    for (uint32_t b = 0; b < B; ++b) {
+        for (uint32_t i = 0; i < N * D; ++i) {
+            TEST(approx_eq(float(output.cpu()[b * N * D + i]), float(pp[i])));
+        }
+    }
+
+    grad_out.fill(float16_t(1.0f));
+    grad_input.fill(float16_t(0.0f));
+    grad_pos.fill(float16_t(0.0f));
+    evk::ai::position_add_backward(grad_out, grad_input, grad_pos, B, N, D);
+
+    grad_input.cpu_download();
+    grad_pos.cpu_download();
+    for (uint32_t i = 0; i < B * N * D; ++i) {
+        TEST(approx_eq(float(grad_input.cpu()[i]), 1.0f));
+    }
+    for (uint32_t i = 0; i < N * D; ++i) {
+        TEST(approx_eq(float(grad_pos.cpu()[i]), float(B)));
+    }
+}
+
+void test_rope_and_backward() {
+    printf("test_rope_and_backward()\n");
+
+    const uint32_t B = 1u;
+    const uint32_t N = 2u;
+    const uint32_t D = 4u;
+    const float base = 10000.0f;
+
+    Tensor input({B, N, D});
+    Tensor output({B, N, D});
+    Tensor grad_out({B, N, D});
+    Tensor grad_input({B, N, D});
+
+    float host_input[B * N * D] = {
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f,
+    };
+    float16_t* ip = input.cpu();
+    for (uint32_t i = 0; i < B * N * D; ++i) {
+        ip[i] = float16_t(host_input[i]);
+    }
+    input.cpu_upload();
+
+    evk::ai::rope(input, output, B, N, D, base);
+    output.cpu_download();
+
+    for (uint32_t t = 0; t < N; ++t) {
+        for (uint32_t pair = 0; pair < D / 2u; ++pair) {
+            uint32_t base_idx = t * D + pair * 2u;
+            float x0 = host_input[base_idx + 0u];
+            float x1 = host_input[base_idx + 1u];
+            float inv_freq = std::pow(base, -2.0f * float(pair) / float(D));
+            float angle = float(t) * inv_freq;
+            float c = std::cos(angle);
+            float s = std::sin(angle);
+            TEST(approx_eq(float(output.cpu()[base_idx + 0u]), x0 * c - x1 * s, 3e-2f));
+            TEST(approx_eq(float(output.cpu()[base_idx + 1u]), x0 * s + x1 * c, 3e-2f));
+        }
+    }
+
+    float host_grad[B * N * D] = {
+        1.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 1.0f,
+    };
+    float16_t* gop = grad_out.cpu();
+    for (uint32_t i = 0; i < B * N * D; ++i) {
+        gop[i] = float16_t(host_grad[i]);
+    }
+    grad_out.cpu_upload();
+    grad_input.fill(float16_t(0.0f));
+
+    evk::ai::rope_backward(grad_out, grad_input, B, N, D, base);
+    grad_input.cpu_download();
+
+    for (uint32_t t = 0; t < N; ++t) {
+        for (uint32_t pair = 0; pair < D / 2u; ++pair) {
+            uint32_t base_idx = t * D + pair * 2u;
+            float g0 = host_grad[base_idx + 0u];
+            float g1 = host_grad[base_idx + 1u];
+            float inv_freq = std::pow(base, -2.0f * float(pair) / float(D));
+            float angle = float(t) * inv_freq;
+            float c = std::cos(angle);
+            float s = std::sin(angle);
+            TEST(approx_eq(float(grad_input.cpu()[base_idx + 0u]), g0 * c + g1 * s, 3e-2f));
+            TEST(approx_eq(float(grad_input.cpu()[base_idx + 1u]), -g0 * s + g1 * c, 3e-2f));
+        }
+    }
+}
+
+void test_sum_batch() {
+    printf("test_sum_batch()\n");
+
+    Tensor input({2, 3});
+    Tensor output({3});
+
+    float16_t* ip = input.cpu();
+    ip[0] = float16_t(1.0f);
+    ip[1] = float16_t(2.0f);
+    ip[2] = float16_t(3.0f);
+    ip[3] = float16_t(4.0f);
+    ip[4] = float16_t(5.0f);
+    ip[5] = float16_t(6.0f);
+    input.cpu_upload();
+
+    output.fill(float16_t(1.0f));
+    evk::ai::sum_batch(input, output, 2u, 3u);
+    output.cpu_download();
+
+    TEST(approx_eq(float(output.cpu()[0]), 6.0f));
+    TEST(approx_eq(float(output.cpu()[1]), 8.0f));
+    TEST(approx_eq(float(output.cpu()[2]), 10.0f));
+}
+
+void test_rms_norm_and_backward() {
+    printf("test_rms_norm_and_backward()\n");
+
+    Tensor input({2, 4});
+    Tensor output({2, 4});
+    Tensor grad_out({2, 4});
+    Tensor grad_input({2, 4});
+
+    float host_input[8] = {
+        3.0f, 4.0f, 0.0f, 0.0f,
+        1.0f, 2.0f, 3.0f, 4.0f,
+    };
+    float16_t* ip = input.cpu();
+    for (uint32_t i = 0; i < 8; ++i) {
+        ip[i] = float16_t(host_input[i]);
+    }
+    input.cpu_upload();
+
+    const float eps = 1e-4f;
+    evk::ai::rms_norm(input, output, eps);
+    output.cpu_download();
+
+    for (uint32_t row = 0; row < 2; ++row) {
+        float sum_sq = 0.0f;
+        for (uint32_t d = 0; d < 4; ++d) {
+            float v = host_input[row * 4 + d];
+            sum_sq += v * v;
+        }
+        float inv_rms = 1.0f / std::sqrt(sum_sq / 4.0f + eps);
+        for (uint32_t d = 0; d < 4; ++d) {
+            float expected = host_input[row * 4 + d] * inv_rms;
+            TEST(approx_eq(float(output.cpu()[row * 4 + d]), expected, 3e-2f));
+        }
+    }
+
+    grad_out.fill(float16_t(1.0f));
+    grad_input.fill(float16_t(0.0f));
+    evk::ai::rms_norm_backward(input, grad_out, grad_input, eps);
+    grad_input.cpu_download();
+
+    for (uint32_t row = 0; row < 2; ++row) {
+        float sum_sq = 0.0f;
+        for (uint32_t d = 0; d < 4; ++d) {
+            float v = host_input[row * 4 + d];
+            sum_sq += v * v;
+        }
+        float rms = std::sqrt(sum_sq / 4.0f + eps);
+        float inv_rms = 1.0f / rms;
+        float dot_gy = 0.0f;
+        for (uint32_t d = 0; d < 4; ++d) {
+            dot_gy += host_input[row * 4 + d] * inv_rms;
+        }
+        float scale = dot_gy / 4.0f;
+        for (uint32_t d = 0; d < 4; ++d) {
+            float x = host_input[row * 4 + d];
+            float expected = inv_rms - x * inv_rms * inv_rms * scale;
+            TEST(approx_eq(float(grad_input.cpu()[row * 4 + d]), expected, 4e-2f));
+        }
+    }
+}
+
+void test_greedy_sample() {
+    printf("test_greedy_sample()\n");
+
+    Tensor logits({2, 2, 5});
+    Tensor out_tokens({2});
+
+    float16_t* lp = logits.cpu();
+    for (uint32_t i = 0; i < logits.shape.count(); ++i) {
+        lp[i] = float16_t(-10.0f);
+    }
+    // Batch 0, position 1 -> token 3 wins in [1, 3]
+    lp[(0u * 2u + 1u) * 5u + 1u] = float16_t(0.5f);
+    lp[(0u * 2u + 1u) * 5u + 2u] = float16_t(2.5f);
+    lp[(0u * 2u + 1u) * 5u + 3u] = float16_t(1.5f);
+    // Batch 1, position 1 -> token 1 wins in [1, 3]
+    lp[(1u * 2u + 1u) * 5u + 1u] = float16_t(3.0f);
+    lp[(1u * 2u + 1u) * 5u + 2u] = float16_t(2.0f);
+    lp[(1u * 2u + 1u) * 5u + 3u] = float16_t(1.0f);
+    logits.cpu_upload();
+
+    evk::ai::greedy_sample(logits, out_tokens, 1u, 1u, 3u);
+    out_tokens.cpu_download();
+
+    TEST(out_tokens.cpu()[0].value == 2u);
+    TEST(out_tokens.cpu()[1].value == 1u);
+}
+
+void test_flash_attention_backward_scratch() {
+    printf("test_flash_attention_backward_scratch()\n");
+
+    const uint32_t B = 1u;
+    const uint32_t N = 16u;
+    const uint32_t Dh = 32u;
+    const uint32_t H = 1u;
+    const uint32_t D = H * Dh;
+
+    Tensor q({B, N, D});
+    Tensor k({B, N, Dh});
+    Tensor v({B, N, Dh});
+    Tensor o({B, N, D});
+    Tensor dO({B, N, D});
+    Tensor dQ({B, N, D});
+    Tensor dK({B, N, Dh});
+    Tensor dV({B, N, Dh});
+
+    q.fill(float16_t(0.0f));
+    k.fill(float16_t(0.0f));
+    v.fill(float16_t(0.0f));
+    o.fill(float16_t(0.0f));
+    dQ.fill(float16_t(0.0f));
+    dK.fill(float16_t(0.0f));
+    dV.fill(float16_t(0.0f));
+
+    float16_t* dop = dO.cpu();
+    for (uint32_t i = 0; i < N; ++i) {
+        for (uint32_t d = 0; d < D; ++d) {
+            dop[i * D + d] = float16_t(float(d + 1u));
+        }
+    }
+    dO.cpu_upload();
+
+    // Intentionally call backward without a prior forward pass.
+    evk::ai::flash_attention_bwd(q, k, v, o, dO, dQ, dK, dV);
+
+    dQ.cpu_download();
+    dK.cpu_download();
+    dV.cpu_download();
+
+    bool ok_dq = true;
+    bool ok_dk = true;
+    bool ok_dv = true;
+    for (uint32_t i = 0; i < N; ++i) {
+        for (uint32_t d = 0; d < D; ++d) {
+            if (!approx_eq(float(dQ.cpu()[i * D + d]), 0.0f, 5e-2f)) {
+                ok_dq = false;
+            }
+        }
+    }
+    for (uint32_t j = 0; j < N; ++j) {
+        for (uint32_t d = 0; d < Dh; ++d) {
+            if (!approx_eq(float(dK.cpu()[j * Dh + d]), 0.0f, 5e-2f)) {
+                ok_dk = false;
+            }
+            if (!approx_eq(float(dV.cpu()[j * Dh + d]), float(d + 1u), 8e-2f)) {
+                ok_dv = false;
+            }
+        }
+    }
+    TEST(ok_dq);
+    TEST(ok_dk);
+    TEST(ok_dv);
+}
+
+void run_ai_kernel_tests() {
+    test_add();
+    test_matmul();
+    test_matmul_broadcast();
+    test_mse_loss();
+    test_cross_entropy_loss();
+    test_sgd();
+    test_adam();
+    test_softmax();
+    test_relu();
+    test_gelu();
+    test_scale_zero();
+    test_embed_and_backward();
+    test_position_add_and_backward();
+    test_rope_and_backward();
+    test_sum_batch();
+    test_rms_norm_and_backward();
+    test_greedy_sample();
+    test_flash_attention_backward_scratch();
 }

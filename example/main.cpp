@@ -46,6 +46,8 @@ int main(int argc, char** argv) {
             .enableSwapchain = false,
         });
         evk::ai::initialize();
+        evk_initialized = true;
+        ai_initialized = true;
     }
 
     // Run benchmarks if requested
@@ -61,6 +63,7 @@ int main(int argc, char** argv) {
     // Run the suite of tests when requested
     if (do_test) {
         evk_tests();
+        run_ai_kernel_tests();
     }
 
     if (ai_initialized) evk::ai::shutdown();

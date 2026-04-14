@@ -58,7 +58,7 @@ namespace evk::ai {
         evk::Pipeline rms_norm_bwd;
         evk::Buffer cross_entropy_accum;
         evk::Buffer flash_scratch;
-        uint32_t flash_scratch_elems = 0;
+        uint64_t flash_scratch_elems = 0;
     };
     static std::unique_ptr<Pipelines> pipelines;
 
@@ -130,6 +130,30 @@ namespace evk::ai {
         }
     };
     static std::unordered_map<uint64_t, evk::Pipeline> flash_configs;
+
+    static void ensure_flash_scratch(uint32_t B, uint32_t H, uint32_t N, uint32_t Dh) {
+        const uint64_t TILE_M = 16u;
+        const uint64_t TILE_J = 16u;
+        uint64_t tilesPerBH = (uint64_t(N) + TILE_M - 1u) / TILE_M;
+
+        // flash_attention_bwd stores both a 16x16 probabilities tile and a 16xDh tile.
+        // Reuse the same buffer for forward so both paths can run independently.
+        uint64_t ptileElems = TILE_M * TILE_J;
+        uint64_t otileElems = TILE_M * uint64_t(Dh);
+        uint64_t perTileElems = ptileElems + otileElems;
+        uint64_t totalElems = uint64_t(B) * uint64_t(H) * tilesPerBH * perTileElems;
+
+        if (!pipelines->flash_scratch || pipelines->flash_scratch_elems < totalElems) {
+            if (pipelines->flash_scratch) {
+                pipelines->flash_scratch = {};
+            }
+            pipelines->flash_scratch = evk::CreateBuffer({
+                .size = totalElems * sizeof(float16_t),
+                .usage = evk::BufferUsage::Storage,
+            });
+            pipelines->flash_scratch_elems = totalElems;
+        }
+    }
 
     static evk::Pipeline get_flash_pipeline(const FlashConfig& config) {
         uint64_t key = config;
@@ -320,23 +344,7 @@ namespace evk::ai {
         uint32_t H = D / Dh;
 
         float scale = 1.0f / std::sqrt(float(Dh));
-        // Allocate/resize scratch buffer for tiled coopmat kernel
-        // Elements per tile: only Ptile (16*16)
-        const uint32_t TILE_M = 16u;
-        const uint32_t TILE_J = 16u;
-        uint32_t tilesPerBH = (N + TILE_M - 1u) / TILE_M;
-        uint32_t perTileElems = TILE_M * TILE_J;
-        uint32_t totalElems = B * H * tilesPerBH * perTileElems;
-        if (!pipelines->flash_scratch || pipelines->flash_scratch_elems < totalElems) {
-            if (pipelines->flash_scratch) {
-                pipelines->flash_scratch = {};
-            }
-            pipelines->flash_scratch = evk::CreateBuffer({
-                .size = uint64_t(totalElems) * sizeof(float16_t),
-                .usage = evk::BufferUsage::Storage,
-            });
-            pipelines->flash_scratch_elems = totalElems;
-        }
+        ensure_flash_scratch(B, H, N, Dh);
 
         auto& cmd = evk::ai::GetCmd();
         cmd.bind(get_flash_pipeline(FlashConfig{B, H, N, D, scale}));
@@ -350,7 +358,7 @@ namespace evk::ai {
 
         // Dispatch over (tileRows, B*H)
         uint32_t groupX = 1u;
-        uint32_t groupY = (N + TILE_M - 1u) / TILE_M;
+        uint32_t groupY = (N + 16u - 1u) / 16u;
         uint32_t groupZ = B * H;
         cmd.dispatch(groupX, groupY, groupZ);
         cmd.barrier();
@@ -383,6 +391,7 @@ namespace evk::ai {
         }
 
         float scale = 1.0f / std::sqrt(float(Dh));
+        ensure_flash_scratch(B, H, N, Dh);
 
         // Zero-out dQ, dK, dV before writing (since shader writes absolute values, this is optional,
         // but we keep it to avoid stale data if shapes shrink across runs)
