@@ -259,6 +259,56 @@ float read_scalar_tensor_from_cpu_buffer(Tensor& t) {
     return float(t.cpu()[0]);
 }
 
+struct ParamSnapshot {
+    std::vector<std::vector<float16_t>> values;
+};
+
+struct ValSeed {
+    MeshBatch batch;
+    std::vector<uint16_t> input_tokens;
+    std::vector<uint16_t> target_tokens;
+    std::vector<float> first_target_mesh;
+};
+
+struct EvalMetrics {
+    float val_ce = 0.0f;
+    float val_completion_mse = 0.0f;
+};
+
+ParamSnapshot capture_params(Graph& graph) {
+    ParamSnapshot snapshot;
+    snapshot.values.resize(graph.params.size());
+
+    for (Tensor* param : graph.params) {
+        param->cpu_download(false);
+    }
+    evk::ai::SubmitCmd(true);
+
+    for (size_t i = 0; i < graph.params.size(); ++i) {
+        Tensor& param = *graph.params[i];
+        float16_t* src = param.cpu();
+        snapshot.values[i].assign(src, src + param.shape.count());
+    }
+
+    return snapshot;
+}
+
+void restore_params(Graph& graph, const ParamSnapshot& snapshot) {
+    assert(snapshot.values.size() == graph.params.size());
+
+    for (size_t i = 0; i < graph.params.size(); ++i) {
+        Tensor& param = *graph.params[i];
+        const auto& src = snapshot.values[i];
+        assert(src.size() == param.shape.count());
+
+        float16_t* dst = param.cpu();
+        std::copy(src.begin(), src.end(), dst);
+        param.cpu_upload(false);
+    }
+
+    evk::ai::SubmitCmd(true);
+}
+
 void seed_condition_prefix_tokens(const std::vector<float>& condition_meshes,
                                   uint32_t batch_size,
                                   std::vector<uint16_t>& generated_inputs) {
@@ -559,6 +609,37 @@ void sample_autoregressive(MeshTokenModel& model,
     }
 }
 
+EvalMetrics evaluate_model(MeshTokenModel& model,
+                           const std::vector<ValSeed>& val,
+                           const std::vector<float>& sample_condition_meshes,
+                           std::vector<uint16_t>& sampled_tokens,
+                           std::vector<uint16_t>& scratch_targets) {
+    EvalMetrics metrics;
+
+    for (const auto& seed : val) {
+        upload_token_tensor(*model.input_tokens, seed.input_tokens, false);
+        upload_token_tensor(*model.target_tokens, seed.target_tokens, false);
+        model.graph.eval(false, false, false);
+        queue_tensor_download(*model.loss);
+        evk::ai::SubmitCmd(true);
+        metrics.val_ce += read_scalar_tensor_from_cpu_buffer(*model.loss);
+    }
+    metrics.val_ce /= float(val.size());
+
+    sample_autoregressive(model, sample_condition_meshes, sampled_tokens, scratch_targets);
+
+    std::vector<float> pred_mesh;
+    metrics.val_completion_mse = 0.0f;
+    for (size_t s = 0; s < val.size(); ++s) {
+        decode_generated_mesh(sampled_tokens, uint32_t(s), pred_mesh);
+        copy_condition_prefix(val[s].first_target_mesh, pred_mesh);
+        metrics.val_completion_mse += completion_mse(pred_mesh, val[s].first_target_mesh);
+    }
+    metrics.val_completion_mse /= float(val.size());
+
+    return metrics;
+}
+
 } // namespace
 
 void main_llm() {
@@ -574,42 +655,33 @@ void main_llm() {
     constexpr uint32_t kLogInterval = 500;
     constexpr float kLearningRate = 1.0e-4f;
     constexpr float kRopeBase = 10000.0f;
+    constexpr uint32_t kValSeeds = 3;
 
     MeshTokenModel model(kBatchSize, kSeqLen, kVocabSize, kModelDim, kHiddenDim, kLayers, kRopeBase);
     model.init_weights(42);
 
     std::mt19937 train_rng(1337);
     auto base = make_cube_triangles();
-
-    struct ValSeed {
-        MeshBatch batch;
-        std::vector<uint16_t> input_tokens;
-        std::vector<uint16_t> target_tokens;
-        std::vector<float> first_target_mesh;
-    };
-
-    constexpr uint32_t kValSeeds = 3;
     std::vector<ValSeed> val(kValSeeds);
 
     for (uint32_t s = 0; s < kValSeeds; ++s) {
         std::mt19937 rng_val(9001 + s);
         generate_batch(base, kBatchSize, rng_val, val[s].batch);
         build_token_batch(val[s].batch.target, kBatchSize, val[s].input_tokens, val[s].target_tokens);
-
         val[s].first_target_mesh.assign(
             val[s].batch.target.begin(),
             val[s].batch.target.begin() + (kTrianglesPerMesh * kMeshFeatureDim));
     }
 
     std::filesystem::path evo_path("output/mesh_val_evolution.obj");
-    if (std::filesystem::exists(evo_path)) {
-        std::filesystem::remove(evo_path);
-    }
     uint32_t evo_vertex_index = 1;
     uint32_t evo_snapshot_count = 0;
     const float mesh_spacing = 2.0f;
     const float row_spacing = mesh_spacing * 2.0f;
 
+    if (std::filesystem::exists(evo_path)) {
+        std::filesystem::remove(evo_path);
+    }
     for (uint32_t s = 0; s < kValSeeds; ++s) {
         float y_offset = -float(s) * row_spacing;
         append_obj(evo_path,
@@ -626,6 +698,11 @@ void main_llm() {
     std::vector<uint16_t> sampled_tokens;
     std::vector<uint16_t> scratch_targets;
     std::vector<float> sample_condition_meshes(kBatchSize * kTrianglesPerMesh * kMeshFeatureDim, 0.0f);
+    ParamSnapshot best_params;
+    bool has_best_params = false;
+    float best_val_completion_loss = INFINITY;
+    uint32_t best_step = 0;
+    float best_val_loss = INFINITY;
 
     for (uint32_t b = 0; b < kBatchSize; ++b) {
         const auto& src = val[b % kValSeeds].first_target_mesh;
@@ -651,43 +728,47 @@ void main_llm() {
 
         evk::ai::SubmitCmd(should_log);
 
-        if (should_log) {
-            float train_loss = read_scalar_tensor_from_cpu_buffer(*model.loss);
-            float val_loss = 0.0f;
-
-            for (uint32_t s = 0; s < kValSeeds; ++s) {
-                upload_token_tensor(*model.input_tokens, val[s].input_tokens, false);
-                upload_token_tensor(*model.target_tokens, val[s].target_tokens, false);
-                model.graph.eval(false, false, false);
-                queue_tensor_download(*model.loss);
-                evk::ai::SubmitCmd(true);
-                val_loss += read_scalar_tensor_from_cpu_buffer(*model.loss);
-            }
-
-            sample_autoregressive(model, sample_condition_meshes, sampled_tokens, scratch_targets);
-            std::vector<float> pred_mesh;
-            float val_completion_loss = 0.0f;
-            for (uint32_t s = 0; s < kValSeeds; ++s) {
-                decode_generated_mesh(sampled_tokens, s, pred_mesh);
-                copy_condition_prefix(val[s].first_target_mesh, pred_mesh);
-                val_completion_loss += completion_mse(pred_mesh, val[s].first_target_mesh);
-                float y_offset = -float(s) * row_spacing;
-                append_obj(evo_path,
-                           pred_mesh,
-                           kTrianglesPerMesh,
-                           evo_vertex_index,
-                           mesh_spacing * float(evo_snapshot_count + 1),
-                           y_offset,
-                           -1.0e9f);
-            }
-            val_loss /= float(kValSeeds);
-            val_completion_loss /= float(kValSeeds);
-
-            printf("step %4u | train_ce %.6f | val_ce %.6f | val_completion_mse %.6f\n",
-                   step, train_loss, val_loss, val_completion_loss);
-            fflush(stdout);
-            evo_snapshot_count++;
+        if (!should_log) {
+            continue;
         }
+
+        float train_loss = read_scalar_tensor_from_cpu_buffer(*model.loss);
+        EvalMetrics metrics = evaluate_model(model, val, sample_condition_meshes, sampled_tokens, scratch_targets);
+
+        if (!has_best_params || metrics.val_completion_mse < best_val_completion_loss) {
+            best_params = capture_params(model.graph);
+            has_best_params = true;
+            best_step = step;
+            best_val_loss = metrics.val_ce;
+            best_val_completion_loss = metrics.val_completion_mse;
+        }
+
+        std::vector<float> pred_mesh;
+        for (uint32_t s = 0; s < kValSeeds; ++s) {
+            decode_generated_mesh(sampled_tokens, s, pred_mesh);
+            copy_condition_prefix(val[s].first_target_mesh, pred_mesh);
+            float y_offset = -float(s) * row_spacing;
+            append_obj(evo_path,
+                       pred_mesh,
+                       kTrianglesPerMesh,
+                       evo_vertex_index,
+                       mesh_spacing * float(evo_snapshot_count + 1),
+                       y_offset,
+                       -1.0e9f);
+        }
+        evo_snapshot_count++;
+
+        printf("step %4u | train_ce %.6f | val_ce %.6f | val_completion_mse %.6f\n",
+               step, train_loss, metrics.val_ce, metrics.val_completion_mse);
+        fflush(stdout);
+    }
+
+    if (has_best_params) {
+        restore_params(model.graph, best_params);
+        sample_autoregressive(model, sample_condition_meshes, sampled_tokens, scratch_targets);
+        printf("restored_best | step %4u | val_ce %.6f | val_completion_mse %.6f\n",
+               best_step, best_val_loss, best_val_completion_loss);
+        fflush(stdout);
     }
 
     if (sampled_tokens.empty()) {
