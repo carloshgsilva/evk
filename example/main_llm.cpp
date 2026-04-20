@@ -13,6 +13,7 @@
 
 namespace {
 constexpr uint32_t kCubeTriangleCount = 12;
+constexpr uint32_t kTetrahedronTriangleCount = 12;
 constexpr uint32_t kTrianglesPerMesh = kCubeTriangleCount;
 constexpr uint32_t kCoordsPerTriangle = 9;
 constexpr uint32_t kMeshFeatureDim = 10; // 9 coords + exist
@@ -52,6 +53,10 @@ Vec3 add(const Vec3& a, const Vec3& b) {
 
 Vec3 scale(const Vec3& v, float s) {
     return {v.x * s, v.y * s, v.z * s};
+}
+
+Vec3 triangle_centroid(const Vec3& a, const Vec3& b, const Vec3& c) {
+    return scale(add(add(a, b), c), 1.0f / 3.0f);
 }
 
 Vec3 mul(const Mat3& r, const Vec3& v) {
@@ -133,6 +138,42 @@ std::vector<std::array<float, 9>> make_cube_triangles() {
     };
 }
 
+std::vector<std::array<float, 9>> make_tetrahedron_triangles() {
+    constexpr float s = 0.5f;
+    Vec3 v0{ s,  s,  s};
+    Vec3 v1{-s, -s,  s};
+    Vec3 v2{-s,  s, -s};
+    Vec3 v3{ s, -s, -s};
+
+    auto tri = [](const Vec3& a, const Vec3& b, const Vec3& c) {
+        return std::array<float, 9>{a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z};
+    };
+
+    auto subdivide_face = [&](const Vec3& a, const Vec3& b, const Vec3& c) {
+        Vec3 center = triangle_centroid(a, b, c);
+        return std::array<std::array<float, 9>, 3>{
+            tri(a, b, center),
+            tri(b, c, center),
+            tri(c, a, center),
+        };
+    };
+
+    std::vector<std::array<float, 9>> tris;
+    tris.reserve(kTetrahedronTriangleCount);
+
+    auto append_face = [&](const std::array<std::array<float, 9>, 3>& face_tris) {
+        tris.insert(tris.end(), face_tris.begin(), face_tris.end());
+    };
+
+    append_face(subdivide_face(v0, v2, v1));
+    append_face(subdivide_face(v0, v1, v3));
+    append_face(subdivide_face(v0, v3, v2));
+    append_face(subdivide_face(v1, v2, v3));
+
+    assert(tris.size() == kTrianglesPerMesh);
+    return tris;
+}
+
 void apply_transform(std::array<float, 9>& tri, const Mat3& r, float s, const Vec3& t) {
     for (int i = 0; i < 3; ++i) {
         Vec3 v{tri[i * 3 + 0], tri[i * 3 + 1], tri[i * 3 + 2]};
@@ -149,14 +190,17 @@ struct MeshBatch {
     std::vector<float> target; // [B, T, 10], 9 coords + exist
 };
 
-void generate_batch(const std::vector<std::array<float, 9>>& base,
+void generate_batch(const std::vector<std::vector<std::array<float, 9>>>& base_shapes,
                     uint32_t batch_size,
                     std::mt19937& rng,
                     MeshBatch& batch) {
+    assert(!base_shapes.empty());
     batch.target.assign(batch_size * kTrianglesPerMesh * kMeshFeatureDim, 0.0f);
+    std::uniform_int_distribution<size_t> shape_dist(0, base_shapes.size() - 1);
 
     for (uint32_t b = 0; b < batch_size; ++b) {
-        auto tris = base;
+        auto tris = base_shapes[shape_dist(rng)];
+        assert(tris.size() == kTrianglesPerMesh);
         Mat3 rot = random_rotation(rng);
         Vec3 translate{
             rand_uniform(rng, -0.45f, 0.45f),
@@ -643,7 +687,7 @@ EvalMetrics evaluate_model(MeshTokenModel& model,
 } // namespace
 
 void main_llm() {
-    printf("=== main_llm: causal autoregressive mesh completion (2-triangle prefix, CE, BOS/EOS, 128 bins) ===\n");
+    printf("=== main_llm: causal autoregressive mesh completion (cube+tetrahedron, 2-triangle prefix, CE, BOS/EOS, 128 bins) ===\n");
 
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -655,18 +699,20 @@ void main_llm() {
     constexpr uint32_t kLogInterval = 500;
     constexpr float kLearningRate = 1.0e-4f;
     constexpr float kRopeBase = 10000.0f;
-    constexpr uint32_t kValSeeds = 3;
+    constexpr uint32_t kValSeeds = 5;
 
     MeshTokenModel model(kBatchSize, kSeqLen, kVocabSize, kModelDim, kHiddenDim, kLayers, kRopeBase);
     model.init_weights(42);
 
     std::mt19937 train_rng(1337);
-    auto base = make_cube_triangles();
+    std::vector<std::vector<std::array<float, 9>>> base_shapes;
+    base_shapes.push_back(make_cube_triangles());
+    base_shapes.push_back(make_tetrahedron_triangles());
     std::vector<ValSeed> val(kValSeeds);
 
     for (uint32_t s = 0; s < kValSeeds; ++s) {
         std::mt19937 rng_val(9001 + s);
-        generate_batch(base, kBatchSize, rng_val, val[s].batch);
+        generate_batch(base_shapes, kBatchSize, rng_val, val[s].batch);
         build_token_batch(val[s].batch.target, kBatchSize, val[s].input_tokens, val[s].target_tokens);
         val[s].first_target_mesh.assign(
             val[s].batch.target.begin(),
@@ -714,7 +760,7 @@ void main_llm() {
         bool should_log = (step == 1 || step % kLogInterval == 0 || step == kTrainSteps);
 
         MeshBatch batch;
-        generate_batch(base, kBatchSize, train_rng, batch);
+        generate_batch(base_shapes, kBatchSize, train_rng, batch);
         build_token_batch(batch.target, kBatchSize, train_input_tokens, train_target_tokens);
         upload_token_tensor(*model.input_tokens, train_input_tokens, false);
         upload_token_tensor(*model.target_tokens, train_target_tokens, false);
