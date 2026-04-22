@@ -473,11 +473,11 @@ struct Tensor {
 
 // pure fp16 and u16 tensors machine learning library
 namespace evk::ai {
-    // Adam optimizer state for a single parameter tensor
-    // Maintains first moment (m) and second moment (v) estimates
+    // Adam optimizer state for a single parameter tensor.
+    // State stays in fp16 for bandwidth, but the second moment is stored as RMS to preserve range.
     struct AdamState {
-        evk::Buffer m_buffer;  // First moment estimate
-        evk::Buffer v_buffer;  // Second moment estimate
+        evk::Buffer m_buffer;  // FP16 first moment estimate
+        evk::Buffer v_buffer;  // FP16 RMS(second moment) estimate
         uint32_t t = 0;        // Timestep counter
 
         void init(uint32_t num_elements);

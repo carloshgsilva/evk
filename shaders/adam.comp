@@ -1,6 +1,7 @@
 #include "evk.frag"
 
-// Adam optimizer compute shader for fp16
+// Adam optimizer compute shader for fp16 parameters, gradients and state.
+// Store the second moment as fp16 RMS instead of fp16 variance to preserve dynamic range.
 // Updates: m = β1*m + (1-β1)*g
 //          v = β2*v + (1-β2)*g²
 //          m̂ = m / (1 - β1^t)
@@ -19,7 +20,7 @@ PUSH(
     BufferFp16 paramBuffer;
     BufferFp16 gradientBuffer;
     BufferFp16 mBuffer;  // First moment estimate
-    BufferFp16 vBuffer;  // Second moment estimate
+    BufferFp16 vBuffer;  // RMS(second moment) estimate
     float learningRate;
     float beta1;
     float beta2;
@@ -37,7 +38,8 @@ void main() {
         float param = float(paramBuffer.x[gid]);
         float grad = float(gradientBuffer.x[gid]);
         float m = float(mBuffer.x[gid]);
-        float v = float(vBuffer.x[gid]);
+        float rms = float(vBuffer.x[gid]);
+        float v = rms * rms;
 
         // Skip update if gradient is NaN or Inf
         if (isnan(grad) || isinf(grad)) {
@@ -53,16 +55,17 @@ void main() {
         if (!isnan(m) && !isinf(m)) {
             mBuffer.x[gid] = float16_t(m);
         }
-        if (!isnan(v) && !isinf(v)) {
-            vBuffer.x[gid] = float16_t(v);
+        rms = sqrt(max(v, 0.0));
+        if (!isnan(rms) && !isinf(rms)) {
+            vBuffer.x[gid] = float16_t(rms);
         }
 
         // Bias-corrected estimates
         float mHat = m * beta1CorrectionInv;
-        float vHat = v * beta2CorrectionInv;
+        float rmsHat = rms * sqrt(beta2CorrectionInv);
 
         // Update parameter with NaN protection
-        float update = learningRate * mHat / (sqrt(vHat) + epsilon);
+        float update = learningRate * mHat / (rmsHat + epsilon);
         if (!isnan(update) && !isinf(update)) {
             param = param - update;
             // Clamp parameter to fp16 range

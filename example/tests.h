@@ -27,6 +27,115 @@ static float gelu_grad_approx_cpu(float x) {
     return 0.5f * (1.0f + t) + 0.5f * x * sech2 * du_dx;
 }
 
+static float quantize_fp16_cpu(float x) {
+    return float(float16_t(x));
+}
+
+static void upload_tensor_from_f32(Tensor& tensor, const std::vector<float>& values) {
+    assert(tensor.shape.count() == values.size());
+    float16_t* dst = tensor.cpu();
+    for (uint32_t i = 0; i < tensor.shape.count(); ++i) {
+        dst[i] = float16_t(values[i]);
+    }
+    tensor.cpu_upload();
+}
+
+static void download_tensor_to_f32(Tensor& tensor, std::vector<float>& values) {
+    tensor.cpu_download();
+    float16_t* src = tensor.cpu();
+    values.resize(tensor.shape.count());
+    for (uint32_t i = 0; i < tensor.shape.count(); ++i) {
+        values[i] = float(src[i]);
+    }
+}
+
+static void cpu_matmul_nn(const std::vector<float>& a,
+                          const std::vector<float>& b,
+                          std::vector<float>& c,
+                          uint32_t rows,
+                          uint32_t inner,
+                          uint32_t cols) {
+    c.assign(rows * cols, 0.0f);
+    for (uint32_t r = 0; r < rows; ++r) {
+        for (uint32_t n = 0; n < cols; ++n) {
+            float sum = 0.0f;
+            for (uint32_t k = 0; k < inner; ++k) {
+                sum += a[r * inner + k] * b[k * cols + n];
+            }
+            c[r * cols + n] = sum;
+        }
+    }
+}
+
+static void cpu_matmul_tn(const std::vector<float>& a,
+                          const std::vector<float>& b,
+                          std::vector<float>& c,
+                          uint32_t rows,
+                          uint32_t inner,
+                          uint32_t cols) {
+    c.assign(inner * cols, 0.0f);
+    for (uint32_t k = 0; k < inner; ++k) {
+        for (uint32_t n = 0; n < cols; ++n) {
+            float sum = 0.0f;
+            for (uint32_t r = 0; r < rows; ++r) {
+                sum += a[r * inner + k] * b[r * cols + n];
+            }
+            c[k * cols + n] = sum;
+        }
+    }
+}
+
+static float cpu_mse_loss_and_grad(const std::vector<float>& predicted,
+                                   const std::vector<float>& target,
+                                   std::vector<float>& grad) {
+    assert(predicted.size() == target.size());
+    grad.resize(predicted.size());
+    double loss_sum = 0.0;
+    float grad_scale = 2.0f / float(predicted.size());
+    for (size_t i = 0; i < predicted.size(); ++i) {
+        float diff = predicted[i] - target[i];
+        loss_sum += double(diff) * double(diff);
+        grad[i] = grad_scale * diff;
+    }
+    return float(loss_sum / double(predicted.size()));
+}
+
+static void cpu_adam_step(std::vector<float>& param,
+                          const std::vector<float>& grad,
+                          std::vector<float>& m,
+                          std::vector<float>& v,
+                          uint32_t timestep,
+                          float learning_rate,
+                          float beta1,
+                          float beta2,
+                          float epsilon) {
+    assert(param.size() == grad.size());
+    assert(m.size() == grad.size());
+    assert(v.size() == grad.size());
+
+    float beta1_correction_inv = 1.0f / (1.0f - std::pow(beta1, float(timestep)));
+    float beta2_correction_inv = 1.0f / (1.0f - std::pow(beta2, float(timestep)));
+
+    for (size_t i = 0; i < param.size(); ++i) {
+        m[i] = beta1 * m[i] + (1.0f - beta1) * grad[i];
+        v[i] = beta2 * v[i] + (1.0f - beta2) * grad[i] * grad[i];
+
+        float m_hat = m[i] * beta1_correction_inv;
+        float v_hat = v[i] * beta2_correction_inv;
+        param[i] -= learning_rate * m_hat / (std::sqrt(v_hat) + epsilon);
+    }
+}
+
+static float rmse_between(const std::vector<float>& a, const std::vector<float>& b) {
+    assert(a.size() == b.size());
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        double diff = double(a[i]) - double(b[i]);
+        sum_sq += diff * diff;
+    }
+    return float(std::sqrt(sum_sq / double(a.size())));
+}
+
 void test_add() {
     printf("test_add()\n");
     Tensor a({4});
@@ -596,6 +705,120 @@ void test_adam() {
 
     // Check that timestep was incremented
     TEST(state.t == 10);
+}
+
+void test_adam_fp16_matmul_convergence_vs_cpu_fp32() {
+    printf("test_adam_fp16_matmul_convergence_vs_cpu_fp32()\n");
+
+    constexpr uint32_t SIZE = 16u;
+    constexpr int STEPS = 96;
+    constexpr float kLearningRate = 0.03f;
+    constexpr float kBeta1 = 0.9f;
+    constexpr float kBeta2 = 0.999f;
+    constexpr float kEpsilon = 1e-4f;
+
+    std::vector<float> x_host(SIZE * SIZE);
+    std::vector<float> w_init(SIZE * SIZE);
+    std::vector<float> w_target(SIZE * SIZE);
+    for (uint32_t r = 0; r < SIZE; ++r) {
+        for (uint32_t c = 0; c < SIZE; ++c) {
+            uint32_t idx = r * SIZE + c;
+
+            float x_val = (r == c ? 1.0f : 0.0f) +
+                0.03125f * float(int((r * 5u + c * 3u) % 5u) - 2);
+            float w_init_val =
+                0.0625f * float(int((r * 7u + c * 11u) % 7u) - 3);
+            float w_target_val =
+                (r == c ? 0.75f : 0.0f) +
+                0.0625f * float(int((r * 13u + c * 9u) % 9u) - 4);
+
+            x_host[idx] = quantize_fp16_cpu(x_val);
+            w_init[idx] = quantize_fp16_cpu(w_init_val);
+            w_target[idx] = quantize_fp16_cpu(w_target_val);
+        }
+    }
+
+    std::vector<float> target_host;
+    cpu_matmul_nn(x_host, w_target, target_host, SIZE, SIZE, SIZE);
+    for (float& value : target_host) {
+        value = quantize_fp16_cpu(value);
+    }
+
+    Tensor x({SIZE, SIZE});
+    Tensor w_gpu({SIZE, SIZE});
+    Tensor y_gpu({SIZE, SIZE});
+    Tensor target({SIZE, SIZE});
+    Tensor loss_gpu_tensor({1});
+    Tensor y_grad_gpu({SIZE, SIZE});
+    Tensor w_grad_gpu({SIZE, SIZE});
+    evk::ai::AdamState gpu_state;
+
+    upload_tensor_from_f32(x, x_host);
+    upload_tensor_from_f32(w_gpu, w_init);
+    upload_tensor_from_f32(target, target_host);
+
+    std::vector<float> w_cpu = w_init;
+    std::vector<float> m_cpu(SIZE * SIZE, 0.0f);
+    std::vector<float> v_cpu(SIZE * SIZE, 0.0f);
+    std::vector<float> y_cpu;
+    std::vector<float> y_grad_cpu;
+    std::vector<float> w_grad_cpu;
+
+    float gpu_initial_loss = 0.0f;
+    float gpu_final_loss = 0.0f;
+    float cpu_initial_loss = 0.0f;
+    float cpu_final_loss = 0.0f;
+    bool gpu_losses_finite = true;
+    bool cpu_losses_finite = true;
+
+    for (int step = 1; step <= STEPS; ++step) {
+        evk::ai::matmul(x, w_gpu, y_gpu, false, false, false, 16, 16);
+        evk::ai::mse_loss(y_gpu, target, y_grad_gpu, loss_gpu_tensor);
+        evk::ai::matmul(x, y_grad_gpu, w_grad_gpu, true, false, false, 16, 16);
+        evk::ai::adam(w_gpu, w_grad_gpu, gpu_state, kLearningRate, kBeta1, kBeta2, kEpsilon);
+        loss_gpu_tensor.cpu_download(false);
+        evk::ai::SubmitCmd(true);
+
+        float gpu_loss = float(loss_gpu_tensor.cpu()[0]);
+        gpu_losses_finite = gpu_losses_finite && std::isfinite(gpu_loss);
+
+        cpu_matmul_nn(x_host, w_cpu, y_cpu, SIZE, SIZE, SIZE);
+        float cpu_loss = cpu_mse_loss_and_grad(y_cpu, target_host, y_grad_cpu);
+        cpu_matmul_tn(x_host, y_grad_cpu, w_grad_cpu, SIZE, SIZE, SIZE);
+        cpu_adam_step(w_cpu, w_grad_cpu, m_cpu, v_cpu,
+                      uint32_t(step), kLearningRate, kBeta1, kBeta2, kEpsilon);
+        cpu_losses_finite = cpu_losses_finite && std::isfinite(cpu_loss);
+
+        if (step == 1) {
+            gpu_initial_loss = gpu_loss;
+            cpu_initial_loss = cpu_loss;
+        }
+        if (step == STEPS) {
+            gpu_final_loss = gpu_loss;
+            cpu_final_loss = cpu_loss;
+        }
+    }
+
+    std::vector<float> w_gpu_final;
+    download_tensor_to_f32(w_gpu, w_gpu_final);
+
+    float gpu_to_target_rmse = rmse_between(w_gpu_final, w_target);
+    float cpu_to_target_rmse = rmse_between(w_cpu, w_target);
+    float gpu_to_cpu_rmse = rmse_between(w_gpu_final, w_cpu);
+
+    printf("  gpu_loss: %.6f -> %.6f\n", gpu_initial_loss, gpu_final_loss);
+    printf("  cpu_loss: %.6f -> %.6f\n", cpu_initial_loss, cpu_final_loss);
+    printf("  rmse(target): gpu=%.6f cpu=%.6f gpu_vs_cpu=%.6f\n",
+           gpu_to_target_rmse, cpu_to_target_rmse, gpu_to_cpu_rmse);
+
+    TEST(gpu_losses_finite);
+    TEST(cpu_losses_finite);
+    TEST(gpu_final_loss < gpu_initial_loss * 0.05f);
+    TEST(gpu_final_loss < 1e-4f);
+    TEST(cpu_final_loss < cpu_initial_loss * 0.02f);
+    TEST(gpu_final_loss <= cpu_final_loss + 1e-4f);
+    TEST(gpu_to_target_rmse <= cpu_to_target_rmse + 2e-3f);
+    TEST(gpu_to_cpu_rmse < 5e-3f);
 }
 
 void test_adam_convergence() {
@@ -1325,6 +1548,7 @@ void run_ai_kernel_tests() {
     test_cross_entropy_loss();
     test_sgd();
     test_adam();
+    test_adam_fp16_matmul_convergence_vs_cpu_fp32();
     test_softmax();
     test_relu();
     test_gelu();
