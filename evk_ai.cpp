@@ -586,7 +586,7 @@ namespace evk::ai {
         cmd.barrier();
     }
 
-    void softmax(Tensor& in, Tensor& out) {
+    void softmax(Tensor& in, Tensor& out, float input_scale) {
         assert(in.shape.rank() == out.shape.rank());
         for (uint32_t i = 0; i < in.shape.rank(); ++i) {
             assert(in.shape[i] == out.shape[i]);
@@ -600,6 +600,7 @@ namespace evk::ai {
         cmd.push(evk::Constant{
             in.buffer.GetReference(),
             out.buffer.GetReference(),
+            input_scale,
             lastDim,
             outerCount,
         });

@@ -1,7 +1,8 @@
 #include "evk.frag"
 
 // Adam optimizer compute shader for fp16 parameters, gradients and state.
-// Store the second moment as fp16 RMS instead of fp16 variance to preserve dynamic range.
+// Store the first moment normalized by RMS and the second moment as biased log2 RMS.
+// This keeps both state values in a range that is friendlier to fp16 quantization.
 // Updates: m = β1*m + (1-β1)*g
 //          v = β2*v + (1-β2)*g²
 //          m̂ = m / (1 - β1^t)
@@ -16,11 +17,14 @@
 
 layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 
+const float LOG_RMS_OFFSET = 41.0;
+const float MIN_RMS = 1.0e-12;
+
 PUSH(
     BufferFp16 paramBuffer;
     BufferFp16 gradientBuffer;
-    BufferFp16 mBuffer;  // First moment estimate
-    BufferFp16 vBuffer;  // RMS(second moment) estimate
+    BufferFp16 mBuffer;  // First moment estimate normalized by RMS
+    BufferFp16 vBuffer;  // Offset log2 RMS(second moment) estimate
     float learningRate;
     float beta1;
     float beta2;
@@ -37,8 +41,10 @@ void main() {
     if (gid < totalElements) {
         float param = float(paramBuffer.x[gid]);
         float grad = float(gradientBuffer.x[gid]);
-        float m = float(mBuffer.x[gid]);
-        float rms = float(vBuffer.x[gid]);
+        float m_norm = float(mBuffer.x[gid]);
+        float storedLogRms = float(vBuffer.x[gid]);
+        float rms = (storedLogRms > 0.0) ? exp2(storedLogRms - LOG_RMS_OFFSET) : 0.0;
+        float m = m_norm * rms;
         float v = rms * rms;
 
         // Skip update if gradient is NaN or Inf
@@ -52,12 +58,16 @@ void main() {
         v = beta2 * v + (1.0 - beta2) * grad * grad;
 
         // Store updated moments (with NaN protection)
-        if (!isnan(m) && !isinf(m)) {
-            mBuffer.x[gid] = float16_t(m);
-        }
         rms = sqrt(max(v, 0.0));
-        if (!isnan(rms) && !isinf(rms)) {
-            vBuffer.x[gid] = float16_t(rms);
+        float denom = max(rms, 1.0e-8);
+        m_norm = m / denom;
+        if (!isnan(m_norm) && !isinf(m_norm)) {
+            mBuffer.x[gid] = float16_t(m_norm);
+        }
+        float rms_clamped = max(rms, MIN_RMS);
+        float logRms = log2(rms_clamped) + LOG_RMS_OFFSET;
+        if (!isnan(logRms) && !isinf(logRms)) {
+            vBuffer.x[gid] = float16_t(logRms);
         }
 
         // Bias-corrected estimates

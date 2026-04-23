@@ -474,10 +474,12 @@ struct Tensor {
 // pure fp16 and u16 tensors machine learning library
 namespace evk::ai {
     // Adam optimizer state for a single parameter tensor.
-    // State stays in fp16 for bandwidth, but the second moment is stored as RMS to preserve range.
+    // State stays in fp16 for bandwidth.
+    // m_buffer stores the first moment normalized by RMS.
+    // v_buffer stores log2(RMS(second moment)) with a positive bias so tiny RMS values survive fp16 storage.
     struct AdamState {
-        evk::Buffer m_buffer;  // FP16 first moment estimate
-        evk::Buffer v_buffer;  // FP16 RMS(second moment) estimate
+        evk::Buffer m_buffer;  // FP16 normalized first moment estimate
+        evk::Buffer v_buffer;  // FP16 biased log2 RMS(second moment) estimate
         uint32_t t = 0;        // Timestep counter
 
         void init(uint32_t num_elements);
@@ -518,9 +520,9 @@ namespace evk::ai {
     // Elementwise add: C = A + B
     void add(Tensor& a, Tensor& b, Tensor& c);
 
-    // Softmax along last dimension
+    // Softmax along the last dimension, with an optional input scale applied in float before exponentiation.
     // out has the same shape as in
-    void softmax(Tensor& in, Tensor& out);
+    void softmax(Tensor& in, Tensor& out, float input_scale = 1.0f);
 
     // Softmax backward with optional scale factor
     // grad_in = probs * (grad_out - dot(grad_out, probs)) * scale
@@ -935,19 +937,19 @@ struct Graph {
         return loss;
     }
 
-    // Softmax along last dimension with backward pass
-    Tensor& softmax(Tensor& input) {
+    // Softmax along last dimension with backward pass.
+    // input_scale is applied in float before exponentiation and mirrored in backward.
+    Tensor& softmax(Tensor& input, float input_scale = 1.0f) {
         nodes.push_back(std::make_unique<Tensor>(input.shape));
         Tensor& out = *nodes.back();
         
-        out.forward_fn = [&input, &out]() {
-            evk::ai::softmax(input, out);
+        out.forward_fn = [&input, &out, input_scale]() {
+            evk::ai::softmax(input, out, input_scale);
         };
         
-        out.backward_fn = [&input, &out]() {
-            // Softmax backward on GPU (scale = 1.0)
-            // The shader accumulates directly into input.grad()
-            evk::ai::softmax_backward(out, out.grad(), input.grad(), 1.0f);
+        out.backward_fn = [&input, &out, input_scale]() {
+            // Softmax backward on GPU, including the input scaling from forward.
+            evk::ai::softmax_backward(out, out.grad(), input.grad(), input_scale);
         };
         
         return out;
@@ -973,15 +975,12 @@ struct Graph {
         out.forward_fn = [&q, &k, &v, &scores, &probs, &out, attn_scale, B, N, D]() {
             // scores = Q @ K^T
             evk::ai::matmul(q, k, scores, false, true, false, 16, 16);
-            
-            // Scale scores (GPU)
-            evk::ai::scale(scores, attn_scale);
-            
+
             // Apply causal mask
             evk::ai::apply_causal_mask(scores);
             
-            // Softmax
-            evk::ai::softmax(scores, probs);
+            // Softmax with input scaling fused in float before exponentiation
+            evk::ai::softmax(scores, probs, attn_scale);
             
             // out = probs @ V
             evk::ai::matmul(probs, v, out, false, false, false, 16, 16);
@@ -994,12 +993,8 @@ struct Graph {
             evk::ai::matmul(out.grad(), v, probs.grad(), false, true, false, 16, 16);
             evk::ai::matmul(probs, out.grad(), v.grad(), true, false, true, 16, 16);
             
-            // Softmax backward WITHOUT scale, then apply scale separately
-            // This gives us: grad_scores = probs * (grad_probs - dot(grad_probs, probs))
-            evk::ai::softmax_backward(probs, probs.grad(), scores.grad(), 1.0f);
-            
-            // Now apply the scale: grad_unscaled_scores = grad_scaled_scores * scale
-            evk::ai::scale(scores.grad(), attn_scale);
+            // Softmax backward with the same fused input scale from forward.
+            evk::ai::softmax_backward(probs, probs.grad(), scores.grad(), attn_scale);
             
             // Backward through Q @ K^T
             // grad_q += grad_scores @ K

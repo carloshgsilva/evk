@@ -654,6 +654,28 @@ void test_softmax() {
         }
     }
     TEST(ok);
+
+    Tensor masked_in({1, 4});
+    Tensor masked_out({1, 4});
+    float16_t* mp = masked_in.cpu();
+    mp[0] = float16_t(0.0f);
+    mp[1] = float16_t(-65504.0f);
+    mp[2] = float16_t(1.0f);
+    mp[3] = float16_t(-65504.0f);
+    masked_in.cpu_upload();
+
+    evk::ai::softmax(masked_in, masked_out, 1e-5f);
+    masked_out.cpu_download();
+
+    float p0 = float(masked_out.cpu()[0]);
+    float p1 = float(masked_out.cpu()[1]);
+    float p2 = float(masked_out.cpu()[2]);
+    float p3 = float(masked_out.cpu()[3]);
+    bool masked_ok = approx_eq(p1, 0.0f, 1e-7f) &&
+                     approx_eq(p3, 0.0f, 1e-7f) &&
+                     approx_eq(p0 + p2, 1.0f, 5e-3f) &&
+                     p0 > 0.49f && p2 > 0.49f;
+    TEST(masked_ok);
 }
 
 void test_adam() {
