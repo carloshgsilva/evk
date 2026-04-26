@@ -34,14 +34,13 @@ namespace evk {
     const uint32_t PERF_QUERY_COUNT = 64;
 
     struct FrameData {
-        Image image;
-
         VkSemaphore imageReadySemaphore;
 
         VkCommandPool pool;
         VkCommandBuffer cmd;
         VkSemaphore cmdDoneSemaphore;
         bool doingPresent = false;
+        bool fenceSubmitted = false;
         bool insideRenderPass = false;
         VkFence fence;  // for the queue submit
 
@@ -111,11 +110,13 @@ namespace evk {
         VkSurfaceKHR surface;
         VkSwapchainKHR swapchain;
         uint32_t swapchainIndex = 0;
-        uint32_t swapchainSemaphoreIndex = 0;
+        std::vector<Image> swapchainImages;
+        std::vector<VkFence> swapchainImageFences;
 
         std::vector<FrameData> frames = {};
         uint32_t frame = 0;
         uint32_t frame_total = 0;
+        bool deviceLost = false;
 
         // Raytracing
         PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR;
