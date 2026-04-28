@@ -34,8 +34,6 @@ namespace evk {
     const uint32_t PERF_QUERY_COUNT = 64;
 
     struct FrameData {
-        Image image;
-
         VkSemaphore imageReadySemaphore;
 
         VkCommandPool pool;
@@ -43,6 +41,7 @@ namespace evk {
         VkSemaphore cmdDoneSemaphore;
         bool doingPresent = false;
         bool insideRenderPass = false;
+        uint32_t swapchainIndex = 0;
         VkFence fence;  // for the queue submit
 
         // performance queries
@@ -111,7 +110,7 @@ namespace evk {
         VkSurfaceKHR surface;
         VkSwapchainKHR swapchain;
         uint32_t swapchainIndex = 0;
-        uint32_t swapchainSemaphoreIndex = 0;
+        std::vector<Image> swapchainImages;
 
         std::vector<FrameData> frames = {};
         uint32_t frame = 0;

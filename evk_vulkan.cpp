@@ -673,9 +673,9 @@ namespace evk {
         VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
         VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.waitSemaphoreCount = F.doingPresent ? 1 : 0;
-        submit.pWaitSemaphores = F.doingPresent ? &S.frames[S.swapchainSemaphoreIndex].imageReadySemaphore : nullptr;
+        submit.pWaitSemaphores = F.doingPresent ? &F.imageReadySemaphore : nullptr;
         submit.signalSemaphoreCount = F.doingPresent ? 1 : 0;
-        submit.pSignalSemaphores = F.doingPresent ? &S.presentSemaphores[S.swapchainIndex] : nullptr;
+        submit.pSignalSemaphores = F.doingPresent ? &S.presentSemaphores[F.swapchainIndex] : nullptr;
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &F.cmd;
         submit.pWaitDstStageMask = &dstStage;
@@ -684,10 +684,10 @@ namespace evk {
         if (F.doingPresent) {
             VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
             present.waitSemaphoreCount = 1;
-            present.pWaitSemaphores = &S.presentSemaphores[S.swapchainIndex];
+            present.pWaitSemaphores = &S.presentSemaphores[F.swapchainIndex];
             present.swapchainCount = 1;
             present.pSwapchains = &S.swapchain;
-            present.pImageIndices = &S.swapchainIndex;
+            present.pImageIndices = &F.swapchainIndex;
             VkResult r = vkQueuePresentKHR(S.queue, &present);
 
             if (r == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -696,11 +696,12 @@ namespace evk {
             }
         }
     }
-    void _WaitFrameCompletion() {
-        auto& F = GetFrame();
+    void _WaitFrameCompletion(uint32_t frameIndex) {
+        auto& S = GetState();
+        auto& F = S.frames[frameIndex];
 
-        CHECK_VK(vkWaitForFences(GetState().device, 1, &F.fence, true, std::numeric_limits<uint64_t>().max()));
-        CHECK_VK(vkResetFences(GetState().device, 1, &F.fence));
+        CHECK_VK(vkWaitForFences(S.device, 1, &F.fence, true, std::numeric_limits<uint64_t>().max()));
+        CHECK_VK(vkResetFences(S.device, 1, &F.fence));
         F.queries.resize(PERF_QUERY_COUNT);
 
         if(F.timestampNames.empty() == false) { 
@@ -1196,7 +1197,7 @@ namespace evk {
             GetState().vkDestroyAccelerationStructureKHR = (PFN_vkDestroyAccelerationStructureKHR)vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR");
         }
 
-        _WaitFrameCompletion();
+        _WaitFrameCompletion(S.frame);
         _BeginFrame();
 
         return true;
@@ -1204,12 +1205,11 @@ namespace evk {
     void Shutdown() {
         auto& S = GetState();
 
-        // release internal resources
         {
             for (auto& f : S.frames) {
-                f.image.release();
                 f.stagingBuffer.release();
             }
+            S.swapchainImages.clear();
             S.blasScratchBuffer.release();
             S.blasScratchBufferSize = 0;
         }
@@ -1330,9 +1330,10 @@ namespace evk {
         CHECK_VK(vkGetSwapchainImagesKHR(S.device, S.swapchain, &imageCount, nullptr));
         images.resize(imageCount);
         CHECK_VK(vkGetSwapchainImagesKHR(S.device, S.swapchain, &imageCount, images.data()));
-        for (int i = 0; i < frameCount; i++) {
-            FrameData& d = S.frames[i];
-            d.image = CreateImageForSwapchain(images[i], extent.width, extent.height);
+        S.swapchainImages.clear();
+        S.swapchainImages.reserve(imageCount);
+        for (uint32_t i = 0; i < imageCount; i++) {
+            S.swapchainImages.push_back(CreateImageForSwapchain(images[i], extent.width, extent.height));
         }
 
         for (auto sem : S.presentSemaphores) {
@@ -1358,15 +1359,14 @@ namespace evk {
 
     void Submit() {
         auto& S = GetState();
-        auto& F = GetFrame();
 
         _EndFrame();
         S.frame_total++;
 
-        // Swap frame
-        S.frame = (S.frame + 1) % S.frames.size();
+        uint32_t nextFrame = (S.frame + 1) % (uint32_t)S.frames.size();
 
-        _WaitFrameCompletion();
+        S.frame = nextFrame;
+        _WaitFrameCompletion(S.frame);
         _ReleaseResources();
         _BeginFrame();
     }
@@ -1778,26 +1778,30 @@ namespace evk {
     }
     void CmdBeginPresent(ClearValue clearValue) {
         auto& F = GetFrame();
+        auto& S = GetState();
         EVK_ASSERT(!F.doingPresent, "CmdBeginPresent have already been called this frame.");
         F.doingPresent = true;
 
-        auto& S = GetState();
-        S.swapchainSemaphoreIndex = (S.swapchainSemaphoreIndex + 1) % S.frames.size();
-        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, std::numeric_limits<uint64_t>().max(), S.frames[S.swapchainSemaphoreIndex].imageReadySemaphore, 0, &S.swapchainIndex);
+        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, std::numeric_limits<uint64_t>().max(), F.imageReadySemaphore, 0, &F.swapchainIndex);
         if (r == VK_ERROR_OUT_OF_DATE_KHR) {
             F.doingPresent = false;
             S.frame = (int)S.frames.size() - 1;
             RecreateSwapchain();
             return;
         }
-        CmdBarrier(S.frames[S.swapchainIndex].image, ImageLayout::Undefined, ImageLayout::Attachment);
+        if (r != VK_SUBOPTIMAL_KHR) {
+            CHECK_VK(r);
+        }
+        S.swapchainIndex = F.swapchainIndex;
+        CmdBarrier(S.swapchainImages[F.swapchainIndex], ImageLayout::Undefined, ImageLayout::Attachment);
 
         ClearValue clears[] = {clearValue};
-        CmdBeginRender(&S.frames[S.swapchainIndex].image, clears, 1);
+        CmdBeginRender(&S.swapchainImages[F.swapchainIndex], clears, 1);
     }
     void CmdEndPresent() {
         CmdEndRender();
-        CmdBarrier(GetState().frames[GetState().swapchainIndex].image, ImageLayout::Attachment, ImageLayout::Present);
+        auto& S = GetState();
+        CmdBarrier(S.swapchainImages[GetFrame().swapchainIndex], ImageLayout::Attachment, ImageLayout::Present);
     }
     void CmdViewport(float x, float y, float w, float h, float minDepth, float maxDepth) {
         VkViewport viewport = {};
@@ -1832,7 +1836,7 @@ namespace evk {
             VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, .baseMipLevel = 0, .levelCount = desc.mipCount, .baseArrayLayer = 0, .layerCount = desc.layerCount};
             vkCmdClearDepthStencilImage(GetFrame().cmd, ToInternal(image).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &vkValue, 1, &range);
         } else {
-            VkClearColorValue vkValue = {.uint32 = {value.color.uint32[0], value.color.uint32[1], value.color.uint32[3], value.color.uint32[4]}};
+            VkClearColorValue vkValue = {.uint32 = {value.color.uint32[0], value.color.uint32[1], value.color.uint32[2], value.color.uint32[3]}};
             VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = desc.mipCount, .baseArrayLayer = 0, .layerCount = desc.layerCount};
             vkCmdClearColorImage(GetFrame().cmd, ToInternal(image).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &vkValue, 1, &range);
         }
@@ -1894,7 +1898,7 @@ namespace evk {
                 .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
                 .vertexData = {.deviceAddress = ToInternal(desc.vertices).deviceAddress},
                 .vertexStride = desc.stride,
-                .maxVertex = desc.vertexCount,
+                .maxVertex = desc.vertexCount - 1,
                 .indexType = VK_INDEX_TYPE_UINT32,
                 .indexData = {.deviceAddress = ToInternal(desc.indices).deviceAddress},
                 .transformData = {.hostAddress = nullptr},  // identity transform // TODO: support multiple geometries
@@ -2180,7 +2184,7 @@ namespace evk {
 
         // Update build information
         res.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-        res.buildInfo.srcAccelerationStructure = res.accel;
+        res.buildInfo.srcAccelerationStructure = update ? res.accel : VK_NULL_HANDLE;
         res.buildInfo.dstAccelerationStructure = res.accel;
         res.buildInfo.scratchData.deviceAddress = ToInternal(scratchBuffer).deviceAddress;
 
