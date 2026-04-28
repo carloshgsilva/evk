@@ -40,7 +40,6 @@ namespace evk {
         VkCommandBuffer cmd;
         VkSemaphore cmdDoneSemaphore;
         bool doingPresent = false;
-        bool fenceSubmitted = false;
         bool insideRenderPass = false;
         VkFence fence;  // for the queue submit
 
@@ -116,7 +115,6 @@ namespace evk {
         std::vector<FrameData> frames = {};
         uint32_t frame = 0;
         uint32_t frame_total = 0;
-        bool deviceLost = false;
 
         // Raytracing
         PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR;

@@ -3,40 +3,9 @@
 #define VMA_IMPLEMENTATION
 #include "vk_mem_alloc.h"
 #include "evk.h"
-#include <cstdio>
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#endif
 
 namespace evk {
     static State* GState;
-
-    static void PumpPlatformMessages() {
-#ifdef _WIN32
-        MSG message;
-        while (PeekMessage(&message, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&message);
-            DispatchMessage(&message);
-        }
-#endif
-    }
-
-    static bool WaitFence(VkDevice device, VkFence fence) {
-        VkResult waitResult = VK_TIMEOUT;
-        int waitCount = 0;
-        while (waitResult == VK_TIMEOUT && waitCount < 5000) {
-            waitResult = vkWaitForFences(device, 1, &fence, true, 1'000'000);
-            PumpPlatformMessages();
-            waitCount++;
-        }
-        return waitResult == VK_SUCCESS;
-    }
 
     const VmaMemoryUsage MEMORY_TYPE_VMA[] = {
         VmaMemoryUsage::VMA_MEMORY_USAGE_CPU_ONLY,
@@ -695,19 +664,11 @@ namespace evk {
         vkCmdBindDescriptorSets(F.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, S.pipelineLayout, 0, 1, &S.descriptorSet, 0, nullptr);
         vkCmdBindDescriptorSets(F.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pipelineLayout, 0, 1, &S.descriptorSet, 0, nullptr);
     }
-    bool _EndFrame() {
+    void _EndFrame() {
         auto& S = GetState();
         auto& F = GetFrame();
 
-        if (S.deviceLost) {
-            return false;
-        }
-
-        VkResult endResult = vkEndCommandBuffer(F.cmd);
-        if (endResult != VK_SUCCESS) {
-            S.deviceLost = true;
-            return false;
-        }
+        CHECK_VK(vkEndCommandBuffer(F.cmd));
 
         VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
         VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -718,12 +679,7 @@ namespace evk {
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &F.cmd;
         submit.pWaitDstStageMask = &dstStage;
-        VkResult submitResult = vkQueueSubmit(S.queue, 1, &submit, F.fence);
-        if (submitResult != VK_SUCCESS) {
-            S.deviceLost = true;
-            return false;
-        }
-        F.fenceSubmitted = true;
+        CHECK_VK(vkQueueSubmit(S.queue, 1, &submit, F.fence));
 
         if (F.doingPresent) {
             VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -734,35 +690,22 @@ namespace evk {
             present.pImageIndices = &S.swapchainIndex;
             VkResult r = vkQueuePresentKHR(S.queue, &present);
 
-            if (r == VK_ERROR_DEVICE_LOST) {
-                S.deviceLost = true;
-                return false;
-            }
             if (r == VK_ERROR_OUT_OF_DATE_KHR) {
                 S.frame = (int)S.frames.size() - 1;
                 RecreateSwapchain();
             }
         }
-        return true;
     }
-    bool _WaitFrameCompletion(uint32_t frameIndex) {
+    void _WaitFrameCompletion(uint32_t frameIndex) {
         auto& S = GetState();
         auto& F = S.frames[frameIndex];
-
-        if (S.deviceLost) {
-            return false;
-        }
 
         for (VkFence& imageFence : S.swapchainImageFences) {
             if (imageFence == F.fence) {
                 imageFence = VK_NULL_HANDLE;
             }
         }
-        if (F.fenceSubmitted && !WaitFence(S.device, F.fence)) {
-            S.deviceLost = true;
-            return false;
-        }
-        F.fenceSubmitted = false;
+        CHECK_VK(vkWaitForFences(S.device, 1, &F.fence, true, std::numeric_limits<uint64_t>().max()));
         CHECK_VK(vkResetFences(S.device, 1, &F.fence));
         F.queries.resize(PERF_QUERY_COUNT);
 
@@ -778,7 +721,6 @@ namespace evk {
                 F.timestampEntries.push_back(e);
             }
         }
-        return true;
     }
     void _ReleaseResources() {
         auto& F = GetFrame();
@@ -1260,18 +1202,13 @@ namespace evk {
             GetState().vkDestroyAccelerationStructureKHR = (PFN_vkDestroyAccelerationStructureKHR)vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR");
         }
 
-        if (!_WaitFrameCompletion(S.frame)) {
-            return false;
-        }
+        _WaitFrameCompletion(S.frame);
         _BeginFrame();
 
         return true;
     }
     void Shutdown() {
         auto& S = GetState();
-        if (S.deviceLost) {
-            return;
-        }
 
         {
             for (auto& f : S.frames) {
@@ -1283,17 +1220,9 @@ namespace evk {
             S.blasScratchBufferSize = 0;
         }
 
-        if (!S.deviceLost) {
-            for (auto& f : S.frames) {
-                if (f.fenceSubmitted && !WaitFence(S.device, f.fence)) {
-                    S.deviceLost = true;
-                    break;
-                }
-                f.fenceSubmitted = false;
-            }
-        }
-        if (S.deviceLost) {
-            return;
+        _EndFrame();
+        for (auto& f : S.frames) {
+            CHECK_VK(vkWaitForFences(S.device, 1, &f.fence, true, std::numeric_limits<uint64_t>::max()));
         }
         for (int i = 0; i < (int)S.frames.size(); i++) {
             S.frame = i;
@@ -1439,24 +1368,13 @@ namespace evk {
     void Submit() {
         auto& S = GetState();
 
-        if (S.deviceLost) {
-            return;
-        }
-        uint32_t nextFrame = (S.frame + 1) % (uint32_t)S.frames.size();
-        if (!_WaitFrameCompletion(nextFrame)) {
-            return;
-        }
-        uint32_t submittedFrame = S.frame;
-        if (!_EndFrame()) {
-            return;
-        }
-        if (S.frame_total < S.frames.size() * 2 && !WaitFence(S.device, S.frames[submittedFrame].fence)) {
-            S.deviceLost = true;
-            return;
-        }
+        _EndFrame();
         S.frame_total++;
 
+        uint32_t nextFrame = (S.frame + 1) % (uint32_t)S.frames.size();
+
         S.frame = nextFrame;
+        _WaitFrameCompletion(S.frame);
         _ReleaseResources();
         _BeginFrame();
     }
@@ -1466,14 +1384,8 @@ namespace evk {
     uint32_t GetFrameIndex() {
         return GetState().frame;
     }
-    bool IsDeviceLost() {
-        return GState != nullptr && GState->deviceLost;
-    }
     void Sync() {
         for (int i = 0; i < GetState().frames.size(); i++) {
-            if (GetState().deviceLost) {
-                return;
-            }
             Submit();
         }
     }
@@ -1875,42 +1787,22 @@ namespace evk {
     void CmdBeginPresent(ClearValue clearValue) {
         auto& F = GetFrame();
         auto& S = GetState();
-        if (S.deviceLost) {
-            return;
-        }
         EVK_ASSERT(!F.doingPresent, "CmdBeginPresent have already been called this frame.");
         F.doingPresent = true;
 
-        VkResult r = VK_TIMEOUT;
-        int acquireWaitCount = 0;
-        while (r == VK_TIMEOUT && acquireWaitCount < 5000) {
-            r = vkAcquireNextImageKHR(S.device, S.swapchain, 1'000'000, F.imageReadySemaphore, 0, &S.swapchainIndex);
-            PumpPlatformMessages();
-            acquireWaitCount++;
-        }
-        if (r == VK_ERROR_DEVICE_LOST) {
-            S.deviceLost = true;
-            F.doingPresent = false;
-            return;
-        }
+        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, std::numeric_limits<uint64_t>().max(), F.imageReadySemaphore, 0, &S.swapchainIndex);
         if (r == VK_ERROR_OUT_OF_DATE_KHR) {
             F.doingPresent = false;
             S.frame = (int)S.frames.size() - 1;
             RecreateSwapchain();
             return;
         }
-        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
-            S.deviceLost = true;
-            F.doingPresent = false;
-            return;
+        if (r != VK_SUBOPTIMAL_KHR) {
+            CHECK_VK(r);
         }
         VkFence& imageFence = S.swapchainImageFences[S.swapchainIndex];
         if (imageFence != VK_NULL_HANDLE) {
-            if (!WaitFence(S.device, imageFence)) {
-                S.deviceLost = true;
-                F.doingPresent = false;
-                return;
-            }
+            CHECK_VK(vkWaitForFences(S.device, 1, &imageFence, true, std::numeric_limits<uint64_t>().max()));
         }
         imageFence = F.fence;
         CmdBarrier(S.swapchainImages[S.swapchainIndex], ImageLayout::Undefined, ImageLayout::Attachment);
@@ -1919,9 +1811,6 @@ namespace evk {
         CmdBeginRender(&S.swapchainImages[S.swapchainIndex], clears, 1);
     }
     void CmdEndPresent() {
-        if (GetState().deviceLost || !GetFrame().doingPresent) {
-            return;
-        }
         CmdEndRender();
         CmdBarrier(GetState().swapchainImages[GetState().swapchainIndex], ImageLayout::Attachment, ImageLayout::Present);
     }

@@ -339,7 +339,6 @@ namespace evk {
     uint32_t GetFrameBufferingCount();
     // Returns the frame buffering index
     uint32_t GetFrameIndex();
-    bool IsDeviceLost();
     // Should be called at the end of each frame to submit the command buffer to the gpu
     void Submit();
     // Ensures that no command buffer are running or have access to any resource
