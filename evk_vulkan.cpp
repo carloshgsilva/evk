@@ -675,7 +675,7 @@ namespace evk {
         submit.waitSemaphoreCount = F.doingPresent ? 1 : 0;
         submit.pWaitSemaphores = F.doingPresent ? &F.imageReadySemaphore : nullptr;
         submit.signalSemaphoreCount = F.doingPresent ? 1 : 0;
-        submit.pSignalSemaphores = F.doingPresent ? &S.presentSemaphores[S.swapchainIndex] : nullptr;
+        submit.pSignalSemaphores = F.doingPresent ? &S.presentSemaphores[F.swapchainIndex] : nullptr;
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &F.cmd;
         submit.pWaitDstStageMask = &dstStage;
@@ -684,10 +684,10 @@ namespace evk {
         if (F.doingPresent) {
             VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
             present.waitSemaphoreCount = 1;
-            present.pWaitSemaphores = &S.presentSemaphores[S.swapchainIndex];
+            present.pWaitSemaphores = &S.presentSemaphores[F.swapchainIndex];
             present.swapchainCount = 1;
             present.pSwapchains = &S.swapchain;
-            present.pImageIndices = &S.swapchainIndex;
+            present.pImageIndices = &F.swapchainIndex;
             VkResult r = vkQueuePresentKHR(S.queue, &present);
 
             if (r == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -1790,7 +1790,7 @@ namespace evk {
         EVK_ASSERT(!F.doingPresent, "CmdBeginPresent have already been called this frame.");
         F.doingPresent = true;
 
-        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, std::numeric_limits<uint64_t>().max(), F.imageReadySemaphore, 0, &S.swapchainIndex);
+        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, std::numeric_limits<uint64_t>().max(), F.imageReadySemaphore, 0, &F.swapchainIndex);
         if (r == VK_ERROR_OUT_OF_DATE_KHR) {
             F.doingPresent = false;
             S.frame = (int)S.frames.size() - 1;
@@ -1800,19 +1800,21 @@ namespace evk {
         if (r != VK_SUBOPTIMAL_KHR) {
             CHECK_VK(r);
         }
-        VkFence& imageFence = S.swapchainImageFences[S.swapchainIndex];
+        S.swapchainIndex = F.swapchainIndex;
+        VkFence& imageFence = S.swapchainImageFences[F.swapchainIndex];
         if (imageFence != VK_NULL_HANDLE) {
             CHECK_VK(vkWaitForFences(S.device, 1, &imageFence, true, std::numeric_limits<uint64_t>().max()));
         }
         imageFence = F.fence;
-        CmdBarrier(S.swapchainImages[S.swapchainIndex], ImageLayout::Undefined, ImageLayout::Attachment);
+        CmdBarrier(S.swapchainImages[F.swapchainIndex], ImageLayout::Undefined, ImageLayout::Attachment);
 
         ClearValue clears[] = {clearValue};
-        CmdBeginRender(&S.swapchainImages[S.swapchainIndex], clears, 1);
+        CmdBeginRender(&S.swapchainImages[F.swapchainIndex], clears, 1);
     }
     void CmdEndPresent() {
         CmdEndRender();
-        CmdBarrier(GetState().swapchainImages[GetState().swapchainIndex], ImageLayout::Attachment, ImageLayout::Present);
+        auto& S = GetState();
+        CmdBarrier(S.swapchainImages[GetFrame().swapchainIndex], ImageLayout::Attachment, ImageLayout::Present);
     }
     void CmdViewport(float x, float y, float w, float h, float minDepth, float maxDepth) {
         VkViewport viewport = {};

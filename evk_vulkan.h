@@ -41,6 +41,7 @@ namespace evk {
         VkSemaphore cmdDoneSemaphore;
         bool doingPresent = false;
         bool insideRenderPass = false;
+        uint32_t swapchainIndex = 0;
         VkFence fence;  // for the queue submit
 
         // performance queries
