@@ -111,7 +111,6 @@ namespace evk {
         VkSwapchainKHR swapchain;
         uint32_t swapchainIndex = 0;
         std::vector<Image> swapchainImages;
-        std::vector<VkFence> swapchainImageFences;
 
         std::vector<FrameData> frames = {};
         uint32_t frame = 0;

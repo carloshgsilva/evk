@@ -700,11 +700,6 @@ namespace evk {
         auto& S = GetState();
         auto& F = S.frames[frameIndex];
 
-        for (VkFence& imageFence : S.swapchainImageFences) {
-            if (imageFence == F.fence) {
-                imageFence = VK_NULL_HANDLE;
-            }
-        }
         CHECK_VK(vkWaitForFences(S.device, 1, &F.fence, true, std::numeric_limits<uint64_t>().max()));
         CHECK_VK(vkResetFences(S.device, 1, &F.fence));
         F.queries.resize(PERF_QUERY_COUNT);
@@ -1215,7 +1210,6 @@ namespace evk {
                 f.stagingBuffer.release();
             }
             S.swapchainImages.clear();
-            S.swapchainImageFences.clear();
             S.blasScratchBuffer.release();
             S.blasScratchBufferSize = 0;
         }
@@ -1341,8 +1335,6 @@ namespace evk {
         for (uint32_t i = 0; i < imageCount; i++) {
             S.swapchainImages.push_back(CreateImageForSwapchain(images[i], extent.width, extent.height));
         }
-        S.swapchainImageFences.clear();
-        S.swapchainImageFences.resize(imageCount, VK_NULL_HANDLE);
 
         for (auto sem : S.presentSemaphores) {
             vkDestroySemaphore(S.device, sem, nullptr);
@@ -1801,11 +1793,6 @@ namespace evk {
             CHECK_VK(r);
         }
         S.swapchainIndex = F.swapchainIndex;
-        VkFence& imageFence = S.swapchainImageFences[F.swapchainIndex];
-        if (imageFence != VK_NULL_HANDLE) {
-            CHECK_VK(vkWaitForFences(S.device, 1, &imageFence, true, std::numeric_limits<uint64_t>().max()));
-        }
-        imageFence = F.fence;
         CmdBarrier(S.swapchainImages[F.swapchainIndex], ImageLayout::Undefined, ImageLayout::Attachment);
 
         ClearValue clears[] = {clearValue};
