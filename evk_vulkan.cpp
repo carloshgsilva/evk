@@ -691,7 +691,6 @@ namespace evk {
             VkResult r = vkQueuePresentKHR(S.queue, &present);
 
             if (r == VK_ERROR_OUT_OF_DATE_KHR) {
-                S.frame = (int)S.frames.size() - 1;
                 RecreateSwapchain();
             }
         }
@@ -1026,6 +1025,11 @@ namespace evk {
                 VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
                 VK_KHR_RAY_QUERY_EXTENSION_NAME,
                 VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME,
+#if defined(NETRUNNER_ENABLE_STREAMLINE)
+                VK_NVX_BINARY_IMPORT_EXTENSION_NAME,
+                VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME,
+                VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+#endif
             };
 
 // Check device extensions support
@@ -1776,7 +1780,7 @@ namespace evk {
         GetFrame().insideRenderPass = false;
         vkCmdEndRendering(GetFrame().cmd);
     }
-    void CmdBeginPresent(ClearValue clearValue) {
+    bool CmdBeginPresent(ClearValue clearValue) {
         auto& F = GetFrame();
         auto& S = GetState();
         EVK_ASSERT(!F.doingPresent, "CmdBeginPresent have already been called this frame.");
@@ -1785,9 +1789,8 @@ namespace evk {
         VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, std::numeric_limits<uint64_t>().max(), F.imageReadySemaphore, 0, &F.swapchainIndex);
         if (r == VK_ERROR_OUT_OF_DATE_KHR) {
             F.doingPresent = false;
-            S.frame = (int)S.frames.size() - 1;
             RecreateSwapchain();
-            return;
+            return false;
         }
         if (r != VK_SUBOPTIMAL_KHR) {
             CHECK_VK(r);
@@ -1797,6 +1800,7 @@ namespace evk {
 
         ClearValue clears[] = {clearValue};
         CmdBeginRender(&S.swapchainImages[F.swapchainIndex], clears, 1);
+        return true;
     }
     void CmdEndPresent() {
         CmdEndRender();

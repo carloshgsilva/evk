@@ -382,7 +382,7 @@ namespace evk {
 
     void CmdBeginRender(Image* attachments, ClearValue* clearValues, int attachmentCount);
     void CmdEndRender();
-    void CmdBeginPresent(ClearValue clearValue = ClearValue(ClearColor{0.0f, 0.0f, 0.0f, 1.0f}));
+    bool CmdBeginPresent(ClearValue clearValue = ClearValue(ClearColor{0.0f, 0.0f, 0.0f, 1.0f}));
     void CmdEndPresent();
     void CmdViewport(float x, float y, float w, float h, float minDepth = 0.0f, float maxDepth = 1.0f);
     void CmdScissor(int32_t x, int32_t y, uint32_t w, uint32_t h);
@@ -410,9 +410,10 @@ namespace evk {
     }
     template <typename T>
     void CmdPresent(T callback) {
-        CmdBeginPresent();
-        callback();
-        CmdEndPresent();
+        if (CmdBeginPresent()) {
+            callback();
+            CmdEndPresent();
+        }
     }
     template <typename T>
     void CmdRender(std::initializer_list<Image> attachments, std::initializer_list<ClearValue> clearValues, T callback, ImageLayout finalLayout = ImageLayout::ShaderRead) {
