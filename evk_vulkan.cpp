@@ -4,6 +4,10 @@
 #include "vk_mem_alloc.h"
 #include "evk.h"
 
+#ifndef VK_EXT_METAL_SURFACE_EXTENSION_NAME
+#define VK_EXT_METAL_SURFACE_EXTENSION_NAME "VK_EXT_metal_surface"
+#endif
+
 namespace evk {
 
 #if EVK_DEBUG
@@ -104,7 +108,7 @@ namespace evk {
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,      // TransferSrc,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,      // TransferDst,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,  // ShaderRead,
-        VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR,    // Attachment,
+        VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,        // Attachment,
         VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,           // Present
     };
     const VkPrimitiveTopology PRIMITIVE_TOPOLOGY_VK[] = {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST};
@@ -132,6 +136,87 @@ namespace evk {
 
     bool RecreateSwapchain();
 
+    static bool HasFlag(BufferUsage usage, BufferUsage flag) {
+        return ((uint32_t)usage & (uint32_t)flag) != 0u;
+    }
+
+    static bool HasFlag(ImageUsage usage, ImageUsage flag) {
+        return ((uint32_t)usage & (uint32_t)flag) != 0u;
+    }
+
+    static void WriteBufferDescriptor(Internal_Buffer& buffer) {
+        auto& S = GetState();
+
+        EVK_ASSERT(buffer.resourceid == -1, "Buffer '%s' already has a bindless descriptor", buffer.desc.name.c_str());
+        EVK_ASSERT(HasFlag(buffer.desc.usage, BufferUsage::Storage), "Buffer '%s' must have BufferUsage::Storage", buffer.desc.name.c_str());
+
+        buffer.resourceid = S.bufferSlots.alloc();
+
+        VkDescriptorBufferInfo info = {};
+        info.buffer = buffer.buffer;
+        info.offset = 0;
+        info.range = buffer.desc.size;
+
+        VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.descriptorCount = 1;
+        write.pBufferInfo = &info;
+        write.dstSet = S.descriptorSet;
+        write.dstBinding = BINDING_STORAGE;
+        write.dstArrayElement = buffer.resourceid;
+        vkUpdateDescriptorSets(S.device, 1, &write, 0, nullptr);
+    }
+
+    static void WriteImageDescriptors(Internal_Image& image) {
+        auto& S = GetState();
+
+        EVK_ASSERT(image.resourceid == -1, "Image '%s' already has a bindless descriptor", image.desc.name.c_str());
+        EVK_ASSERT(HasFlag(image.desc.usage, ImageUsage::Sampled) || HasFlag(image.desc.usage, ImageUsage::Storage),
+                   "Image '%s' must have ImageUsage::Sampled or ImageUsage::Storage", image.desc.name.c_str());
+
+        image.resourceid = S.imageSlots.alloc();
+
+        VkDescriptorImageInfo imageInfos[2] = {};
+        VkWriteDescriptorSet writes[2] = {};
+        uint32_t writeCount = 0;
+
+        if (HasFlag(image.desc.usage, ImageUsage::Sampled)) {
+            VkDescriptorImageInfo& info = imageInfos[writeCount];
+            info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            info.imageView = image.view;
+            info.sampler = image.sampler;
+
+            VkWriteDescriptorSet& write = writes[writeCount++];
+            write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &info;
+            write.descriptorCount = 1;
+            write.dstSet = S.descriptorSet;
+            write.dstBinding = BINDING_SAMPLER;
+            write.dstArrayElement = image.resourceid;
+        }
+
+        if (HasFlag(image.desc.usage, ImageUsage::Storage)) {
+            VkDescriptorImageInfo& info = imageInfos[writeCount];
+            info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            info.imageView = image.view;
+            info.sampler = image.sampler;
+
+            VkWriteDescriptorSet& write = writes[writeCount++];
+            write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            write.pImageInfo = &info;
+            write.descriptorCount = 1;
+            write.dstSet = S.descriptorSet;
+            write.dstBinding = BINDING_IMAGE;
+            write.dstArrayElement = image.resourceid;
+        }
+
+        if (writeCount > 0) {
+            vkUpdateDescriptorSets(S.device, writeCount, writes, 0, nullptr);
+        }
+    }
+
     void Resource::decRef() {
         refCount--;
         if (refCount == 0) {
@@ -142,12 +227,16 @@ namespace evk {
     RID ResourceRef::GetRID() const {
         EVK_ASSERT(res != nullptr, "Trying to get resource id of invalid resource");
 
-        EVK_ASSERT(!dynamic_cast<Internal_Image*>(res) || ((uint32_t) dynamic_cast<Internal_Image*>(res)->desc.usage & (uint32_t)ImageUsage::Sampled || (uint32_t) dynamic_cast<Internal_Image*>(res)->desc.usage & (uint32_t)ImageUsage::Storage),
-                   "Image '%s' must have ImageUsage::Sampled or ImageUsage::Storage", dynamic_cast<Internal_Image*>(res)->desc.name.c_str());
+        if (auto* image = dynamic_cast<Internal_Image*>(res)) {
+            EVK_ASSERT(HasFlag(image->desc.usage, ImageUsage::Sampled) || HasFlag(image->desc.usage, ImageUsage::Storage),
+                       "Image '%s' must have ImageUsage::Sampled or ImageUsage::Storage", image->desc.name.c_str());
+        }
 
-        EVK_ASSERT(!dynamic_cast<Internal_Buffer*>(res) || ((uint32_t) dynamic_cast<Internal_Buffer*>(res)->desc.usage & (uint32_t)BufferUsage::Storage), "Buffer '%s' must have BufferUsage::Storage",
-                   dynamic_cast<Internal_Buffer*>(res)->desc.name.c_str());
+        if (auto* buffer = dynamic_cast<Internal_Buffer*>(res)) {
+            EVK_ASSERT(HasFlag(buffer->desc.usage, BufferUsage::Storage), "Buffer '%s' must have BufferUsage::Storage", buffer->desc.name.c_str());
+        }
 
+        EVK_ASSERT(res->resourceid != -1, "Resource does not have a bindless descriptor");
         return res->resourceid;
     }
 
@@ -157,6 +246,7 @@ namespace evk {
     Buffer CreateBuffer(const BufferDesc& desc) {
         auto& S = GetState();
         Internal_Buffer* res = new Internal_Buffer();
+        res->resourceid = -1;
 
         EVK_ASSERT(desc.size != 0, "Buffer size must not be zero");
 
@@ -164,14 +254,16 @@ namespace evk {
         res->desc = desc;
 
         VkBufferUsageFlags usageBits{};
-        if ((int)(desc.usage | BufferUsage::TransferSrc)) usageBits |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        if ((int)(desc.usage | BufferUsage::TransferDst)) usageBits |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        if ((int)(desc.usage | BufferUsage::Vertex)) usageBits |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-        if ((int)(desc.usage | BufferUsage::Index)) usageBits |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-        if ((int)(desc.usage | BufferUsage::Indirect)) usageBits |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
-        if ((int)(desc.usage | BufferUsage::Storage)) usageBits |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        if ((int)(desc.usage | BufferUsage::AccelerationStructure)) usageBits |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
-        if ((int)(desc.usage | BufferUsage::AccelerationStructureInput)) usageBits |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        if (HasFlag(desc.usage, BufferUsage::TransferSrc)) usageBits |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        if (HasFlag(desc.usage, BufferUsage::TransferDst)) usageBits |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (HasFlag(desc.usage, BufferUsage::Vertex)) usageBits |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        if (HasFlag(desc.usage, BufferUsage::Index)) usageBits |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+        if (HasFlag(desc.usage, BufferUsage::Indirect)) usageBits |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        if (HasFlag(desc.usage, BufferUsage::Storage)) usageBits |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if (S.rayTracingEnabled) {
+            if (HasFlag(desc.usage, BufferUsage::AccelerationStructure)) usageBits |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
+            if (HasFlag(desc.usage, BufferUsage::AccelerationStructureInput)) usageBits |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        }
         if (desc.memoryType == MemoryType::GPU || desc.memoryType == MemoryType::CPU_TO_GPU) {
             usageBits |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         }
@@ -209,24 +301,8 @@ namespace evk {
         GetState().vkSetDebugUtilsObjectNameEXT(GetState().device, &name);
 #endif
 
-        // Alloc descriptor index
-        {
-            res->resourceid = S.bufferSlots.alloc();
-
-            VkDescriptorBufferInfo info = {};
-            info.buffer = res->buffer;
-            info.offset = 0;
-            info.range = res->desc.size;
-
-            VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            write.descriptorCount = 1;
-            write.pBufferInfo = &info;
-            write.dstSet = S.descriptorSet;
-            write.dstBinding = BINDING_STORAGE;
-            write.dstArrayElement = res->resourceid;
-
-            vkUpdateDescriptorSets(S.device, 1, &write, 0, nullptr);
+        if (HasFlag(desc.usage, BufferUsage::Storage)) {
+            WriteBufferDescriptor(*res);
         }
 
         return Buffer(res);
@@ -307,6 +383,7 @@ namespace evk {
     Image CreateImage(const ImageDesc& desc) {
         auto& S = GetState();
         Internal_Image* res = new Internal_Image();
+        res->resourceid = -1;
 
         EVK_ASSERT(desc.format != Format::Undefined, "Image '%s' format is Undefined, did you forgot to set the format?", desc.name.c_str());
 
@@ -355,43 +432,8 @@ namespace evk {
 
         InitializeImageView(res);
 
-        // Alloc descriptor index
-        {
-            res->resourceid = S.imageSlots.alloc();
-
-            // Bind for Sampler
-            if ((int)desc.usage & (int)ImageUsage::Sampled) {
-                VkDescriptorImageInfo info = {};
-                info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                info.imageView = res->view;
-                info.sampler = res->sampler;
-
-                VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                write.pImageInfo = &info;
-                write.descriptorCount = 1;
-                write.dstSet = S.descriptorSet;
-                write.dstBinding = BINDING_SAMPLER;
-                write.dstArrayElement = res->resourceid;
-                vkUpdateDescriptorSets(S.device, 1, &write, 0, nullptr);
-            }
-
-            // Bind for Storage
-            if ((int)usage & (int)ImageUsage::Storage) {
-                VkDescriptorImageInfo info = {};
-                info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-                info.imageView = res->view;
-                info.sampler = res->sampler;
-
-                VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                write.pImageInfo = &info;
-                write.descriptorCount = 1;
-                write.dstSet = S.descriptorSet;
-                write.dstBinding = BINDING_IMAGE;
-                write.dstArrayElement = res->resourceid;
-                vkUpdateDescriptorSets(S.device, 1, &write, 0, nullptr);
-            }
+        if (HasFlag(desc.usage, ImageUsage::Sampled) || HasFlag(desc.usage, ImageUsage::Storage)) {
+            WriteImageDescriptors(*res);
         }
 
         return Image(res);
@@ -573,7 +615,7 @@ namespace evk {
         dynamicStateInfo.dynamicStateCount = (uint32_t)dynamicState.size();
         dynamicStateInfo.pDynamicStates = dynamicState.data();
 
-        VkPipelineRenderingCreateInfoKHR renderingCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+        VkPipelineRenderingCreateInfo renderingCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         renderingCreateInfo.colorAttachmentCount = renderingColorAttachmentCount;
         renderingCreateInfo.pColorAttachmentFormats = renderingFormats;
         renderingCreateInfo.depthAttachmentFormat = renderingDepthStencilFormat;
@@ -705,6 +747,11 @@ namespace evk {
         GState = new State();
         State& S = GetState();
 
+        S.storageCount = desc.bindless.storageBufferCount;
+        S.imageCount = desc.bindless.imageCount;
+        S.samplerCount = desc.bindless.imageCount;
+        S.tlasCount = desc.bindless.tlasCount;
+
         // Application and Instance
         {
             // Application Info
@@ -715,16 +762,43 @@ namespace evk {
             appInfo.pEngineName = desc.engineName.c_str();
             appInfo.engineVersion = desc.engineVersion;
 
-            
-            std::vector<std::string> instanceLayers = {};
-            std::vector<std::string> instanceExtensions = {};
+
+            auto addUnique = [](std::vector<std::string>& list, const char* name) {
+                if (!name || !name[0]) return;
+                for (auto& s : list) {
+                    if (s == name) return;
+                }
+                list.push_back(name);
+            };
+
+            auto isInstanceExtensionSupported = [](const char* name) {
+                uint32_t count = 0;
+                if (vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr) != VK_SUCCESS) return false;
+                std::vector<VkExtensionProperties> props;
+                props.resize(count);
+                if (vkEnumerateInstanceExtensionProperties(nullptr, &count, props.data()) != VK_SUCCESS) return false;
+                for (const auto& p : props) {
+                    if (strcmp(p.extensionName, name) == 0) return true;
+                }
+                return false;
+            };
+
+            std::vector<std::string> instanceLayers = desc.instanceLayers;
+            std::vector<std::string> instanceExtensions = desc.instanceExtensions;
 
             if (desc.enableSwapchain) {
-                instanceExtensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
-                #if WIN32
-                    instanceExtensions.push_back("VK_KHR_win32_surface");
+                addUnique(instanceExtensions, VK_KHR_SURFACE_EXTENSION_NAME);
+
+                #if defined(_WIN32)
+                    addUnique(instanceExtensions, VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+                #elif defined(__APPLE__)
+                    if (isInstanceExtensionSupported(VK_EXT_METAL_SURFACE_EXTENSION_NAME)) {
+                        addUnique(instanceExtensions, VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+                    } else {
+                        EVK_ASSERT(false, "No supported macOS Vulkan surface extension found (need %s)", VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+                    }
                 #else
-                    #error "Unsupported platform"
+                    // Other platforms must provide the correct surface extension via EvkDesc::instanceExtensions.
                 #endif
             }
 
@@ -790,7 +864,6 @@ namespace evk {
             instanceci.enabledLayerCount = uint32_t(layers.size());
             instanceci.ppEnabledLayerNames = layers.data();
 
-
             CHECK_VK(vkCreateInstance(&instanceci, nullptr, &S.instance));
 
 #if EVK_DEBUG
@@ -827,8 +900,7 @@ namespace evk {
             // PhysicalDevice properties
             VkPhysicalDeviceProperties props = {};
             vkGetPhysicalDeviceProperties(S.physicalDevice, &props);
-            EVK_ASSERT(props.limits.timestampComputeAndGraphics, "Timestamp not supported!");
-
+            EVK_ASSERT(props.apiVersion >= VK_API_VERSION_1_3, "EVK requires Vulkan 1.3");
             S.timestampPeriod = props.limits.timestampPeriod;
 
             printf("[evk] Vulkan %d.%d.%d | %s \n", VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion), props.deviceName);
@@ -846,6 +918,8 @@ namespace evk {
                 }
                 S.queueFamily++;
             }
+            EVK_ASSERT(S.queueFamily < familyProps.size(), "could not find graphics queue family!");
+            S.timestampsEnabled = familyProps[S.queueFamily].timestampValidBits != 0;
 
             float priority0 = 1.0f;
             VkDeviceQueueCreateInfo deviceQueueci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -853,27 +927,20 @@ namespace evk {
             deviceQueueci.queueCount = 1;
             deviceQueueci.pQueuePriorities = &priority0;
 
-            // Device features
+            // Base device features (only enable what the device reports as supported)
+            VkPhysicalDeviceFeatures supportedBase = {};
+            vkGetPhysicalDeviceFeatures(S.physicalDevice, &supportedBase);
+
             VkPhysicalDeviceFeatures features = {};
-            features.geometryShader = true;
-            features.shaderInt64 = true;
-            features.fillModeNonSolid = true;
-            features.shaderStorageImageReadWithoutFormat = true;
-            features.shaderStorageImageWriteWithoutFormat = true;
-            features.independentBlend = true;
-            features.wideLines = true;
+            features.geometryShader = supportedBase.geometryShader;
+            features.shaderInt64 = supportedBase.shaderInt64;
+            features.fillModeNonSolid = supportedBase.fillModeNonSolid;
+            features.shaderStorageImageReadWithoutFormat = supportedBase.shaderStorageImageReadWithoutFormat;
+            features.shaderStorageImageWriteWithoutFormat = supportedBase.shaderStorageImageWriteWithoutFormat;
+            features.independentBlend = supportedBase.independentBlend;
+            features.wideLines = supportedBase.wideLines;
 
-            std::vector<const char*> deviceExtensions = {
-                VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
-                VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
-
-                VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
-                VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
-                VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
-                VK_KHR_RAY_QUERY_EXTENSION_NAME,
-                VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME,
-                VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME,
-            };
+            std::vector<const char*> deviceExtensions = {};
 
             // Query supported device extensions so we can conditionally enable optional ones
             std::vector<VkExtensionProperties> supportedExtensions;
@@ -889,6 +956,38 @@ namespace evk {
                 return false;
             };
 
+            auto addDeviceExtensionIfSupported = [&](const char* name) {
+                if (!isExtensionSupported(name)) return;
+                for (auto* e : deviceExtensions) {
+                    if (strcmp(e, name) == 0) return;
+                }
+                deviceExtensions.push_back(name);
+            };
+
+            // Query supported feature structs so we only request what is available.
+            VkPhysicalDeviceFeatures2 supportedFeatures2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            VkPhysicalDeviceVulkan12Features supported12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+            VkPhysicalDeviceVulkan13Features supported13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+            VkPhysicalDevice16BitStorageFeatures supported16Bit = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};
+            VkPhysicalDeviceShaderAtomicFloatFeaturesEXT supportedAtomicFloat = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
+            VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT supportedImgAtomicInt64 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};
+            VkPhysicalDeviceAccelerationStructureFeaturesKHR supportedAS = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+            VkPhysicalDeviceRayTracingPipelineFeaturesKHR supportedRTPipe = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
+            VkPhysicalDeviceRayQueryFeaturesKHR supportedRayQuery = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+            VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR supportedRTPosFetch = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR};
+
+            supportedFeatures2.pNext = &supported12;
+            supported12.pNext = &supported13;
+            supported13.pNext = &supported16Bit;
+            supported16Bit.pNext = &supportedAtomicFloat;
+            supportedAtomicFloat.pNext = &supportedImgAtomicInt64;
+            supportedImgAtomicInt64.pNext = &supportedAS;
+            supportedAS.pNext = &supportedRTPipe;
+            supportedRTPipe.pNext = &supportedRayQuery;
+            supportedRayQuery.pNext = &supportedRTPosFetch;
+            supportedRTPosFetch.pNext = nullptr;
+            vkGetPhysicalDeviceFeatures2(S.physicalDevice, &supportedFeatures2);
+
             // Common feature struct for pNext chaining
             struct VkFeature {
                 VkStructureType    sType;
@@ -900,76 +999,126 @@ namespace evk {
                 pNext_lastFeature = (VkFeature*)&feature;
             };
             
-            VkPhysicalDeviceShaderAtomicFloatFeaturesEXT feature_atomicFloat = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
-                .shaderBufferFloat32Atomics = true,
-                .shaderBufferFloat32AtomicAdd = true,
-            };
-            add_feature(feature_atomicFloat);
-            VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT feature_imageatomicint64 = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT,
-                .shaderImageInt64Atomics = true,
-            };
-            add_feature(feature_imageatomicint64);
-            VkPhysicalDevice16BitStorageFeatures feature_16bitStorage = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
-                .storageBuffer16BitAccess = true,
-                .uniformAndStorageBuffer16BitAccess = true,
-            };
+            // Optional: atomic float support
+            VkPhysicalDeviceShaderAtomicFloatFeaturesEXT feature_atomicFloat = supportedAtomicFloat;
+            if (isExtensionSupported(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
+                addDeviceExtensionIfSupported(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+                add_feature(feature_atomicFloat);
+            }
+
+            // Optional: image atomic int64 support
+            VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT feature_imageatomicint64 = supportedImgAtomicInt64;
+            if (isExtensionSupported(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME)) {
+                addDeviceExtensionIfSupported(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+                add_feature(feature_imageatomicint64);
+            }
+            VkPhysicalDevice16BitStorageFeatures feature_16bitStorage = supported16Bit;
             add_feature(feature_16bitStorage);
 
             // Vulkan 1.2 features
-            VkPhysicalDeviceVulkan12Features feature_vulkan12 = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-                .storageBuffer8BitAccess = VK_TRUE,
-                .shaderBufferInt64Atomics = VK_TRUE,
-                .shaderSharedInt64Atomics = VK_TRUE,
-                .shaderFloat16 = VK_TRUE,
-                .descriptorIndexing = VK_TRUE,
-                .shaderSampledImageArrayNonUniformIndexing = true,
-                .shaderStorageBufferArrayNonUniformIndexing = true,
-                .shaderStorageImageArrayNonUniformIndexing = true,
-                .descriptorBindingSampledImageUpdateAfterBind = true,
-                .descriptorBindingStorageImageUpdateAfterBind = true,
-                .descriptorBindingStorageBufferUpdateAfterBind = true,
-                .descriptorBindingUpdateUnusedWhilePending = true,
-                .descriptorBindingPartiallyBound = true,
-                .runtimeDescriptorArray = true,
-                .bufferDeviceAddress = VK_TRUE,
-                .vulkanMemoryModel = VK_TRUE,
-                .vulkanMemoryModelDeviceScope = VK_TRUE,
-            };
+            VkPhysicalDeviceVulkan12Features feature_vulkan12 = supported12;
+            VkPhysicalDeviceVulkan13Features feature_vulkan13 = supported13;
+            VkPhysicalDeviceRayTracingPipelineFeaturesKHR feature_rayTracingPipeline = supportedRTPipe;
+            VkPhysicalDeviceAccelerationStructureFeaturesKHR feature_accelerationStructure = supportedAS;
+            VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR feature_rtPositionFetch = supportedRTPosFetch;
+            VkPhysicalDeviceRayQueryFeaturesKHR feature_rayQuery = supportedRayQuery;
+
+            EVK_ASSERT(supported12.runtimeDescriptorArray, "EVK requires runtimeDescriptorArray (bindless) support");
+            EVK_ASSERT(supported12.shaderSampledImageArrayNonUniformIndexing, "EVK requires non-uniform indexing of sampled images");
+            EVK_ASSERT(supported12.shaderStorageBufferArrayNonUniformIndexing, "EVK requires non-uniform indexing of storage buffers");
+            EVK_ASSERT(supported12.shaderStorageImageArrayNonUniformIndexing, "EVK requires non-uniform indexing of storage images");
+            EVK_ASSERT(supported12.descriptorBindingPartiallyBound, "EVK requires descriptorBindingPartiallyBound support");
+            EVK_ASSERT(supported12.descriptorBindingUpdateUnusedWhilePending, "EVK requires descriptorBindingUpdateUnusedWhilePending support");
+            EVK_ASSERT(supported12.descriptorBindingStorageBufferUpdateAfterBind, "EVK requires descriptorBindingStorageBufferUpdateAfterBind support");
+            EVK_ASSERT(supported12.descriptorBindingSampledImageUpdateAfterBind, "EVK requires descriptorBindingSampledImageUpdateAfterBind support");
+            EVK_ASSERT(supported12.descriptorBindingStorageImageUpdateAfterBind, "EVK requires descriptorBindingStorageImageUpdateAfterBind support");
             add_feature(feature_vulkan12);
-            VkPhysicalDeviceVulkan13Features feature_vulkan13 = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-                .synchronization2 = true,
-                .dynamicRendering = true,
-            };
+
+            EVK_ASSERT(supported13.dynamicRendering, "EVK requires Vulkan 1.3 dynamicRendering support");
+            EVK_ASSERT(supported13.synchronization2, "EVK requires Vulkan 1.3 synchronization2 support");
+            feature_vulkan13.dynamicRendering = VK_TRUE;
+            feature_vulkan13.synchronization2 = VK_TRUE;
             add_feature(feature_vulkan13);
 
-            // Ray Tracing features
-            VkPhysicalDeviceRayTracingPipelineFeaturesKHR feature_rayTracingPipeline = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
-                .rayTracingPipeline = VK_TRUE,
-            };
-            add_feature(feature_rayTracingPipeline);
-            VkPhysicalDeviceAccelerationStructureFeaturesKHR feature_accelerationStructure = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
-                .accelerationStructure = VK_TRUE,
-                .accelerationStructureCaptureReplay = VK_TRUE,
-                .descriptorBindingAccelerationStructureUpdateAfterBind = VK_TRUE,
-            };
-            add_feature(feature_accelerationStructure);
-            VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR feature_rtPositionFetch = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR,
-                .rayTracingPositionFetch = true,
-            };
-            add_feature(feature_rtPositionFetch);
-            VkPhysicalDeviceRayQueryFeaturesKHR feature_rayQuery = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
-                .rayQuery = VK_TRUE,
-            };
-            add_feature(feature_rayQuery);
+            // Ray tracing: only enable if requested and supported.
+            const bool wantRayTracing = desc.enableRayTracing;
+            const bool canRayTracing =
+                wantRayTracing &&
+                isExtensionSupported(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) &&
+                isExtensionSupported(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+                isExtensionSupported(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) &&
+                isExtensionSupported(VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+                isExtensionSupported(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME) &&
+                supportedAS.accelerationStructure &&
+                supportedRTPipe.rayTracingPipeline &&
+                supportedRayQuery.rayQuery &&
+                supportedRTPosFetch.rayTracingPositionFetch &&
+                supported12.bufferDeviceAddress;
+
+            S.rayTracingEnabled = canRayTracing;
+
+            {
+                VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+                VkPhysicalDeviceDescriptorIndexingProperties indexingProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES};
+                props2.pNext = &indexingProps;
+                vkGetPhysicalDeviceProperties2(S.physicalDevice, &props2);
+
+                auto clampTo = [](uint32_t value, uint32_t maxVal) {
+                    if (maxVal == 0) return value;
+                    return value > maxVal ? maxVal : value;
+                };
+                auto min3 = [](uint32_t a, uint32_t b, uint32_t c) {
+                    return std::min(a, std::min(b, c));
+                };
+
+                // Descriptor set + per-stage limits.
+                uint32_t maxSetStorage = indexingProps.maxDescriptorSetUpdateAfterBindStorageBuffers;
+                uint32_t maxStageStorage = indexingProps.maxPerStageDescriptorUpdateAfterBindStorageBuffers;
+                uint32_t maxSetStorageImages = indexingProps.maxDescriptorSetUpdateAfterBindStorageImages;
+                uint32_t maxStageStorageImages = indexingProps.maxPerStageDescriptorUpdateAfterBindStorageImages;
+                uint32_t maxSetSampled = indexingProps.maxDescriptorSetUpdateAfterBindSampledImages;
+                uint32_t maxStageSampled = indexingProps.maxPerStageDescriptorUpdateAfterBindSampledImages;
+                uint32_t maxSetSamplers = indexingProps.maxDescriptorSetUpdateAfterBindSamplers;
+                uint32_t maxStageSamplers = indexingProps.maxPerStageDescriptorUpdateAfterBindSamplers;
+
+                const uint32_t storageHardMax = std::min(maxSetStorage, maxStageStorage);
+                const uint32_t storageImageHardMax = std::min(maxSetStorageImages, maxStageStorageImages);
+                const uint32_t sampledHardMax = min3(maxSetSampled, maxStageSampled, std::min(maxSetSamplers, maxStageSamplers));
+
+                const uint32_t requestedStorage = S.storageCount;
+                const uint32_t requestedImages = S.imageCount;
+                const uint32_t requestedTLAS = S.rayTracingEnabled ? S.tlasCount : 0;
+
+                S.storageCount = clampTo(requestedStorage, storageHardMax);
+                S.imageCount = clampTo(requestedImages, std::min(storageImageHardMax, sampledHardMax));
+                if (S.imageCount == 0) S.imageCount = 1;
+                S.samplerCount = S.imageCount;
+                S.tlasCount = requestedTLAS;
+
+                if (S.storageCount == 0) S.storageCount = 1;
+
+                // Init slot allocators to the final clamped counts.
+                S.bufferSlots = SlotAllocator((int)S.storageCount);
+                S.imageSlots = SlotAllocator((int)S.imageCount);
+                S.tlasSlots = SlotAllocator((int)S.tlasCount);
+            }
+            if (S.rayTracingEnabled) {
+                addDeviceExtensionIfSupported(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+                addDeviceExtensionIfSupported(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+                addDeviceExtensionIfSupported(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+                addDeviceExtensionIfSupported(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+                addDeviceExtensionIfSupported(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
+                addDeviceExtensionIfSupported(VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME);
+
+                add_feature(feature_rayTracingPipeline);
+                add_feature(feature_accelerationStructure);
+                if (isExtensionSupported(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME)) {
+                    add_feature(feature_rtPositionFetch);
+                }
+                if (isExtensionSupported(VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
+                    add_feature(feature_rayQuery);
+                }
+            }
 
             // Cooperative Matrix features
             VkPhysicalDeviceCooperativeMatrixFeaturesKHR feature_coop = {
@@ -983,6 +1132,7 @@ namespace evk {
 
             // Conditionally enable swapchain device extension only if swapchain support requested
             if (desc.enableSwapchain) {
+                EVK_ASSERT(isExtensionSupported(VK_KHR_SWAPCHAIN_EXTENSION_NAME), "Device extension '%s' not found!", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
                 deviceExtensions.insert(deviceExtensions.begin(), VK_KHR_SWAPCHAIN_EXTENSION_NAME);
             }
 
@@ -1019,6 +1169,7 @@ namespace evk {
             EVK_PFN(vkCmdBeginDebugUtilsLabelEXT);
             EVK_PFN(vkCmdEndDebugUtilsLabelEXT);
             EVK_PFN(vkSetDebugUtilsObjectNameEXT);
+            #undef EVK_PFN
         }
 
         // Vma Allocator
@@ -1032,19 +1183,30 @@ namespace evk {
             vmaCreateAllocator(&allocatorInfo, &S.allocator);
         }
 
-        // Descriptors
+        // Descriptors / pipeline layout
         {
+            VkPushConstantRange pushc = {};
+            pushc.offset = 0;
+            pushc.size = 128;
+            pushc.stageFlags = VK_SHADER_STAGE_ALL;
+
+            VkPipelineLayoutCreateInfo layoutci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layoutci.pushConstantRangeCount = 1;
+            layoutci.pPushConstantRanges = &pushc;
+
             // layout(binding = 0) buffer //
             // layout(binding = 1) sampler //
             // layout(binding = 2) image //
 
             // Create descriptor pool
             std::vector<VkDescriptorPoolSize> poolSizes = {
-                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, STORAGE_COUNT},
-                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SAMPLER_COUNT},
-                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, IMAGE_COUNT},
-                {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, TLAS_COUNT},
+                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, S.storageCount},
+                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, S.samplerCount},
+                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, S.imageCount},
             };
+            if (S.rayTracingEnabled) {
+                poolSizes.push_back({VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, S.tlasCount});
+            }
             VkDescriptorPoolCreateInfo poolci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
             poolci.poolSizeCount = (uint32_t)poolSizes.size();
             poolci.pPoolSizes = poolSizes.data();
@@ -1054,20 +1216,29 @@ namespace evk {
 
             // Create layout set
             std::vector<VkDescriptorSetLayoutBinding> bindings = {
-                {BINDING_STORAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, STORAGE_COUNT, VK_SHADER_STAGE_ALL},
-                {BINDING_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SAMPLER_COUNT, VK_SHADER_STAGE_ALL},
-                {BINDING_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, IMAGE_COUNT, VK_SHADER_STAGE_ALL},
-                {BINDING_TLAS, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, TLAS_COUNT, VK_SHADER_STAGE_ALL},
+                {BINDING_STORAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, S.storageCount, VK_SHADER_STAGE_ALL},
+                {BINDING_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, S.samplerCount, VK_SHADER_STAGE_ALL},
+                {BINDING_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, S.imageCount, VK_SHADER_STAGE_ALL},
             };
+            if (S.rayTracingEnabled) {
+                bindings.push_back({BINDING_TLAS, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, S.tlasCount, VK_SHADER_STAGE_ALL});
+            }
 
-            // Flag each binding as partially bound and update after bind
+            // Flag each binding for descriptor indexing.
             VkDescriptorSetLayoutBindingFlagsCreateInfo setLayoutBindingsFlags = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
-            std::vector<VkDescriptorBindingFlags> bindingFlags = {
-                VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
-                VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
-                VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
-                VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
+            std::vector<VkDescriptorBindingFlags> bindingFlags;
+            const VkDescriptorBindingFlags baseFlags =
+                VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+            bindingFlags = {
+                baseFlags,
+                baseFlags,
+                baseFlags,
             };
+            if (S.rayTracingEnabled) {
+                bindingFlags.push_back(baseFlags);
+            }
             setLayoutBindingsFlags.bindingCount = (uint32_t)bindingFlags.size();
             setLayoutBindingsFlags.pBindingFlags = bindingFlags.data();
 
@@ -1078,16 +1249,9 @@ namespace evk {
             setLayoutci.pNext = &setLayoutBindingsFlags;
             CHECK_VK(vkCreateDescriptorSetLayout(S.device, &setLayoutci, nullptr, &S.descriptorSetLayout));
 
-            VkPushConstantRange pushc = {};
-            pushc.offset = 0;
-            pushc.size = 128;
-            pushc.stageFlags = VK_SHADER_STAGE_ALL;
-
-            VkPipelineLayoutCreateInfo layoutci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
             layoutci.setLayoutCount = 1;
             layoutci.pSetLayouts = &S.descriptorSetLayout;
-            layoutci.pushConstantRangeCount = 1;
-            layoutci.pPushConstantRanges = &pushc;
+
             CHECK_VK(vkCreatePipelineLayout(S.device, &layoutci, nullptr, &S.pipelineLayout));
 
             // Allocate single global descriptor set
@@ -1119,10 +1283,12 @@ namespace evk {
                 fenceci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
                 CHECK_VK(vkCreateFence(S.device, &fenceci, nullptr, &cb.fence));
 
-                VkQueryPoolCreateInfo queryPoolci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-                queryPoolci.queryCount = PERF_QUERY_COUNT;
-                queryPoolci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-                CHECK_VK(vkCreateQueryPool(S.device, &queryPoolci, nullptr, &cb.queryPool));
+                if (S.timestampsEnabled) {
+                    VkQueryPoolCreateInfo queryPoolci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                    queryPoolci.queryCount = PERF_QUERY_COUNT;
+                    queryPoolci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                    CHECK_VK(vkCreateQueryPool(S.device, &queryPoolci, nullptr, &cb.queryPool));
+                }
 
                 // Create semaphores for swapchain synchronization
                 VkSemaphoreCreateInfo semaphoreci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -1141,17 +1307,25 @@ namespace evk {
         }
 
         // Raytracing
-        {
+        if (S.rayTracingEnabled) {
             VkDevice device = GetState().device;
             GetState().vkGetAccelerationStructureBuildSizesKHR = (PFN_vkGetAccelerationStructureBuildSizesKHR)vkGetDeviceProcAddr(device, "vkGetAccelerationStructureBuildSizesKHR");
             GetState().vkCreateAccelerationStructureKHR = (PFN_vkCreateAccelerationStructureKHR)vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR");
-            GetState().vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)vkGetDeviceProcAddr(device, "vkGetBufferDeviceAddressKHR");
             GetState().vkCmdBuildAccelerationStructuresKHR = (PFN_vkCmdBuildAccelerationStructuresKHR)vkGetDeviceProcAddr(device, "vkCmdBuildAccelerationStructuresKHR");
             GetState().vkGetAccelerationStructureDeviceAddressKHR = (PFN_vkGetAccelerationStructureDeviceAddressKHR)vkGetDeviceProcAddr(device, "vkGetAccelerationStructureDeviceAddressKHR");
             GetState().vkCreateRayTracingPipelinesKHR = (PFN_vkCreateRayTracingPipelinesKHR)vkGetDeviceProcAddr(device, "vkCreateRayTracingPipelinesKHR");
             GetState().vkGetRayTracingShaderGroupHandlesKHR = (PFN_vkGetRayTracingShaderGroupHandlesKHR)vkGetDeviceProcAddr(device, "vkGetRayTracingShaderGroupHandlesKHR");
             GetState().vkCmdTraceRaysKHR = (PFN_vkCmdTraceRaysKHR)vkGetDeviceProcAddr(device, "vkCmdTraceRaysKHR");
             GetState().vkDestroyAccelerationStructureKHR = (PFN_vkDestroyAccelerationStructureKHR)vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR");
+        } else {
+            GetState().vkGetAccelerationStructureBuildSizesKHR = nullptr;
+            GetState().vkCreateAccelerationStructureKHR = nullptr;
+            GetState().vkCmdBuildAccelerationStructuresKHR = nullptr;
+            GetState().vkGetAccelerationStructureDeviceAddressKHR = nullptr;
+            GetState().vkCreateRayTracingPipelinesKHR = nullptr;
+            GetState().vkGetRayTracingShaderGroupHandlesKHR = nullptr;
+            GetState().vkCmdTraceRaysKHR = nullptr;
+            GetState().vkDestroyAccelerationStructureKHR = nullptr;
         }
 
         return true;
@@ -1217,7 +1391,9 @@ namespace evk {
 
         // Now destroy command buffer Vulkan resources (including semaphores)
         for (auto& cb : S.commandBuffers) {
-            vkDestroyQueryPool(S.device, cb.queryPool, nullptr);
+            if (cb.queryPool != VK_NULL_HANDLE) {
+                vkDestroyQueryPool(S.device, cb.queryPool, nullptr);
+            }
             vkDestroyFence(S.device, cb.fence, nullptr);
             vkDestroySemaphore(S.device, cb.imageReadySemaphore, nullptr);
             vkDestroySemaphore(S.device, cb.cmdDoneSemaphore, nullptr);
@@ -1257,6 +1433,7 @@ namespace evk {
     Image CreateImageForSwapchain(VkImage image, uint32_t width, uint32_t height) {
         auto& S = GetState();
         Internal_Image* res = new Internal_Image();
+        res->resourceid = -1;
 
         res->desc.name = "Swapchain color image";
         res->desc.format = Format::BGRA8Unorm;
@@ -1305,6 +1482,23 @@ namespace evk {
         CHECK_VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(S.physicalDevice, S.surface, &surfaceCaps));
         VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
         VkColorSpaceKHR colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        {
+            uint32_t presentModeCount = 0;
+            CHECK_VK(vkGetPhysicalDeviceSurfacePresentModesKHR(S.physicalDevice, S.surface, &presentModeCount, nullptr));
+            std::vector<VkPresentModeKHR> presentModes(presentModeCount);
+            CHECK_VK(vkGetPhysicalDeviceSurfacePresentModesKHR(S.physicalDevice, S.surface, &presentModeCount, presentModes.data()));
+
+            for (VkPresentModeKHR mode : presentModes) {
+                if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+                    presentMode = mode;
+                    break;
+                }
+                if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                    presentMode = mode;
+                }
+            }
+        }
         uint32_t imageCount = surfaceCaps.minImageCount < 2 ? 2 : surfaceCaps.minImageCount;
         if (surfaceCaps.maxImageCount > 0 && imageCount > surfaceCaps.maxImageCount) {
             imageCount = surfaceCaps.maxImageCount;
@@ -1324,7 +1518,7 @@ namespace evk {
             .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
             .preTransform = transform,
             .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-            .presentMode = VK_PRESENT_MODE_MAILBOX_KHR,
+            .presentMode = presentMode,
             .clipped = false,
             .oldSwapchain = oldSwapchain,
         };
@@ -1382,6 +1576,11 @@ namespace evk {
     static void ReadTimestampsFromCommandBuffer(CommandBufferData& cb) {
         auto& S = GetState();
         
+        if (!S.timestampsEnabled || cb.queryPool == VK_NULL_HANDLE) {
+            S.lastTimestamps.clear();
+            return;
+        }
+
         if (cb.timestampNames.empty()) {
             S.lastTimestamps.clear();
             return;
@@ -1497,7 +1696,9 @@ namespace evk {
         cmdbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         CHECK_VK(vkBeginCommandBuffer(cmdData->cmd, &cmdbi));
         
-        vkCmdResetQueryPool(cmdData->cmd, cmdData->queryPool, 0, PERF_QUERY_COUNT);
+        if (S.timestampsEnabled) {
+            vkCmdResetQueryPool(cmdData->cmd, cmdData->queryPool, 0, PERF_QUERY_COUNT);
+        }
         vkCmdBindDescriptorSets(cmdData->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, S.pipelineLayout, 0, 1, &S.descriptorSet, 0, nullptr);
         vkCmdBindDescriptorSets(cmdData->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pipelineLayout, 0, 1, &S.descriptorSet, 0, nullptr);
         
@@ -1595,7 +1796,7 @@ namespace evk {
         VkImageLayout oLayout = IMAGE_LAYOUT_VK[(int)oldLayout];
         VkImageLayout nLayout = IMAGE_LAYOUT_VK[(int)newLayout];
 
-        VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        VkImageMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
         barrier.image = ToInternal(image).image;
         barrier.oldLayout = oLayout;
         barrier.newLayout = nLayout;
@@ -1607,63 +1808,65 @@ namespace evk {
         barrier.subresourceRange.levelCount = mipCount;
         barrier.subresourceRange.baseMipLevel = mip;
 
-        auto stage_access_for_layout = [&](ImageLayout layout, bool src, VkPipelineStageFlags& stage, VkAccessFlags& access) {
-            // Conservative defaults: keep it correct even if not perfectly minimal.
-            stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        auto stage_access_for_layout = [&](ImageLayout layout, bool src, VkPipelineStageFlags2& stage, VkAccessFlags2& access) {
+            stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
             access = 0;
 
             switch (layout) {
                 case ImageLayout::Undefined:
-                    stage = src ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+                    stage = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
                     access = 0;
                     break;
                 case ImageLayout::Present:
-                    stage = src ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+                    stage = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
                     access = 0;
                     break;
                 case ImageLayout::TransferSrc:
-                    stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-                    access = src ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+                    stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                    access = VK_ACCESS_2_TRANSFER_READ_BIT;
                     break;
                 case ImageLayout::TransferDst:
-                    stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-                    access = src ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
+                    stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                    access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
                     break;
                 case ImageLayout::Attachment:
                     if (isDepth) {
-                        stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-                        access = src ? (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT)
-                                     : (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+                        stage = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+                        access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
                     } else {
-                        stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-                        access = src ? (VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT)
-                                     : (VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT);
+                        stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                        access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT;
                     }
                     break;
                 case ImageLayout::ShaderRead:
-                    // Includes fragment/compute/raytracing and any other shader stage that might sample.
-                    stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-                    access = VK_ACCESS_SHADER_READ_BIT;
+                    stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                    access = VK_ACCESS_2_SHADER_READ_BIT;
                     break;
                 case ImageLayout::General:
-                    // Storage image read/write.
-                    stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-                    access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                    stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                    access = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
                     break;
             }
         };
 
-        VkPipelineStageFlags srcStage;
-        VkPipelineStageFlags dstStage;
-        VkAccessFlags srcAccess;
-        VkAccessFlags dstAccess;
+        VkPipelineStageFlags2 srcStage;
+        VkPipelineStageFlags2 dstStage;
+        VkAccessFlags2 srcAccess;
+        VkAccessFlags2 dstAccess;
         stage_access_for_layout(oldLayout, true, srcStage, srcAccess);
         stage_access_for_layout(newLayout, false, dstStage, dstAccess);
 
         barrier.srcAccessMask = srcAccess;
         barrier.dstAccessMask = dstAccess;
-        
-        vkCmdPipelineBarrier(cb->cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        barrier.srcStageMask = srcStage;
+        barrier.dstStageMask = dstStage;
+
+        VkDependencyInfo dependency = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &barrier,
+        };
+        vkCmdPipelineBarrier2(cb->cmd, &dependency);
     }
     
     void Cmd::barrier() {
@@ -1893,7 +2096,7 @@ namespace evk {
         bool hasDepth = false;
         bool hasStencil = false;
         uint32_t colorAttachmentCount = 0;
-        VkRenderingAttachmentInfoKHR attachInfos[MAX_ATTACHMENTS_COUNT];
+        VkRenderingAttachmentInfo attachInfos[MAX_ATTACHMENTS_COUNT];
         for (int i = 0; i < attachmentCount; i++) {
             auto& desc = GetDesc(attachments[i]);
             auto& attach = attachInfos[i];
@@ -1902,7 +2105,7 @@ namespace evk {
             bool isStencilOnly = DoesFormatHaveStencil(desc.format);
             EVK_ASSERT((uint32_t)ToInternal(attachments[i]).desc.usage & (uint32_t)ImageUsage::Attachment, "Image '%s' which is attachment %d don't have ImageUsage::Attachment", GetDesc(attachments[i]).name.c_str(), i);
 
-            attach = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+            attach = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             if (isDepthStencil || isStencilOnly) {
                 EVK_ASSERT(i == attachmentCount - 1, "DepthStencil attachment must be in the last attachment index!");
                 hasDepth = isDepthStencil;
@@ -1913,8 +2116,8 @@ namespace evk {
 
             attach.pNext = nullptr;
             attach.imageView = ToInternal(attachments[i]).view;
-            attach.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
-            attach.resolveMode = VK_RESOLVE_MODE_NONE_KHR;
+            attach.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
+            attach.resolveMode = VK_RESOLVE_MODE_NONE;
             attach.resolveImageView = VK_NULL_HANDLE;
             attach.resolveImageLayout = {};
             attach.loadOp = clearValues ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -1936,7 +2139,7 @@ namespace evk {
         }
 
         Extent extent = GetDesc(attachments[0]).extent;
-        VkRenderingInfo info = {VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+        VkRenderingInfo info = {VK_STRUCTURE_TYPE_RENDERING_INFO};
         info.flags = 0;
         info.renderArea = VkRect2D{{0, 0}, {extent.width, extent.height}};
         info.layerCount = 1;
@@ -2073,6 +2276,9 @@ namespace evk {
         if(GetState().vkCmdBeginDebugUtilsLabelEXT) {
             GetState().vkCmdBeginDebugUtilsLabelEXT(cb->cmd, &label);
         }
+        if (!GetState().timestampsEnabled) {
+            return -1;
+        }
         int id = cb->AllocTimestamp(name);
         vkCmdWriteTimestamp(cb->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, cb->queryPool, id * 2);
         return id;
@@ -2080,7 +2286,9 @@ namespace evk {
     
     void Cmd::endTimestamp(int id) {
         CommandBufferData* cb = (CommandBufferData*)_internal;
-        vkCmdWriteTimestamp(cb->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, cb->queryPool, id * 2 + 1);
+        if (GetState().timestampsEnabled && id >= 0) {
+            vkCmdWriteTimestamp(cb->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, cb->queryPool, id * 2 + 1);
+        }
         if(GetState().vkCmdEndDebugUtilsLabelEXT) {
             GetState().vkCmdEndDebugUtilsLabelEXT(cb->cmd);
         }
@@ -2089,8 +2297,12 @@ namespace evk {
     void Cmd::buildBLAS(const std::vector<BLAS>& blases, bool update) {
         CommandBufferData* cb = (CommandBufferData*)_internal;
         auto& S = GetState();
+        if (!S.rayTracingEnabled || S.vkCmdBuildAccelerationStructuresKHR == nullptr) {
+            return;
+        }
         VkDeviceSize scratchSize = {0};
         for (auto& blasRes : blases) {
+            if (!blasRes) continue;
             scratchSize = std::max(scratchSize, ToInternal(blasRes).sizeInfo.buildScratchSize);
         }
 
@@ -2106,6 +2318,7 @@ namespace evk {
         EVK_ASSERT(ToInternal(scratchBuffer).deviceAddress != 0u, "BLAS scratch buffer deviceAddress == 0");
 
         for (auto& blasRes : blases) {
+            if (!blasRes) continue;
             Internal_BLAS& blas = ToInternal(blasRes);
             blas.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
             blas.buildInfo.scratchData = {ToInternal(scratchBuffer).deviceAddress};
@@ -2116,12 +2329,19 @@ namespace evk {
 
             auto range = blas.ranges.data();
             S.vkCmdBuildAccelerationStructuresKHR(cb->cmd, 1, &blas.buildInfo, &range);
-            VkMemoryBarrier barrier{
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
-                .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+            VkMemoryBarrier2 barrier = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                .srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                .dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                .dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR,
             };
-            vkCmdPipelineBarrier(cb->cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+            VkDependencyInfo dependency = {
+                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &barrier,
+            };
+            vkCmdPipelineBarrier2(cb->cmd, &dependency);
 
             VkAccelerationStructureDeviceAddressInfoKHR addressInfo = {
                 .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
@@ -2139,9 +2359,14 @@ namespace evk {
     void Cmd::buildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update) {
         CommandBufferData* cb = (CommandBufferData*)_internal;
         auto& S = GetState();
+        if (!S.rayTracingEnabled || S.vkCmdBuildAccelerationStructuresKHR == nullptr) {
+            return;
+        }
+        if (!tlas) {
+            return;
+        }
         Internal_TLAS& res = ToInternal(tlas);
 
-        EVK_ASSERT(tlas, "Invalid TLAS.");
         EVK_ASSERT(blasInstances.size() < res.instances.size(), "TLAS has been created with max of %llu BLAS count but now is being built with %llu BLAS count!",
                     res.instances.size(), blasInstances.size());
 
@@ -2209,10 +2434,19 @@ namespace evk {
         VkAccelerationStructureBuildRangeInfoKHR buildOffsetInfo{static_cast<uint32_t>(blasInstances.size()), 0, 0, 0};
         const VkAccelerationStructureBuildRangeInfoKHR* pBuildOffsetInfo = &buildOffsetInfo;
 
-        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-        vkCmdPipelineBarrier(cb->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        VkMemoryBarrier2 barrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            .dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        };
+        VkDependencyInfo dependency = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &barrier,
+        };
+        vkCmdPipelineBarrier2(cb->cmd, &dependency);
         S.vkCmdBuildAccelerationStructuresKHR(cb->cmd, 1, &res.buildInfo, &pBuildOffsetInfo);
 
         // Ensure the built TLAS is visible to subsequent reads (ray tracing / shaders) in the same command buffer.
@@ -2288,6 +2522,9 @@ namespace evk {
 
     BLAS CreateBLAS(const BLASDesc& desc) {
         auto& S = GetState();
+        if (!S.rayTracingEnabled) {
+            return BLAS{};
+        }
         Internal_BLAS* res = new Internal_BLAS();
         res->aabbsBuffer = desc.aabbs;
         res->vertexBuffer = desc.vertices;
@@ -2357,7 +2594,13 @@ namespace evk {
             .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
             .flags = VkBuildAccelerationStructureFlagsKHR(
                 VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
-                VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR
+                (
+                    #ifdef VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR
+                        VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR
+                    #else
+                        VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR
+                    #endif
+                )
             ),
             .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
             .geometryCount = static_cast<uint32_t>(res->geometries.size()),
@@ -2386,6 +2629,9 @@ namespace evk {
     }
     TLAS CreateTLAS(uint32_t maxBlasCount, bool allowUpdate) {
         auto& S = GetState();
+        if (!S.rayTracingEnabled) {
+            return TLAS{};
+        }
         Internal_TLAS* res = new Internal_TLAS();
 
         res->instances.resize(maxBlasCount);

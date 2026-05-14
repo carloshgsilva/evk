@@ -15,7 +15,7 @@ void CreateOrResizeBuffer(Buffer& buff, uint64_t desired_size, BufferUsage usage
         bdesc.name = usage == BufferUsage::Vertex ? "ImGui Vertex Buffer" : "ImGui Index Buffer";
         bdesc.size = desired_size > START_SIZE ? desired_size : START_SIZE;
         bdesc.memoryType = MemoryType::CPU_TO_GPU;
-        bdesc.usage = usage;
+        bdesc.usage = usage | BufferUsage::TransferDst;
         buff = CreateBuffer(bdesc);
     }
 }
