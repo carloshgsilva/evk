@@ -319,7 +319,11 @@ namespace evk {
     BLAS CreateBLAS(const BLASDesc& desc);
     TLAS CreateTLAS(uint32_t maxBlasCount, bool allowUpdate);
 
-
+    struct EvkBindlessDesc {
+        uint32_t storageBufferCount = 16384;
+        uint32_t imageCount = 16384;
+        uint32_t tlasCount = 16384;
+    };
 
     struct EvkDesc {
         std::string applicationName = "";
@@ -330,6 +334,8 @@ namespace evk {
         std::vector<std::string> instanceExtensions = {};
         uint32_t frameBufferingCount = 3;
         bool enableSwapchain = false; // VK_KHR_swapchain
+        bool enableRayTracing = true; // Requires VK_KHR_acceleration_structure + VK_KHR_ray_tracing_pipeline
+        EvkBindlessDesc bindless = {};
     };
 
     bool InitializeEVK(const EvkDesc& info);

@@ -31,10 +31,9 @@ namespace evk {
     const uint32_t BINDING_IMAGE = 2;
     const uint32_t BINDING_TLAS = 3;
 
-    const uint32_t STORAGE_COUNT = 16384;
-    const uint32_t IMAGE_COUNT = 16384;
-    const uint32_t SAMPLER_COUNT = IMAGE_COUNT;
-    const uint32_t TLAS_COUNT = 16384;
+    const uint32_t DEFAULT_STORAGE_COUNT = 16384;
+    const uint32_t DEFAULT_IMAGE_COUNT = 16384;
+    const uint32_t DEFAULT_TLAS_COUNT = 16384;
     
     const uint32_t PERF_QUERY_COUNT = 64;
     const uint32_t MAX_COMMAND_BUFFERS = 4;
@@ -86,9 +85,10 @@ namespace evk {
     };
 
     struct SlotAllocator {
-        int maxSlot;
+        int maxSlot = 0;
         int currentSlot = 0;
         std::vector<int> freeSlots;
+        SlotAllocator() = default;
         SlotAllocator(int maxSlot) : maxSlot(maxSlot) {
         }
 
@@ -115,18 +115,27 @@ namespace evk {
         VkQueue queue;
         uint32_t queueFamily;
         VmaAllocator allocator;
-        float timestampPeriod;
+        bool timestampsEnabled = false;
+        float timestampPeriod = 0.0f;
+
+        bool rayTracingEnabled = false;
+
+        // Bindless descriptor array sizes (clamped to requested and device limits at runtime)
+        uint32_t storageCount = DEFAULT_STORAGE_COUNT;
+        uint32_t imageCount = DEFAULT_IMAGE_COUNT;
+        uint32_t samplerCount = DEFAULT_IMAGE_COUNT;
+        uint32_t tlasCount = DEFAULT_TLAS_COUNT;
 
         // Descriptors
-        VkDescriptorPool descriptorPool;
-        VkDescriptorSetLayout descriptorSetLayout;
-        VkDescriptorSet descriptorSet;
-        VkPipelineLayout pipelineLayout;
-        SlotAllocator bufferSlots = SlotAllocator(STORAGE_COUNT);
-        SlotAllocator imageSlots = SlotAllocator(IMAGE_COUNT);
-        SlotAllocator tlasSlots = SlotAllocator(TLAS_COUNT);
+        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+        VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+        SlotAllocator bufferSlots;
+        SlotAllocator imageSlots;
+        SlotAllocator tlasSlots;
 
-        // Command buffer management (new API)
+        // Command buffer management
         std::vector<CommandBufferData> commandBuffers;
         uint64_t nextSubmissionIndex = 1;  // Start at 1 so 0 is invalid
         Cmd currentCmd;  // Current command buffer being recorded
@@ -151,7 +160,6 @@ namespace evk {
         PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR;
         PFN_vkGetAccelerationStructureBuildSizesKHR vkGetAccelerationStructureBuildSizesKHR;
         PFN_vkCreateAccelerationStructureKHR vkCreateAccelerationStructureKHR;
-        PFN_vkGetBufferDeviceAddressKHR vkGetBufferDeviceAddressKHR;
         PFN_vkCmdBuildAccelerationStructuresKHR vkCmdBuildAccelerationStructuresKHR;
         PFN_vkGetAccelerationStructureDeviceAddressKHR vkGetAccelerationStructureDeviceAddressKHR;
         PFN_vkGetRayTracingShaderGroupHandlesKHR vkGetRayTracingShaderGroupHandlesKHR;
@@ -182,8 +190,10 @@ namespace evk {
         ~Internal_Buffer() {
             vmaDestroyBuffer(GetState().allocator, buffer, allocation);
             // Free descriptor index
-            EVK_ASSERT(resourceid != -1, "destroying buffer '%s' with RID = -1", desc.name.c_str());
-            GetState().bufferSlots.free(resourceid);
+            if (resourceid != -1) {
+                GetState().bufferSlots.free(resourceid);
+                resourceid = -1;
+            }
         }
     };
     struct Internal_Image : Resource {
@@ -202,8 +212,7 @@ namespace evk {
                 vmaFreeMemory(S.allocator, allocation);
                 vkDestroyImage(S.device, image, nullptr);
                 // Free descriptor index
-                {
-                    EVK_ASSERT(resourceid != -1, "destroying image '%s' with RID = -1", desc.name.c_str());
+                if (resourceid != -1) {
                     GetState().imageSlots.free(resourceid);
                     resourceid = -1;
                 }
@@ -236,7 +245,10 @@ namespace evk {
         Buffer indexBuffer;
 
         ~Internal_BLAS() {
-            GetState().vkDestroyAccelerationStructureKHR(GetState().device, accel, nullptr);
+            auto& S = GetState();
+            if (S.rayTracingEnabled && S.vkDestroyAccelerationStructureKHR) {
+                S.vkDestroyAccelerationStructureKHR(S.device, accel, nullptr);
+            }
         }
     };
     struct Internal_TLAS : Resource {
@@ -251,8 +263,13 @@ namespace evk {
         Buffer buffer;
 
         ~Internal_TLAS() {
-            GetState().vkDestroyAccelerationStructureKHR(GetState().device, accel, nullptr);
-            GetState().tlasSlots.free(resourceid);
+            auto& S = GetState();
+            if (S.rayTracingEnabled && S.vkDestroyAccelerationStructureKHR) {
+                S.vkDestroyAccelerationStructureKHR(S.device, accel, nullptr);
+            }
+            if (resourceid != -1) {
+                S.tlasSlots.free(resourceid);
+            }
         }
     };
 
