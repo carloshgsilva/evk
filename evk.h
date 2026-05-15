@@ -334,13 +334,19 @@ namespace evk {
         std::vector<std::string> instanceExtensions = {};
         uint32_t frameBufferingCount = 3;
         bool enableSwapchain = false; // VK_KHR_swapchain
-        bool enableRayTracing = true; // Requires VK_KHR_acceleration_structure + VK_KHR_ray_tracing_pipeline
         EvkBindlessDesc bindless = {};
+    };
+
+    struct Features {
+        bool raytracing = false;
+        bool coopmat = false;
+        bool timestamps = false;
     };
 
     bool InitializeEVK(const EvkDesc& info);
     void Shutdown();
     bool InitializeSwapchain(void* vulkanSurfaceKHR);
+    const Features& GetFeatures();
 
     MemoryBudget GetMemoryBudget();
     

@@ -92,6 +92,7 @@ namespace evk::ai {
     static std::unordered_map<uint64_t, evk::Pipeline> matmul_configs;
     
     static evk::Pipeline get_matmul_pipeline(MatMulConfig config) {
+        assert(evk::GetFeatures().coopmat && "evk::ai::matmul requires evk::GetFeatures().coopmat");
         uint64_t key = config;
         auto it = matmul_configs.find(key);
         if (it != matmul_configs.end()) {
@@ -156,6 +157,7 @@ namespace evk::ai {
     }
 
     static evk::Pipeline get_flash_pipeline(const FlashConfig& config) {
+        assert(evk::GetFeatures().coopmat && "evk::ai::flash_attention requires evk::GetFeatures().coopmat");
         uint64_t key = config;
         auto it = flash_configs.find(key);
         if (it != flash_configs.end()) {
@@ -208,8 +210,10 @@ namespace evk::ai {
 
     void initialize() {
         pipelines = std::make_unique<Pipelines>();
-        pipelines->flash_attn = create_named_compute_pipeline("flash_attention");
-        pipelines->flash_attn_bwd = create_named_compute_pipeline("flash_attention_bwd");
+        if (evk::GetFeatures().coopmat) {
+            pipelines->flash_attn = create_named_compute_pipeline("flash_attention");
+            pipelines->flash_attn_bwd = create_named_compute_pipeline("flash_attention_bwd");
+        }
         pipelines->mse_loss = create_named_compute_pipeline("mse_loss");
         pipelines->sgd = create_named_compute_pipeline("sgd");
         pipelines->adam = create_named_compute_pipeline("adam");
@@ -1088,4 +1092,3 @@ namespace evk::ai {
         cmd.barrier();
     }
 }
-
