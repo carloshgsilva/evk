@@ -8,6 +8,10 @@
 #define VK_EXT_METAL_SURFACE_EXTENSION_NAME "VK_EXT_metal_surface"
 #endif
 
+#ifndef VK_KHR_WIN32_SURFACE_EXTENSION_NAME
+#define VK_KHR_WIN32_SURFACE_EXTENSION_NAME "VK_KHR_win32_surface"
+#endif
+
 namespace evk {
 
 #if EVK_DEBUG
