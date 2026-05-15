@@ -80,6 +80,7 @@ namespace evk::ai {
     static std::unordered_map<uint64_t, evk::Pipeline> matmul_configs;
     
     static evk::Pipeline get_matmul_pipeline(MatMulConfig config) {
+        assert(evk::GetFeatures().coopmat && "evk::ai::matmul requires evk::GetFeatures().coopmat");
         uint64_t key = config;
         auto it = matmul_configs.find(key);
         if (it != matmul_configs.end()) {
@@ -120,6 +121,7 @@ namespace evk::ai {
     static std::unordered_map<uint64_t, evk::Pipeline> flash_configs;
 
     static evk::Pipeline get_flash_pipeline(const FlashConfig& config) {
+        assert(evk::GetFeatures().coopmat && "evk::ai::flash_attention requires evk::GetFeatures().coopmat");
         uint64_t key = config;
         auto it = flash_configs.find(key);
         if (it != flash_configs.end()) {
@@ -172,14 +174,16 @@ namespace evk::ai {
 
     void initialize() {
         pipelines = std::make_unique<Pipelines>();
-        pipelines->flash_attn = evk::CreatePipeline({
-            .name = "flash_attention",
-            .CS = evk::loadSpirvFile("shaders/bin/flash_attention.comp.spv"),
-        });
-        pipelines->flash_attn_bwd = evk::CreatePipeline({
-            .name = "flash_attention_bwd",
-            .CS = evk::loadSpirvFile("shaders/bin/flash_attention_bwd.comp.spv"),
-        });
+        if (evk::GetFeatures().coopmat) {
+            pipelines->flash_attn = evk::CreatePipeline({
+                .name = "flash_attention",
+                .CS = evk::loadSpirvFile("shaders/bin/flash_attention.comp.spv"),
+            });
+            pipelines->flash_attn_bwd = evk::CreatePipeline({
+                .name = "flash_attention_bwd",
+                .CS = evk::loadSpirvFile("shaders/bin/flash_attention_bwd.comp.spv"),
+            });
+        }
         pipelines->mse_loss = evk::CreatePipeline({
             .name = "mse_loss",
             .CS = evk::loadSpirvFile("shaders/bin/mse_loss.comp.spv"),
@@ -1010,4 +1014,3 @@ namespace evk::ai {
         cmd.barrier();
     }
 }
-

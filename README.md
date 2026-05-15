@@ -55,6 +55,18 @@ int main() {
         return -1;
     }
 
+    if (evk::GetFeatures().raytracing) {
+        // Ray tracing resources and pipelines can be used.
+    }
+
+    if (evk::GetFeatures().coopmat) {
+        // Cooperative-matrix AI kernels can use accelerated matmul.
+    }
+
+    if (evk::GetFeatures().timestamps) {
+        // GPU timestamp profiling is available.
+    }
+
     // Application loop
     while (running) {
         auto& cmd = evk::CmdBegin(evk::Queue::Graphics);
@@ -197,7 +209,19 @@ uint64_t idx = cmd.submit();
 evk::CmdWait(idx);
 ```
 
+### AI Cooperative Matrix
+
+EVK enables cooperative matrices automatically when `VK_KHR_cooperative_matrix` and its device feature are available. Query `evk::GetFeatures().coopmat` before using AI kernels that depend on accelerated cooperative-matrix matmul, such as `evk::ai::matmul` and flash attention.
+
 ### Ray Tracing
+
+EVK enables ray tracing automatically when the Vulkan device supports the required extensions and features. Query it at runtime before creating ray tracing resources or selecting a ray tracing render path:
+
+```cpp
+if (!evk::GetFeatures().raytracing) {
+    // Use a raster or compute fallback.
+}
+```
 
 ```cpp
 // Create acceleration structures
@@ -221,6 +245,8 @@ evk::CmdWait(idx);
 ```
 
 ### GPU Profiling
+
+GPU timestamps are enabled automatically when the selected queue family supports timestamp queries. Query `evk::GetFeatures().timestamps` before showing profiler UI that expects timing data.
 
 ```cpp
 auto& cmd = evk::CmdBegin(evk::Queue::Graphics);
@@ -255,6 +281,7 @@ for (uint32_t i = 0; i < budget.MAX_HEAPS; ++i) {
 | Function | Description |
 |----------|-------------|
 | `InitializeEVK(desc)` | Initialize the Vulkan context |
+| `GetFeatures() -> const Features&` | Query optional Vulkan features enabled in the active EVK context |
 | `Shutdown()` | Clean up all resources |
 | `CmdBegin(queue) -> Cmd&` | Begin recording on a queue and return a command buffer handle |
 | `CmdDone(submissionIndex)` | Check if a submitted command buffer has finished |

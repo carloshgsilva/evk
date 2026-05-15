@@ -115,10 +115,9 @@ namespace evk {
         VkQueue queue;
         uint32_t queueFamily;
         VmaAllocator allocator;
-        bool timestampsEnabled = false;
         float timestampPeriod = 0.0f;
 
-        bool rayTracingEnabled = false;
+        Features features = {};
 
         // Bindless descriptor array sizes (clamped to requested and device limits at runtime)
         uint32_t storageCount = DEFAULT_STORAGE_COUNT;
@@ -246,7 +245,7 @@ namespace evk {
 
         ~Internal_BLAS() {
             auto& S = GetState();
-            if (S.rayTracingEnabled && S.vkDestroyAccelerationStructureKHR) {
+            if (S.features.raytracing && S.vkDestroyAccelerationStructureKHR) {
                 S.vkDestroyAccelerationStructureKHR(S.device, accel, nullptr);
             }
         }
@@ -264,7 +263,7 @@ namespace evk {
 
         ~Internal_TLAS() {
             auto& S = GetState();
-            if (S.rayTracingEnabled && S.vkDestroyAccelerationStructureKHR) {
+            if (S.features.raytracing && S.vkDestroyAccelerationStructureKHR) {
                 S.vkDestroyAccelerationStructureKHR(S.device, accel, nullptr);
             }
             if (resourceid != -1) {

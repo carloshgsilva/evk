@@ -260,7 +260,7 @@ namespace evk {
         if (HasFlag(desc.usage, BufferUsage::Index)) usageBits |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
         if (HasFlag(desc.usage, BufferUsage::Indirect)) usageBits |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
         if (HasFlag(desc.usage, BufferUsage::Storage)) usageBits |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        if (S.rayTracingEnabled) {
+        if (S.features.raytracing) {
             if (HasFlag(desc.usage, BufferUsage::AccelerationStructure)) usageBits |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
             if (HasFlag(desc.usage, BufferUsage::AccelerationStructureInput)) usageBits |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         }
@@ -739,6 +739,10 @@ namespace evk {
         GState = state;
     }
 
+    const Features& GetFeatures() {
+        return GetState().features;
+    }
+
     //////////////////////
     // Global Functions //
     //////////////////////
@@ -919,7 +923,7 @@ namespace evk {
                 S.queueFamily++;
             }
             EVK_ASSERT(S.queueFamily < familyProps.size(), "could not find graphics queue family!");
-            S.timestampsEnabled = familyProps[S.queueFamily].timestampValidBits != 0;
+            S.features.timestamps = familyProps[S.queueFamily].timestampValidBits != 0;
 
             float priority0 = 1.0f;
             VkDeviceQueueCreateInfo deviceQueueci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -975,6 +979,7 @@ namespace evk {
             VkPhysicalDeviceRayTracingPipelineFeaturesKHR supportedRTPipe = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
             VkPhysicalDeviceRayQueryFeaturesKHR supportedRayQuery = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
             VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR supportedRTPosFetch = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR};
+            VkPhysicalDeviceCooperativeMatrixFeaturesKHR supportedCoop = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
 
             supportedFeatures2.pNext = &supported12;
             supported12.pNext = &supported13;
@@ -985,7 +990,8 @@ namespace evk {
             supportedAS.pNext = &supportedRTPipe;
             supportedRTPipe.pNext = &supportedRayQuery;
             supportedRayQuery.pNext = &supportedRTPosFetch;
-            supportedRTPosFetch.pNext = nullptr;
+            supportedRTPosFetch.pNext = &supportedCoop;
+            supportedCoop.pNext = nullptr;
             vkGetPhysicalDeviceFeatures2(S.physicalDevice, &supportedFeatures2);
 
             // Common feature struct for pNext chaining
@@ -1022,6 +1028,7 @@ namespace evk {
             VkPhysicalDeviceAccelerationStructureFeaturesKHR feature_accelerationStructure = supportedAS;
             VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR feature_rtPositionFetch = supportedRTPosFetch;
             VkPhysicalDeviceRayQueryFeaturesKHR feature_rayQuery = supportedRayQuery;
+            VkPhysicalDeviceCooperativeMatrixFeaturesKHR feature_coop = supportedCoop;
 
             EVK_ASSERT(supported12.runtimeDescriptorArray, "EVK requires runtimeDescriptorArray (bindless) support");
             EVK_ASSERT(supported12.shaderSampledImageArrayNonUniformIndexing, "EVK requires non-uniform indexing of sampled images");
@@ -1040,10 +1047,8 @@ namespace evk {
             feature_vulkan13.synchronization2 = VK_TRUE;
             add_feature(feature_vulkan13);
 
-            // Ray tracing: only enable if requested and supported.
-            const bool wantRayTracing = desc.enableRayTracing;
+            // Ray tracing: enable when all required Vulkan support is available.
             const bool canRayTracing =
-                wantRayTracing &&
                 isExtensionSupported(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) &&
                 isExtensionSupported(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
                 isExtensionSupported(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) &&
@@ -1055,7 +1060,7 @@ namespace evk {
                 supportedRTPosFetch.rayTracingPositionFetch &&
                 supported12.bufferDeviceAddress;
 
-            S.rayTracingEnabled = canRayTracing;
+            S.features.raytracing = canRayTracing;
 
             {
                 VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -1087,7 +1092,7 @@ namespace evk {
 
                 const uint32_t requestedStorage = S.storageCount;
                 const uint32_t requestedImages = S.imageCount;
-                const uint32_t requestedTLAS = S.rayTracingEnabled ? S.tlasCount : 0;
+                const uint32_t requestedTLAS = S.features.raytracing ? S.tlasCount : 0;
 
                 S.storageCount = clampTo(requestedStorage, storageHardMax);
                 S.imageCount = clampTo(requestedImages, std::min(storageImageHardMax, sampledHardMax));
@@ -1102,7 +1107,7 @@ namespace evk {
                 S.imageSlots = SlotAllocator((int)S.imageCount);
                 S.tlasSlots = SlotAllocator((int)S.tlasCount);
             }
-            if (S.rayTracingEnabled) {
+            if (S.features.raytracing) {
                 addDeviceExtensionIfSupported(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
                 addDeviceExtensionIfSupported(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
                 addDeviceExtensionIfSupported(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
@@ -1120,12 +1125,10 @@ namespace evk {
                 }
             }
 
-            // Cooperative Matrix features
-            VkPhysicalDeviceCooperativeMatrixFeaturesKHR feature_coop = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
-                .cooperativeMatrix = VK_TRUE,
-            };
-            if(isExtensionSupported(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+            S.features.coopmat =
+                isExtensionSupported(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) &&
+                supportedCoop.cooperativeMatrix;
+            if (S.features.coopmat) {
                 deviceExtensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
                 add_feature(feature_coop);
             }
@@ -1204,7 +1207,7 @@ namespace evk {
                 {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, S.samplerCount},
                 {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, S.imageCount},
             };
-            if (S.rayTracingEnabled) {
+            if (S.features.raytracing) {
                 poolSizes.push_back({VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, S.tlasCount});
             }
             VkDescriptorPoolCreateInfo poolci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1220,7 +1223,7 @@ namespace evk {
                 {BINDING_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, S.samplerCount, VK_SHADER_STAGE_ALL},
                 {BINDING_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, S.imageCount, VK_SHADER_STAGE_ALL},
             };
-            if (S.rayTracingEnabled) {
+            if (S.features.raytracing) {
                 bindings.push_back({BINDING_TLAS, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, S.tlasCount, VK_SHADER_STAGE_ALL});
             }
 
@@ -1236,7 +1239,7 @@ namespace evk {
                 baseFlags,
                 baseFlags,
             };
-            if (S.rayTracingEnabled) {
+            if (S.features.raytracing) {
                 bindingFlags.push_back(baseFlags);
             }
             setLayoutBindingsFlags.bindingCount = (uint32_t)bindingFlags.size();
@@ -1283,7 +1286,7 @@ namespace evk {
                 fenceci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
                 CHECK_VK(vkCreateFence(S.device, &fenceci, nullptr, &cb.fence));
 
-                if (S.timestampsEnabled) {
+                if (S.features.timestamps) {
                     VkQueryPoolCreateInfo queryPoolci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
                     queryPoolci.queryCount = PERF_QUERY_COUNT;
                     queryPoolci.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -1307,7 +1310,7 @@ namespace evk {
         }
 
         // Raytracing
-        if (S.rayTracingEnabled) {
+        if (S.features.raytracing) {
             VkDevice device = GetState().device;
             GetState().vkGetAccelerationStructureBuildSizesKHR = (PFN_vkGetAccelerationStructureBuildSizesKHR)vkGetDeviceProcAddr(device, "vkGetAccelerationStructureBuildSizesKHR");
             GetState().vkCreateAccelerationStructureKHR = (PFN_vkCreateAccelerationStructureKHR)vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR");
@@ -1576,7 +1579,7 @@ namespace evk {
     static void ReadTimestampsFromCommandBuffer(CommandBufferData& cb) {
         auto& S = GetState();
         
-        if (!S.timestampsEnabled || cb.queryPool == VK_NULL_HANDLE) {
+        if (!S.features.timestamps || cb.queryPool == VK_NULL_HANDLE) {
             S.lastTimestamps.clear();
             return;
         }
@@ -1696,7 +1699,7 @@ namespace evk {
         cmdbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         CHECK_VK(vkBeginCommandBuffer(cmdData->cmd, &cmdbi));
         
-        if (S.timestampsEnabled) {
+        if (S.features.timestamps) {
             vkCmdResetQueryPool(cmdData->cmd, cmdData->queryPool, 0, PERF_QUERY_COUNT);
         }
         vkCmdBindDescriptorSets(cmdData->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, S.pipelineLayout, 0, 1, &S.descriptorSet, 0, nullptr);
@@ -2276,7 +2279,7 @@ namespace evk {
         if(GetState().vkCmdBeginDebugUtilsLabelEXT) {
             GetState().vkCmdBeginDebugUtilsLabelEXT(cb->cmd, &label);
         }
-        if (!GetState().timestampsEnabled) {
+        if (!GetState().features.timestamps) {
             return -1;
         }
         int id = cb->AllocTimestamp(name);
@@ -2286,7 +2289,7 @@ namespace evk {
     
     void Cmd::endTimestamp(int id) {
         CommandBufferData* cb = (CommandBufferData*)_internal;
-        if (GetState().timestampsEnabled && id >= 0) {
+        if (GetState().features.timestamps && id >= 0) {
             vkCmdWriteTimestamp(cb->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, cb->queryPool, id * 2 + 1);
         }
         if(GetState().vkCmdEndDebugUtilsLabelEXT) {
@@ -2297,7 +2300,7 @@ namespace evk {
     void Cmd::buildBLAS(const std::vector<BLAS>& blases, bool update) {
         CommandBufferData* cb = (CommandBufferData*)_internal;
         auto& S = GetState();
-        if (!S.rayTracingEnabled || S.vkCmdBuildAccelerationStructuresKHR == nullptr) {
+        if (!S.features.raytracing || S.vkCmdBuildAccelerationStructuresKHR == nullptr) {
             return;
         }
         VkDeviceSize scratchSize = {0};
@@ -2359,7 +2362,7 @@ namespace evk {
     void Cmd::buildTLAS(const TLAS& tlas, const std::vector<BLASInstance>& blasInstances, bool update) {
         CommandBufferData* cb = (CommandBufferData*)_internal;
         auto& S = GetState();
-        if (!S.rayTracingEnabled || S.vkCmdBuildAccelerationStructuresKHR == nullptr) {
+        if (!S.features.raytracing || S.vkCmdBuildAccelerationStructuresKHR == nullptr) {
             return;
         }
         if (!tlas) {
@@ -2522,7 +2525,7 @@ namespace evk {
 
     BLAS CreateBLAS(const BLASDesc& desc) {
         auto& S = GetState();
-        if (!S.rayTracingEnabled) {
+        if (!S.features.raytracing) {
             return BLAS{};
         }
         Internal_BLAS* res = new Internal_BLAS();
@@ -2629,7 +2632,7 @@ namespace evk {
     }
     TLAS CreateTLAS(uint32_t maxBlasCount, bool allowUpdate) {
         auto& S = GetState();
-        if (!S.rayTracingEnabled) {
+        if (!S.features.raytracing) {
             return TLAS{};
         }
         Internal_TLAS* res = new Internal_TLAS();
