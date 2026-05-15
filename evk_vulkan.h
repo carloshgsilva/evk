@@ -110,6 +110,7 @@ namespace evk {
         VkSurfaceKHR surface;
         VkSwapchainKHR swapchain;
         uint32_t swapchainIndex = 0;
+        Extent requestedSwapchainExtent = {};
         std::vector<Image> swapchainImages;
 
         std::vector<FrameData> frames = {};

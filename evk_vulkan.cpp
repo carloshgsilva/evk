@@ -4,6 +4,9 @@
 #include "vk_mem_alloc.h"
 #include "evk.h"
 
+#include <algorithm>
+#include <limits>
+
 namespace evk {
     static State* GState;
 
@@ -1306,6 +1309,10 @@ namespace evk {
         auto frameCount = S.frames.size();
         VkSurfaceTransformFlagBitsKHR transform = surfaceCaps.currentTransform;
         VkExtent2D extent = surfaceCaps.currentExtent;
+        if (extent.width == std::numeric_limits<uint32_t>::max() || extent.height == std::numeric_limits<uint32_t>::max()) {
+            extent.width = std::clamp(S.requestedSwapchainExtent.width, surfaceCaps.minImageExtent.width, surfaceCaps.maxImageExtent.width);
+            extent.height = std::clamp(S.requestedSwapchainExtent.height, surfaceCaps.minImageExtent.height, surfaceCaps.maxImageExtent.height);
+        }
 
         EVK_ASSERT(surfaceCaps.minImageCount <= S.frames.size() && S.frames.size() <= surfaceCaps.maxImageCount, "Frame buffering count out of range!");
 
@@ -1356,8 +1363,12 @@ namespace evk {
 
         return true;
     }
-    bool InitializeSwapchain(void* vulkanSurfaceKHR) {
+    void SetSwapchainExtent(uint32_t width, uint32_t height) {
+        GetState().requestedSwapchainExtent = Extent(width, height);
+    }
+    bool InitializeSwapchain(void* vulkanSurfaceKHR, uint32_t width, uint32_t height) {
         GetState().surface = (VkSurfaceKHR)vulkanSurfaceKHR;
+        SetSwapchainExtent(width, height);
         return RecreateSwapchain();
     }
 

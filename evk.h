@@ -333,7 +333,8 @@ namespace evk {
 
     bool InitializeEVK(const EvkDesc& info);
     void Shutdown();
-    bool InitializeSwapchain(void* vulkanSurfaceKHR);
+    bool InitializeSwapchain(void* vulkanSurfaceKHR, uint32_t width = 0, uint32_t height = 0);
+    void SetSwapchainExtent(uint32_t width, uint32_t height);
 
     // Returns the frame buffering count
     uint32_t GetFrameBufferingCount();
