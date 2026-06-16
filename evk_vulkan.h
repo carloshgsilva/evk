@@ -25,6 +25,8 @@ namespace evk {
     const uint32_t BINDING_SAMPLER = 1;
     const uint32_t BINDING_IMAGE = 2;
     const uint32_t BINDING_TLAS = 3;
+    const uint32_t BINDING_SAMPLER_3D = 4;
+    const uint32_t BINDING_IMAGE_3D = 5;
 
     const uint32_t STORAGE_COUNT = 16384;
     const uint32_t IMAGE_COUNT = 16384;

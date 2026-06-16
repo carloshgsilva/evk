@@ -357,6 +357,10 @@ namespace evk {
                 write.dstBinding = BINDING_SAMPLER;
                 write.dstArrayElement = res->resourceid;
                 vkUpdateDescriptorSets(S.device, 1, &write, 0, nullptr);
+                if (desc.extent.depth > 1) {
+                    write.dstBinding = BINDING_SAMPLER_3D;
+                    vkUpdateDescriptorSets(S.device, 1, &write, 0, nullptr);
+                }
             }
 
             // Bind for Storage
@@ -374,6 +378,10 @@ namespace evk {
                 write.dstBinding = BINDING_IMAGE;
                 write.dstArrayElement = res->resourceid;
                 vkUpdateDescriptorSets(S.device, 1, &write, 0, nullptr);
+                if (desc.extent.depth > 1) {
+                    write.dstBinding = BINDING_IMAGE_3D;
+                    vkUpdateDescriptorSets(S.device, 1, &write, 0, nullptr);
+                }
             }
         }
 
@@ -1095,8 +1103,8 @@ namespace evk {
             // Create descriptor pool
             std::vector<VkDescriptorPoolSize> poolSizes = {
                 {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, STORAGE_COUNT},
-                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SAMPLER_COUNT},
-                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, IMAGE_COUNT},
+                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SAMPLER_COUNT * 2},
+                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, IMAGE_COUNT * 2},
                 {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, TLAS_COUNT},
             };
             VkDescriptorPoolCreateInfo poolci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1112,11 +1120,15 @@ namespace evk {
                 {BINDING_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SAMPLER_COUNT, VK_SHADER_STAGE_ALL},
                 {BINDING_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, IMAGE_COUNT, VK_SHADER_STAGE_ALL},
                 {BINDING_TLAS, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, TLAS_COUNT, VK_SHADER_STAGE_ALL},
+                {BINDING_SAMPLER_3D, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SAMPLER_COUNT, VK_SHADER_STAGE_ALL},
+                {BINDING_IMAGE_3D, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, IMAGE_COUNT, VK_SHADER_STAGE_ALL},
             };
 
             // Flag each binding as partially bound and update after bind
             VkDescriptorSetLayoutBindingFlagsCreateInfo setLayoutBindingsFlags = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
             std::vector<VkDescriptorBindingFlags> bindingFlags = {
+                VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
+                VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
                 VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
                 VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
                 VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
