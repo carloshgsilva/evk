@@ -335,6 +335,7 @@ namespace evk {
         uint32_t frameBufferingCount = 3;
         bool enableSwapchain = false; // VK_KHR_swapchain
         bool enableValidation = false;
+        bool enableTimestamps = false;
         EvkBindlessDesc bindless = {};
     };
 

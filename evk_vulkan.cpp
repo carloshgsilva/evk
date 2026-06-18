@@ -958,7 +958,7 @@ namespace evk {
                 S.queueFamily++;
             }
             EVK_ASSERT(S.queueFamily < familyProps.size(), "could not find graphics queue family!");
-            S.features.timestamps = familyProps[S.queueFamily].timestampValidBits != 0;
+            S.features.timestamps = desc.enableTimestamps && familyProps[S.queueFamily].timestampValidBits != 0;
 
             float priority0 = 1.0f;
             VkDeviceQueueCreateInfo deviceQueueci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
