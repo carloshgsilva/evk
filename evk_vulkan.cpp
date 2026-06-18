@@ -753,6 +753,11 @@ namespace evk {
         return GetState().features;
     }
 
+    Extent GetSwapchainExtent() {
+        auto& S = GetState();
+        return S.swapchainImages.empty() ? Extent{} : GetDesc(S.swapchainImages[S.swapchainIndex]).extent;
+    }
+
     //////////////////////
     // Global Functions //
     //////////////////////
