@@ -296,13 +296,15 @@ namespace evk {
         }
 
 #if EVK_DEBUG
-        VkDebugUtilsObjectNameInfoEXT name = {
-            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
-            .objectType = VkObjectType::VK_OBJECT_TYPE_BUFFER,
-            .objectHandle = (uint64_t)(VkBuffer)res->buffer,
-            .pObjectName = desc.name.c_str(),
-        };
-        GetState().vkSetDebugUtilsObjectNameEXT(GetState().device, &name);
+        if (GetState().vkSetDebugUtilsObjectNameEXT) {
+            VkDebugUtilsObjectNameInfoEXT name = {
+                .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
+                .objectType = VkObjectType::VK_OBJECT_TYPE_BUFFER,
+                .objectHandle = (uint64_t)(VkBuffer)res->buffer,
+                .pObjectName = desc.name.c_str(),
+            };
+            GetState().vkSetDebugUtilsObjectNameEXT(GetState().device, &name);
+        }
 #endif
 
         if (HasFlag(desc.usage, BufferUsage::Storage)) {
@@ -425,13 +427,15 @@ namespace evk {
         }
 
 #if EVK_DEBUG
-        VkDebugUtilsObjectNameInfoEXT name = {
-            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
-            .objectType = VkObjectType::VK_OBJECT_TYPE_IMAGE,
-            .objectHandle = (uint64_t)(VkImage)res->image,
-            .pObjectName = desc.name.c_str(),
-        };
-        GetState().vkSetDebugUtilsObjectNameEXT(GetState().device, &name);
+        if (GetState().vkSetDebugUtilsObjectNameEXT) {
+            VkDebugUtilsObjectNameInfoEXT name = {
+                .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
+                .objectType = VkObjectType::VK_OBJECT_TYPE_IMAGE,
+                .objectHandle = (uint64_t)(VkImage)res->image,
+                .pObjectName = desc.name.c_str(),
+            };
+            GetState().vkSetDebugUtilsObjectNameEXT(GetState().device, &name);
+        }
 #endif
 
         InitializeImageView(res);
@@ -714,13 +718,15 @@ namespace evk {
         EVK_ASSERT(state->pipeline != VK_NULL_HANDLE, "Failed to create pipeline '%s'", desc.name.c_str());
 
 #if EVK_DEBUG
-        VkDebugUtilsObjectNameInfoEXT name = {
-            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
-            .objectType = VkObjectType::VK_OBJECT_TYPE_PIPELINE,
-            .objectHandle = (uint64_t)state->pipeline,
-            .pObjectName = desc.name.c_str(),
-        };
-        GetState().vkSetDebugUtilsObjectNameEXT(GetState().device, &name);
+        if (GetState().vkSetDebugUtilsObjectNameEXT) {
+            VkDebugUtilsObjectNameInfoEXT name = {
+                .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
+                .objectType = VkObjectType::VK_OBJECT_TYPE_PIPELINE,
+                .objectHandle = (uint64_t)state->pipeline,
+                .pObjectName = desc.name.c_str(),
+            };
+            GetState().vkSetDebugUtilsObjectNameEXT(GetState().device, &name);
+        }
 #endif
 
         return Pipeline{state};
@@ -820,11 +826,15 @@ namespace evk {
                 layers.push_back(name.c_str());
             }
 
-#if EVK_DEBUG
-            extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            const bool enableValidation = desc.enableValidation;
 
+            if (enableValidation) {
+                extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            }
+
+#if EVK_DEBUG
             bool validation_available = false;
-            {
+            if (enableValidation) {
                 uint32_t count = 0;
                 if (vkEnumerateInstanceLayerProperties(&count, nullptr) == VK_SUCCESS && count > 0) {
                     std::vector<VkLayerProperties> available_layers(count);
@@ -837,13 +847,13 @@ namespace evk {
                         }
                     }
                 }
-            }
 
-            if (validation_available) {
-                printf("[evk] validation layers enabled!\n");
-                layers.push_back("VK_LAYER_KHRONOS_validation");
-            } else {
-                printf("[evk] validation layer not found; continuing without it.\n");
+                if (validation_available) {
+                    printf("[evk] validation layers enabled!\n");
+                    layers.push_back("VK_LAYER_KHRONOS_validation");
+                } else {
+                    printf("[evk] validation layer not found; continuing without it.\n");
+                }
             }
 #endif
 
@@ -896,7 +906,7 @@ namespace evk {
             CHECK_VK(vkCreateInstance(&instanceci, nullptr, &S.instance));
 
 #if EVK_DEBUG
-            {
+            if (enableValidation) {
                 auto vkCreateDebugUtilsMessengerEXT_fn = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(S.instance, "vkCreateDebugUtilsMessengerEXT");
                 EVK_ASSERT(vkCreateDebugUtilsMessengerEXT_fn, "vkCreateDebugUtilsMessengerEXT not found");
 

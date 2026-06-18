@@ -334,6 +334,7 @@ namespace evk {
         std::vector<std::string> instanceExtensions = {};
         uint32_t frameBufferingCount = 3;
         bool enableSwapchain = false; // VK_KHR_swapchain
+        bool enableValidation = false;
         EvkBindlessDesc bindless = {};
     };
 
