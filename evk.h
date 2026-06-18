@@ -408,6 +408,7 @@ namespace evk {
         void beginRender(Image* attachments, ClearValue* clearValues, int attachmentCount);
         void endRender();
         void beginPresent();
+        void beginPresent(Image* attachments, ClearValue* clearValues, int attachmentCount);
         void endPresent();
         void viewport(float x, float y, float w, float h, float minDepth = 0.0f, float maxDepth = 1.0f);
         void scissor(int32_t x, int32_t y, uint32_t w, uint32_t h);
@@ -436,6 +437,12 @@ namespace evk {
         template <typename T>
         void present(T callback) {
             beginPresent();
+            callback();
+            endPresent();
+        }
+        template <typename T>
+        void present(Image* attachments, ClearValue* clearValues, int attachmentCount, T callback) {
+            beginPresent(attachments, clearValues, attachmentCount);
             callback();
             endPresent();
         }

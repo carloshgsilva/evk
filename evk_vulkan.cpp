@@ -2241,6 +2241,51 @@ namespace evk {
         ClearValue clears[] = {ClearColor{0.0f, 0.0f, 0.0f, 1.0f}};
         beginRender(&S.swapchainImages[cb->swapchainIndex], clears, 1);
     }
+
+    void Cmd::beginPresent(Image* attachments, ClearValue* clearValues, int attachmentCount) {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        EVK_ASSERT(!cb->doingPresent, "beginPresent have already been called.");
+        EVK_ASSERT(attachmentCount >= 0, "attachmentCount < 0");
+        EVK_ASSERT(attachmentCount + 1 < MAX_ATTACHMENTS_COUNT, "Number of attachments %d greater than %d", attachmentCount + 1, MAX_ATTACHMENTS_COUNT);
+        cb->doingPresent = true;
+
+        auto& S = GetState();
+        uint32_t acquiredIndex = 0;
+        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
+            RecreateSwapchain();
+            r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
+        }
+
+        cb->swapchainIndex = acquiredIndex;
+        S.swapchainIndex = acquiredIndex;
+        EVK_ASSERT(cb->swapchainIndex < S.swapchainImages.size(), "Swapchain image index out of range");
+        EVK_ASSERT(cb->swapchainIndex < S.swapchainPresentSemaphores.size(), "Swapchain present semaphores out of range");
+        cb->presentDoneSemaphore = S.swapchainPresentSemaphores[cb->swapchainIndex];
+
+        Image renderAttachments[MAX_ATTACHMENTS_COUNT];
+        ClearValue clears[MAX_ATTACHMENTS_COUNT] = {
+            ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
+            ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
+            ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
+            ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
+            ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
+            ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
+            ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
+            ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
+        };
+        renderAttachments[0] = S.swapchainImages[cb->swapchainIndex];
+        for (int i = 0; i < attachmentCount; i++) {
+            renderAttachments[i + 1] = attachments[i];
+            clears[i + 1] = clearValues[i];
+        }
+
+        for (int i = 0; i < attachmentCount + 1; i++) {
+            barrier(renderAttachments[i], ImageLayout::Undefined, ImageLayout::Attachment);
+        }
+
+        beginRender(renderAttachments, clears, attachmentCount + 1);
+    }
     
     void Cmd::endPresent() {
         CommandBufferData* cb = (CommandBufferData*)_internal;
