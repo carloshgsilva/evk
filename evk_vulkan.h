@@ -151,6 +151,7 @@ namespace evk {
         VkSwapchainKHR swapchain;
         uint32_t swapchainIndex = 0;
         std::vector<Image> swapchainImages;  // Swapchain images
+        bool swapchainRecreateRequested = false;
 
         // One present-complete semaphore per swapchain image (indexed by acquired image index)
         std::vector<VkSemaphore> swapchainPresentSemaphores;

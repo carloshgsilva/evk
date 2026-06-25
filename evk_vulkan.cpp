@@ -758,6 +758,12 @@ namespace evk {
         return S.swapchainImages.empty() ? Extent{} : GetDesc(S.swapchainImages[S.swapchainIndex]).extent;
     }
 
+    void RequestSwapchainRecreate() {
+        if (GState != nullptr) {
+            GState->swapchainRecreateRequested = true;
+        }
+    }
+
     //////////////////////
     // Global Functions //
     //////////////////////
@@ -1493,6 +1499,7 @@ namespace evk {
         auto& S = GetState();
         CHECK_VK(vkDeviceWaitIdle(S.device));
         EVK_ASSERT(S.surface != nullptr, "Surface is not initialized!");
+        S.swapchainRecreateRequested = false;
 
         auto oldSwapchain = S.swapchain;
         VkSurfaceKHR surface = (VkSurfaceKHR)S.surface;
@@ -2227,6 +2234,9 @@ namespace evk {
         cb->doingPresent = true;
 
         auto& S = GetState();
+        if (S.swapchainRecreateRequested) {
+            RecreateSwapchain();
+        }
         // Use the command buffer's own imageReadySemaphore for acquire
         uint32_t acquiredIndex = 0;
         VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
@@ -2255,6 +2265,9 @@ namespace evk {
         cb->doingPresent = true;
 
         auto& S = GetState();
+        if (S.swapchainRecreateRequested) {
+            RecreateSwapchain();
+        }
         uint32_t acquiredIndex = 0;
         VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {

@@ -350,6 +350,7 @@ namespace evk {
     bool InitializeSwapchain(void* vulkanSurfaceKHR);
     const Features& GetFeatures();
     Extent GetSwapchainExtent();
+    void RequestSwapchainRecreate();
 
     MemoryBudget GetMemoryBudget();
     
