@@ -715,7 +715,8 @@ namespace evk {
         F.queries.resize(PERF_QUERY_COUNT);
 
         if(F.timestampNames.empty() == false) { 
-            vkGetQueryPoolResults(GetState().device, F.queryPool, 0, PERF_QUERY_COUNT, PERF_QUERY_COUNT * sizeof(uint64_t), F.queries.data(), 8, VK_QUERY_RESULT_64_BIT);
+            const uint32_t queryCount = static_cast<uint32_t>(F.timestampNames.size()) * 2;
+            vkGetQueryPoolResults(GetState().device, F.queryPool, 0, queryCount, queryCount * sizeof(uint64_t), F.queries.data(), 8, VK_QUERY_RESULT_64_BIT);
             F.timestampEntries.clear();
             uint64_t start = F.queries[0];
             for (int i = 0; i < F.timestampNames.size(); i++) {
@@ -1253,6 +1254,23 @@ namespace evk {
         // auto capabilities = S.physicalDevice.getSurfaceCapabilitiesKHR(surface);i
         VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
         VkColorSpaceKHR colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        {
+            uint32_t presentModeCount = 0;
+            CHECK_VK(vkGetPhysicalDeviceSurfacePresentModesKHR(S.physicalDevice, S.surface, &presentModeCount, nullptr));
+            std::vector<VkPresentModeKHR> presentModes(presentModeCount);
+            CHECK_VK(vkGetPhysicalDeviceSurfacePresentModesKHR(S.physicalDevice, S.surface, &presentModeCount, presentModes.data()));
+
+            for (VkPresentModeKHR mode : presentModes) {
+                if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+                    presentMode = mode;
+                    break;
+                }
+                if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                    presentMode = mode;
+                }
+            }
+        }
         auto frameCount = S.frames.size();
         VkSurfaceTransformFlagBitsKHR transform = surfaceCaps.currentTransform;
         VkExtent2D extent = surfaceCaps.currentExtent;
@@ -1275,7 +1293,7 @@ namespace evk {
             .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
             .preTransform = transform,
             .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-            .presentMode = VK_PRESENT_MODE_FIFO_KHR,
+            .presentMode = presentMode,
             .clipped = false,
             .oldSwapchain = oldSwapchain,
         };

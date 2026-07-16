@@ -54,6 +54,7 @@ namespace evk {
 
         inline int AllocTimestap(const char* name) {
             int id = int(timestampNames.size());
+            EVK_ASSERT((id + 1) * 2 <= PERF_QUERY_COUNT, "Timestamp query pool exhausted");
             timestampNames.push_back(name);
             return id;
         }
