@@ -785,31 +785,18 @@ namespace evk {
                 #endif
             }
 
-            uint32_t availableExtensionCount = 0;
-            std::vector<VkExtensionProperties> availableExtensions;
-            CHECK_VK(vkEnumerateInstanceExtensionProperties(nullptr, &availableExtensionCount, nullptr));
-            availableExtensions.resize(availableExtensionCount);
-            CHECK_VK(vkEnumerateInstanceExtensionProperties(nullptr, &availableExtensionCount, availableExtensions.data()));
-
-            std::vector<std::string> enabledExtensions;
-            for (auto& requestedExt : instanceExtensions) {
-                bool found = false;
-                for (auto& availableExt : availableExtensions) {
-                    if (strcmp(requestedExt.c_str(), availableExt.extensionName) == 0) {
-                        found = true;
+            std::vector<const char*> extensions;
+            for (auto& name : instanceExtensions) {
+                bool duplicate = false;
+                for (const char* extension : extensions) {
+                    if (strcmp(name.c_str(), extension) == 0) {
+                        duplicate = true;
                         break;
                     }
                 }
-                if (found) {
-                    enabledExtensions.push_back(requestedExt);
-                } else {
-                    printf("[evk] Warning: Extension '%s' not available, skipping\n", requestedExt.c_str());
+                if (!duplicate) {
+                    extensions.push_back(name.c_str());
                 }
-            }
-
-            std::vector<const char*> extensions;
-            for (auto& name : enabledExtensions) {
-                extensions.push_back(name.c_str());
             }
             std::vector<const char*> layers;
             for (auto& name : instanceLayers) {
@@ -818,49 +805,16 @@ namespace evk {
 
 #if EVK_DEBUG
             printf("[evk] validation layers enabled!\n");
-            bool debugExtFound = false;
-            for (auto& availableExt : availableExtensions) {
-                if (strcmp(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, availableExt.extensionName) == 0) {
-                    debugExtFound = true;
-                    break;
-                }
-            }
-            if (debugExtFound) {
-                extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-            } else {
-                printf("[evk] Warning: Debug utils extension not available\n");
-            }
+            extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
             layers.push_back("VK_LAYER_KHRONOS_validation");
 #endif
-
-            uint32_t availableLayerCount = 0;
-            std::vector<VkLayerProperties> availableLayers;
-            CHECK_VK(vkEnumerateInstanceLayerProperties(&availableLayerCount, nullptr));
-            availableLayers.resize(availableLayerCount);
-            CHECK_VK(vkEnumerateInstanceLayerProperties(&availableLayerCount, availableLayers.data()));
-
-            std::vector<const char*> enabledLayers;
-            for (auto& requestedLayer : layers) {
-                bool found = false;
-                for (auto& availableLayer : availableLayers) {
-                    if (strcmp(requestedLayer, availableLayer.layerName) == 0) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (found) {
-                    enabledLayers.push_back(requestedLayer);
-                } else {
-                    printf("[evk] Warning: Instance layer '%s' not available, skipping\n", requestedLayer);
-                }
-            }
 
             VkInstanceCreateInfo instanceci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
             instanceci.pApplicationInfo = &appInfo;
             instanceci.enabledExtensionCount = uint32_t(extensions.size());
             instanceci.ppEnabledExtensionNames = extensions.data();
-            instanceci.enabledLayerCount = uint32_t(enabledLayers.size());
-            instanceci.ppEnabledLayerNames = enabledLayers.data();
+            instanceci.enabledLayerCount = uint32_t(layers.size());
+            instanceci.ppEnabledLayerNames = layers.data();
 
             // #if EVK_DEBUG
             //     VkValidationFeatureEnableEXT validationEnable[] = { VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT };
@@ -1042,25 +996,6 @@ namespace evk {
                 VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
 #endif
             };
-
-// Check device extensions support
-#if EVK_DEBUG
-            std::vector<VkExtensionProperties> supportedExtensions;
-            uint32_t supportedExtensionsCount = 0;
-            CHECK_VK(vkEnumerateDeviceExtensionProperties(S.physicalDevice, NULL, &supportedExtensionsCount, NULL));
-            supportedExtensions.resize(supportedExtensionsCount);
-            CHECK_VK(vkEnumerateDeviceExtensionProperties(S.physicalDevice, NULL, &supportedExtensionsCount, supportedExtensions.data()));
-            for (auto& ext1 : deviceExtensions) {
-                bool found = false;
-                for (auto& ext2 : supportedExtensions) {
-                    if (!std::strcmp(ext1, ext2.extensionName)) {
-                        found = true;
-                        break;
-                    }
-                }
-                EVK_ASSERT(found, "Device extension '%s' not found!", ext1);
-            }
-#endif
 
             VkDeviceCreateInfo deviceci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
             deviceci.pEnabledFeatures = &features;
