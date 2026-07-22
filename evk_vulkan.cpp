@@ -148,6 +148,19 @@ namespace evk {
         return ((uint32_t)usage & (uint32_t)flag) != 0u;
     }
 
+    static VkSampleCountFlagBits ToVkSampleCount(SampleCount sampleCount) {
+        return static_cast<VkSampleCountFlagBits>(static_cast<uint32_t>(sampleCount));
+    }
+
+    SampleCount GetSupportedSampleCount(SampleCount requested) {
+        const uint32_t requestedCount = static_cast<uint32_t>(requested);
+        const VkSampleCountFlags supported = GetState().framebufferSampleCounts;
+        for (uint32_t count = requestedCount; count >= 1; count >>= 1) {
+            if ((supported & count) != 0) return static_cast<SampleCount>(count);
+        }
+        return SampleCount::One;
+    }
+
     static void WriteBufferDescriptor(Internal_Buffer& buffer) {
         auto& S = GetState();
 
@@ -392,6 +405,19 @@ namespace evk {
         res->resourceid = -1;
 
         EVK_ASSERT(desc.format != Format::Undefined, "Image '%s' format is Undefined, did you forgot to set the format?", desc.name.c_str());
+        EVK_ASSERT((GetState().framebufferSampleCounts & static_cast<uint32_t>(desc.sampleCount)) != 0,
+                   "Image '%s' requests an unsupported sample count", desc.name.c_str());
+        if (desc.sampleCount != SampleCount::One) {
+            EVK_ASSERT(desc.extent.depth == 1 && desc.mipCount == 1 && !desc.isCube,
+                       "Multisampled image '%s' must be a 2D, single-mip image", desc.name.c_str());
+            EVK_ASSERT(HasFlag(desc.usage, ImageUsage::Attachment),
+                       "Multisampled image '%s' must be an attachment", desc.name.c_str());
+        }
+        if (HasFlag(desc.usage, ImageUsage::Transient)) {
+            EVK_ASSERT(HasFlag(desc.usage, ImageUsage::Attachment) &&
+                           !HasFlag(desc.usage, ImageUsage::Sampled) && !HasFlag(desc.usage, ImageUsage::Storage),
+                       "Transient image '%s' must only be used as an attachment", desc.name.c_str());
+        }
 
         // Immutable state
         res->desc = desc;
@@ -399,11 +425,14 @@ namespace evk {
         // Usage flags
         ImageUsage usage = desc.usage;
         VkImageUsageFlags usageBits{};
-        usageBits |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        usageBits |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (!HasFlag(usage, ImageUsage::Transient)) {
+            usageBits |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            usageBits |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        }
         if ((int)usage & (int)ImageUsage::Sampled) usageBits |= VK_IMAGE_USAGE_SAMPLED_BIT;
         if ((int)usage & (int)ImageUsage::Attachment) usageBits |= DoesFormatHaveDepth(desc.format) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if ((int)usage & (int)ImageUsage::Storage) usageBits |= VK_IMAGE_USAGE_STORAGE_BIT;
+        if ((int)usage & (int)ImageUsage::Transient) usageBits |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
 
         VkImageCreateInfo imageci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         imageci.imageType = desc.extent.depth == 1 ? VK_IMAGE_TYPE_2D : VK_IMAGE_TYPE_3D;
@@ -414,12 +443,15 @@ namespace evk {
         imageci.arrayLayers = desc.layerCount;
         imageci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageci.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageci.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageci.samples = ToVkSampleCount(desc.sampleCount);
         imageci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         imageci.flags = desc.isCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
 
         VmaAllocationCreateInfo allocCreateInfo = {};
         allocCreateInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+        if (HasFlag(desc.usage, ImageUsage::Transient)) {
+            allocCreateInfo.preferredFlags = VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT;
+        }
         VmaAllocationInfo allocInfo;
 
         if (vmaCreateImage(S.allocator, &imageci, &allocCreateInfo, (VkImage*)&res->image, &res->allocation, &allocInfo) != VK_SUCCESS) {
@@ -554,7 +586,7 @@ namespace evk {
         rasterizationInfo.rasterizerDiscardEnable = false;
 
         VkPipelineMultisampleStateCreateInfo multisampleInfo{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        multisampleInfo.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisampleInfo.rasterizationSamples = ToVkSampleCount(desc.sampleCount);
 
         VkPipelineDepthStencilStateCreateInfo depthStencilInfo = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         depthStencilInfo.depthTestEnable = desc.depthTest;
@@ -952,6 +984,13 @@ namespace evk {
             vkGetPhysicalDeviceProperties(S.physicalDevice, &props);
             EVK_ASSERT(props.apiVersion >= VK_API_VERSION_1_3, "EVK requires Vulkan 1.3");
             S.timestampPeriod = props.limits.timestampPeriod;
+            S.framebufferSampleCounts = props.limits.framebufferColorSampleCounts & props.limits.framebufferDepthSampleCounts;
+            for (uint32_t count = VK_SAMPLE_COUNT_64_BIT; count >= VK_SAMPLE_COUNT_1_BIT; count >>= 1) {
+                if ((S.framebufferSampleCounts & count) != 0) {
+                    S.features.maxFramebufferSampleCount = static_cast<SampleCount>(count);
+                    break;
+                }
+            }
 
             printf("[evk] Vulkan %d.%d.%d | %s \n", VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion), props.deviceName);
 
@@ -2134,7 +2173,7 @@ namespace evk {
         vkCmdBindIndexBuffer(cb->cmd, ToInternal(buffer).buffer, rawOffset, useHalf ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     }
     
-    void Cmd::beginRender(Image* attachments, ClearValue* clearValues, int attachmentCount) {
+    void Cmd::beginRender(Image* attachments, ClearValue* clearValues, int attachmentCount, Image* resolveAttachments) {
         CommandBufferData* cb = (CommandBufferData*)_internal;
         EVK_ASSERT(cb->insideRenderPass == false, "render pass already bound!");
         EVK_ASSERT(attachments, "attachments = nullptr");
@@ -2172,6 +2211,23 @@ namespace evk {
             attach.resolveImageLayout = {};
             attach.loadOp = clearValues ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             attach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            if (HasFlag(desc.usage, ImageUsage::Transient)) {
+                attach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            }
+            if (resolveAttachments && resolveAttachments[i]) {
+                const auto& resolveDesc = GetDesc(resolveAttachments[i]);
+                EVK_ASSERT(!isDepthStencil && !isStencilOnly, "Only color attachment resolves are supported");
+                EVK_ASSERT(desc.sampleCount != SampleCount::One && resolveDesc.sampleCount == SampleCount::One,
+                           "Resolve source must be multisampled and destination must be single-sampled");
+                EVK_ASSERT(desc.format == resolveDesc.format && desc.extent.width == resolveDesc.extent.width &&
+                               desc.extent.height == resolveDesc.extent.height,
+                           "Resolve source and destination must have matching format and extent");
+                EVK_ASSERT(HasFlag(resolveDesc.usage, ImageUsage::Attachment),
+                           "Resolve destination must have ImageUsage::Attachment");
+                attach.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+                attach.resolveImageView = ToInternal(resolveAttachments[i]).view;
+                attach.resolveImageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
+            }
             if (clearValues) {
                 if (isDepthStencil || isStencilOnly) {
                     VkClearDepthStencilValue clearDepthStencil;

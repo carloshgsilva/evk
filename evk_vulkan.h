@@ -118,6 +118,7 @@ namespace evk {
         float timestampPeriod = 0.0f;
 
         Features features = {};
+        VkSampleCountFlags framebufferSampleCounts = VK_SAMPLE_COUNT_1_BIT;
 
         // Bindless descriptor array sizes (clamped to requested and device limits at runtime)
         uint32_t storageCount = DEFAULT_STORAGE_COUNT;

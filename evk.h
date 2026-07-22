@@ -14,6 +14,7 @@ namespace evk {
     enum class Stage { TopOfPipe, Host, Transfer, Compute, DrawIndirect, VertexInput, VertexShader, EarlyFragmentTest, FragmentShader, LateFragmentTest, ColorAttachmentOutput, BottomOfPipe, AllGraphics, AllCommands };
     enum class Format { Undefined, R8Uint, R16Uint, R32Uint, R64Uint, BGRA8Unorm, BGRA8Snorm, RGBA8Unorm, RGBA8Snorm, RG16Sfloat, RGBA16Sfloat, RGBA16Unorm, RGBA16Snorm, R32Sfloat, RG32Sfloat, RGB32Sfloat, RGBA32Sfloat, RGBA32Sint, RGBA32Uint, D24UnormS8Uint, D32Sfloat };
     enum class Primitive { Triangle, Line };
+    enum class SampleCount : uint32_t { One = 1, Two = 2, Four = 4, Eight = 8, Sixteen = 16, ThirtyTwo = 32, SixtyFour = 64 };
     enum class Blend { Disabled, Alpha, Additive };
     enum class BufferUsage {
         TransferSrc = 1,
@@ -40,6 +41,7 @@ namespace evk {
         Sampled = 4,      // can be read by shader with texture() or texelFetch()
         Attachment = 8,   // used by CmdBeginRender()
         Storage = 16,     // can access with imageStore and imageLoad
+        Transient = 32,   // short-lived attachment; may use lazily allocated memory
     };
     struct ClearDepthStencil {
         float depth = 1.0f;
@@ -232,6 +234,7 @@ namespace evk {
         Op depthOp = Op::Never;
         bool depthTest = false;
         bool depthWrite = false;
+        SampleCount sampleCount = SampleCount::One;
     };
     struct Pipeline : ResourceRef {
         Pipeline(Resource* res = nullptr) : ResourceRef(res) {
@@ -266,6 +269,7 @@ namespace evk {
         uint32_t mipCount = 1;
         uint32_t layerCount = 1;
         bool isCube = false;
+        SampleCount sampleCount = SampleCount::One;
     };
     struct Image : ResourceRef {
         Image(Resource* res = nullptr) : ResourceRef(res) {
@@ -343,12 +347,14 @@ namespace evk {
         bool raytracing = false;
         bool coopmat = false;
         bool timestamps = false;
+        SampleCount maxFramebufferSampleCount = SampleCount::One;
     };
 
     bool InitializeEVK(const EvkDesc& info);
     void Shutdown();
     bool InitializeSwapchain(void* vulkanSurfaceKHR);
     const Features& GetFeatures();
+    SampleCount GetSupportedSampleCount(SampleCount requested);
     Extent GetSwapchainExtent();
     void RequestSwapchainRecreate();
 
@@ -407,7 +413,7 @@ namespace evk {
         void index(Buffer& buffer, bool useHalf = false, uint64_t offset = 0);
 
         // Rendering
-        void beginRender(Image* attachments, ClearValue* clearValues, int attachmentCount);
+        void beginRender(Image* attachments, ClearValue* clearValues, int attachmentCount, Image* resolveAttachments = nullptr);
         void endRender();
         void beginPresent();
         void beginPresent(Image* attachments, ClearValue* clearValues, int attachmentCount);
