@@ -326,6 +326,27 @@ namespace evk {
 
         return Buffer(res);
     }
+
+    struct AccelerationStructureScratchBuffer {
+        Buffer buffer;
+        VkDeviceAddress address = 0;
+    };
+
+    static AccelerationStructureScratchBuffer CreateAccelerationStructureScratchBuffer(
+        const char* name, VkDeviceSize size) {
+        const VkDeviceSize alignment = GetState().accelerationStructureScratchAlignment;
+        Buffer buffer = CreateBuffer({
+            .name = name,
+            .size = size + alignment - 1,
+            .usage = BufferUsage::Storage,
+            .memoryType = MemoryType::GPU,
+        });
+        VkDeviceAddress address = ToInternal(buffer).deviceAddress;
+        address = (address + alignment - 1) & ~(alignment - 1);
+        EVK_ASSERT(address != 0u, "%s deviceAddress == 0", name);
+        return {std::move(buffer), address};
+    }
+
     void* Buffer::GetPtr() {
         Internal_Buffer* buffer = dynamic_cast<Internal_Buffer*>(res);
         EVK_ASSERT(buffer, "Invalid Buffer");
@@ -1150,8 +1171,15 @@ namespace evk {
             {
                 VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
                 VkPhysicalDeviceDescriptorIndexingProperties indexingProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES};
+                VkPhysicalDeviceAccelerationStructurePropertiesKHR accelerationStructureProps = {
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+                indexingProps.pNext = S.features.raytracing ? &accelerationStructureProps : nullptr;
                 props2.pNext = &indexingProps;
                 vkGetPhysicalDeviceProperties2(S.physicalDevice, &props2);
+                if (S.features.raytracing) {
+                    S.accelerationStructureScratchAlignment =
+                        std::max<VkDeviceSize>(accelerationStructureProps.minAccelerationStructureScratchOffsetAlignment, 1);
+                }
 
                 auto clampTo = [](uint32_t value, uint32_t maxVal) {
                     if (maxVal == 0) return value;
@@ -2466,19 +2494,14 @@ namespace evk {
         if(scratchSize == 0u)
             return;
 
-        Buffer scratchBuffer = CreateBuffer({
-            .name = "BLAS Build Scratch Buffer",
-            .size = scratchSize,
-            .usage = BufferUsage::Storage,
-            .memoryType = MemoryType::GPU,
-        });
-        EVK_ASSERT(ToInternal(scratchBuffer).deviceAddress != 0u, "BLAS scratch buffer deviceAddress == 0");
+        AccelerationStructureScratchBuffer scratchBuffer =
+            CreateAccelerationStructureScratchBuffer("BLAS Build Scratch Buffer", scratchSize);
 
         for (auto& blasRes : blases) {
             if (!blasRes) continue;
             Internal_BLAS& blas = ToInternal(blasRes);
             blas.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-            blas.buildInfo.scratchData = {ToInternal(scratchBuffer).deviceAddress};
+            blas.buildInfo.scratchData = {scratchBuffer.address};
             blas.buildInfo.dstAccelerationStructure = blas.accel;
             if (update) {
                 blas.buildInfo.srcAccelerationStructure = blas.accel;
@@ -2555,38 +2578,35 @@ namespace evk {
                 .accelerationStructureReference = internalBlas.accStructureDeviceAddress,
             };
         }
-        WriteBuffer(res.instancesBuffer, res.instances.data(), blasInstances.size() * sizeof(VkAccelerationStructureInstanceKHR));
+        if (!blasInstances.empty()) {
+            copy(res.instances.data(), res.instancesBuffer,
+                 blasInstances.size() * sizeof(VkAccelerationStructureInstanceKHR));
+        }
 
-        // Make host writes to the instances buffer visible to the acceleration-structure build.
-        // Even with host-coherent memory, being explicit avoids relying on implementation details.
         {
-            VkMemoryBarrier2 barrier2 = {
+            VkMemoryBarrier2 barrier = {
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                .srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
-                .srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT,
+                .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                 .dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT,
+                .dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                                 VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
             };
             VkDependencyInfo dependency = {
                 .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
                 .memoryBarrierCount = 1,
-                .pMemoryBarriers = &barrier2,
+                .pMemoryBarriers = &barrier,
             };
             vkCmdPipelineBarrier2(cb->cmd, &dependency);
         }
 
-        Buffer scratchBuffer = CreateBuffer({
-            .name = "TLAS Scratch",
-            .size = res.sizeInfo.buildScratchSize,
-            .usage = BufferUsage::Storage,
-            .memoryType = MemoryType::GPU,
-        });
-        EVK_ASSERT(ToInternal(scratchBuffer).deviceAddress != 0u, "TLAS scratch buffer deviceAddress == 0");
+        AccelerationStructureScratchBuffer scratchBuffer =
+            CreateAccelerationStructureScratchBuffer("TLAS Scratch", res.sizeInfo.buildScratchSize);
 
         res.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         res.buildInfo.srcAccelerationStructure = res.accel;
         res.buildInfo.dstAccelerationStructure = res.accel;
-        res.buildInfo.scratchData.deviceAddress = ToInternal(scratchBuffer).deviceAddress;
+        res.buildInfo.scratchData.deviceAddress = scratchBuffer.address;
 
         VkAccelerationStructureBuildRangeInfoKHR buildOffsetInfo{static_cast<uint32_t>(blasInstances.size()), 0, 0, 0};
         const VkAccelerationStructureBuildRangeInfoKHR* pBuildOffsetInfo = &buildOffsetInfo;
@@ -2799,8 +2819,8 @@ namespace evk {
         res->instancesBuffer = CreateBuffer({
             .name = "Instances Buffer",
             .size = sizeof(VkAccelerationStructureInstanceKHR) * res->instances.size(),
-            .usage = BufferUsage::Storage | BufferUsage::AccelerationStructureInput,
-            .memoryType = MemoryType::CPU_TO_GPU,
+            .usage = BufferUsage::Storage | BufferUsage::TransferDst | BufferUsage::AccelerationStructureInput,
+            .memoryType = MemoryType::GPU,
         });
         EVK_ASSERT(ToInternal(res->instancesBuffer).deviceAddress != 0u, "TLAS instances buffer deviceAddress == 0");
 

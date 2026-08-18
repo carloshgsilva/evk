@@ -116,6 +116,7 @@ namespace evk {
         uint32_t queueFamily;
         VmaAllocator allocator;
         float timestampPeriod = 0.0f;
+        VkDeviceSize accelerationStructureScratchAlignment = 1;
 
         Features features = {};
         VkSampleCountFlags framebufferSampleCounts = VK_SAMPLE_COUNT_1_BIT;
