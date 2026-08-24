@@ -125,6 +125,153 @@ std::vector<ArchiveTensor> parse_table(const std::vector<uint8_t>& bytes) {
     return tensors;
 }
 
+std::unique_ptr<Tensor> pack_bias(const std::string& name, Tensor& source) {
+    uint32_t channels = source.shape[0];
+    uint32_t packed_channels = name == "dec_conv0.bias"
+        ? 8u : (channels + 15u) & ~15u;
+    auto packed = std::make_unique<Tensor>(Shape({16u, packed_channels}));
+    float16_t* destination = packed->cpu();
+    float16_t* source_data = source.cpu();
+    std::fill(destination, destination + packed->shape.count(), float16_t(0.0f));
+    for (uint32_t row = 0; row < 16u; ++row) {
+        std::copy(source_data, source_data + channels,
+                  destination + row * packed_channels);
+    }
+    packed->cpu_upload(false);
+    return packed;
+}
+
+uint32_t collapsed_tap(uint32_t phase, uint32_t kernel_index) {
+    if (phase == 0u) return kernel_index == 0u ? 0u : 1u;
+    return kernel_index == 2u ? 1u : 0u;
+}
+
+std::unique_ptr<Tensor> pack_weight(const std::string& name, Tensor& source) {
+    uint32_t output_channels = source.shape[0];
+    uint32_t input_channels = source.shape[1];
+    uint32_t kernel_height = source.shape[2];
+    uint32_t kernel_width = source.shape[3];
+    uint32_t kernel_elements = kernel_height * kernel_width;
+
+    bool compact_rgb_input = name == "enc_conv0.weight";
+    bool compact_rgb_output = name == "dec_conv0.weight";
+    bool compact_rgb_skip = name == "dec_conv1a.weight";
+    bool collapse_fast_phase =
+        (input_channels == 64u || input_channels == 96u) &&
+        output_channels == 64u && name.starts_with("dec_conv") &&
+        name.ends_with("a.weight");
+    bool collapse_phase = compact_rgb_skip || collapse_fast_phase;
+
+    uint32_t low_channels = 0u;
+    if (collapse_phase) {
+        uint32_t skip_channels = compact_rgb_skip ? 3u : 32u;
+        if (input_channels <= skip_channels) {
+            throw std::runtime_error("unsupported collapsed phase channel count");
+        }
+        low_channels = input_channels - skip_channels;
+        if ((low_channels % 16u) != 0u) {
+            throw std::runtime_error("unsupported collapsed phase channel count");
+        }
+    }
+
+    uint32_t packed_output_channels = compact_rgb_output
+        ? 8u : (output_channels + 15u) & ~15u;
+    uint32_t padded_k = ((input_channels + 15u) / 16u) * kernel_elements * 16u;
+    uint32_t packed_k = padded_k;
+    if (compact_rgb_input) {
+        packed_k = kernel_elements * 8u;
+    } else if (compact_rgb_skip) {
+        packed_k = low_channels / 16u * kernel_elements * 16u +
+                   kernel_elements * 8u;
+    }
+    uint32_t phase_k = low_channels / 16u * 4u * 16u;
+    auto packed = std::make_unique<Tensor>(
+        Shape({packed_k + 4u * phase_k, packed_output_channels}));
+    float16_t* destination = packed->cpu();
+    float16_t* source_data = source.cpu();
+    std::fill(destination, destination + packed->shape.count(), float16_t(0.0f));
+
+    for (uint32_t output_channel = 0; output_channel < output_channels;
+         ++output_channel) {
+        for (uint32_t input_channel = 0; input_channel < input_channels;
+             ++input_channel) {
+            for (uint32_t kernel_y = 0; kernel_y < kernel_height; ++kernel_y) {
+                for (uint32_t kernel_x = 0; kernel_x < kernel_width; ++kernel_x) {
+                    uint32_t kernel_offset = kernel_y * kernel_width + kernel_x;
+                    uint32_t k;
+                    if (compact_rgb_input) {
+                        k = kernel_offset * 8u + input_channel;
+                    } else if (compact_rgb_skip && input_channel >= low_channels) {
+                        k = low_channels / 16u * kernel_elements * 16u +
+                            kernel_offset * 8u + input_channel - low_channels;
+                    } else {
+                        k = ((input_channel / 16u) * kernel_elements + kernel_offset) *
+                                16u +
+                            input_channel % 16u;
+                    }
+                    uint32_t source_index =
+                        ((output_channel * input_channels + input_channel) *
+                             kernel_height +
+                         kernel_y) * kernel_width + kernel_x;
+                    destination[k * packed_output_channels + output_channel] =
+                        source_data[source_index];
+                }
+            }
+        }
+    }
+
+    if (collapse_phase) {
+        for (uint32_t phase_y = 0u; phase_y < 2u; ++phase_y) {
+            for (uint32_t phase_x = 0u; phase_x < 2u; ++phase_x) {
+                uint32_t phase = phase_y * 2u + phase_x;
+                for (uint32_t output_channel = 0u;
+                     output_channel < output_channels; ++output_channel) {
+                    for (uint32_t input_channel = 0u;
+                         input_channel < low_channels; ++input_channel) {
+                        for (uint32_t tap_y = 0u; tap_y < 2u; ++tap_y) {
+                            for (uint32_t tap_x = 0u; tap_x < 2u; ++tap_x) {
+                                float sum = 0.0f;
+                                for (uint32_t kernel_y = 0u; kernel_y < 3u;
+                                     ++kernel_y) {
+                                    if (collapsed_tap(phase_y, kernel_y) != tap_y) {
+                                        continue;
+                                    }
+                                    for (uint32_t kernel_x = 0u; kernel_x < 3u;
+                                         ++kernel_x) {
+                                        if (collapsed_tap(phase_x, kernel_x) != tap_x) {
+                                            continue;
+                                        }
+                                        uint32_t source_index =
+                                            ((output_channel * input_channels +
+                                              input_channel) * kernel_height +
+                                             kernel_y) * kernel_width + kernel_x;
+                                        sum += float(source_data[source_index]);
+                                        // Fast decoder weights must match the
+                                        // runtime FP16 fragment-add order.
+                                        if (!compact_rgb_skip) {
+                                            sum = float(float16_t(sum));
+                                        }
+                                    }
+                                }
+                                uint32_t tap = tap_y * 2u + tap_x;
+                                uint32_t k =
+                                    (input_channel / 16u * 4u + tap) * 16u +
+                                    input_channel % 16u;
+                                destination[(packed_k + phase * phase_k + k) *
+                                                packed_output_channels +
+                                            output_channel] = float16_t(sum);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    packed->cpu_upload(false);
+    return packed;
+}
+
 } // namespace
 
 struct Model::Kernels {
@@ -136,8 +283,10 @@ struct Model::Kernels {
     evk::Pipeline narrow_phase_concat_conv;
     evk::Pipeline prepacked_phase_concat_conv;
     evk::Pipeline conv_final;
+    evk::Pipeline conv_final_rows;
     evk::Pipeline max_pool;
     evk::Pipeline conv_pool;
+    evk::Pipeline conv_32_rows;
     evk::Pipeline to_rgb;
     evk::Pipeline fast_conv_3_32;
     evk::Pipeline fast_conv_32_32;
@@ -169,18 +318,21 @@ struct Model::Kernels {
         phase_concat_conv = create("oidn_concat_phase");
         narrow_phase_concat_conv = create("oidn_concat_phase_narrow");
         prepacked_phase_concat_conv = create("oidn_concat_phase_prepacked");
-        conv_final = create("oidn_conv_output");
+        conv_final = create("oidn_conv_output_8");
+        conv_final_rows = create("oidn_conv_output_8_rows");
         max_pool = create("oidn_max_pool");
         conv_pool = create("oidn_conv_pool");
+        conv_32_rows = create("oidn_conv_32_rows");
         to_rgb = create("oidn_to_rgb");
-        fast_conv_3_32 = create_regular("oidn_fast_conv_3_32", 3u, 32u);
+        fast_conv_3_32 = create_regular(
+            "oidn_fast_conv_3_32", 3u, 32u, "oidn_conv_input_8");
         fast_conv_32_32 = create_regular("oidn_fast_conv_32_32", 32u, 32u);
         fast_conv_64_64 = create_regular("oidn_fast_conv_64_64", 64u, 64u);
         fast_conv_64_32 = create_regular("oidn_fast_conv_64_32", 64u, 32u);
         fast_phase_32_32_64 = create_phase(
-            "oidn_fast_phase_32_32_64", "oidn_concat_phase_narrow", 32u, 64u, 64u);
+            "oidn_fast_phase_32_32_64", "oidn_concat_phase_collapsed", 32u, 64u, 64u);
         fast_phase_64_32_64 = create_phase(
-            "oidn_fast_phase_64_32_64", "oidn_concat_phase_narrow", 64u, 96u, 64u);
+            "oidn_fast_phase_64_32_64", "oidn_concat_phase_collapsed", 64u, 96u, 64u);
         fast_phase_32_3_32 = create_phase(
             "oidn_fast_phase_32_3_32", "oidn_concat_phase_prepacked", 32u, 35u, 32u);
     }
@@ -193,8 +345,11 @@ struct Model::Kernels {
     }
 
     static evk::Pipeline create_regular(const char* name, uint32_t input_channels,
-                                        uint32_t output_channels) {
-        const char* shader = output_channels <= 64u ? "oidn_conv_narrow" : "oidn_conv";
+                                        uint32_t output_channels,
+                                        const char* shader = nullptr) {
+        if (!shader) {
+            shader = output_channels <= 64u ? "oidn_conv_narrow" : "oidn_conv";
+        }
         return evk::CreatePipeline({
             .name = name,
             .CS = evk::loadSpirvFile(
@@ -219,6 +374,23 @@ struct Model::Kernels {
         });
     }
 
+    void convolution_rows(const evk::Pipeline& pipeline, evk::Buffer& input,
+                          Tensor& weight, Tensor& bias, Tensor& output,
+                          uint32_t width, uint32_t height) const {
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(pipeline);
+        cmd.push(evk::Constant{
+            input.GetReference(),
+            weight.buffer.GetReference(),
+            bias.buffer.GetReference(),
+            output.buffer.GetReference(),
+            width,
+            height,
+        });
+        cmd.dispatch((width + 63u) / 64u, height / 4u, 1u);
+        cmd.barrier();
+    }
+
     void convolution(Tensor& input, Tensor& weight, Tensor& bias, Tensor& output,
                      bool activation) const {
         uint32_t height = input.shape[1];
@@ -229,6 +401,12 @@ struct Model::Kernels {
         auto& cmd = evk::ai::GetCmd();
 
         if (!activation) {
+            if (input_channels == 32u && output_channels == 8u &&
+                (height % 4u) == 0u) {
+                convolution_rows(conv_final_rows, input.buffer, weight, bias,
+                                 output, width, height);
+                return;
+            }
             cmd.bind(conv_final);
             cmd.push(evk::Constant{
                 input.buffer.GetReference(),
@@ -308,6 +486,12 @@ struct Model::Kernels {
         uint32_t output_channels = output.shape[3];
         uint32_t padded_k = ((input_channels + 15u) / 16u) * 9u * 16u;
         auto& cmd = evk::ai::GetCmd();
+        if (!fused && input_channels == 32u && output_channels == 32u &&
+            (height % 4u) == 0u) {
+            convolution_rows(conv_32_rows, input, weight, bias, output,
+                             width, height);
+            return;
+        }
         bool narrow = output_channels <= 64u;
         const evk::Pipeline* specialized = nullptr;
         if (!fused && input_channels == 3u && output_channels == 32u) {
@@ -443,106 +627,13 @@ void Model::load(const std::string& weights_path) {
 
     std::unordered_map<std::string, std::unique_ptr<Tensor>> packed_parameters;
     for (const auto& [name, source] : parameters_) {
+        std::unique_ptr<Tensor> packed;
         if (name.ends_with(".bias")) {
-            uint32_t channels = source->shape[0];
-            uint32_t packed_channels = (channels + 15u) & ~15u;
-            auto packed = std::make_unique<Tensor>(Shape({16u, packed_channels}));
-            float16_t* destination = packed->cpu();
-            float16_t* source_data = source->cpu();
-            std::fill(destination, destination + packed->shape.count(), float16_t(0.0f));
-            for (uint32_t row = 0; row < 16u; ++row) {
-                std::copy(source_data, source_data + channels,
-                          destination + row * packed_channels);
-            }
-            packed->cpu_upload(false);
-            packed_parameters.emplace(name, std::move(packed));
-            continue;
+            packed = pack_bias(name, *source);
+        } else if (name.ends_with(".weight")) {
+            packed = pack_weight(name, *source);
         }
-        if (!name.ends_with(".weight")) continue;
-        uint32_t output_channels = source->shape[0];
-        uint32_t packed_output_channels = (output_channels + 15u) & ~15u;
-        uint32_t input_channels = source->shape[1];
-        uint32_t kernel_height = source->shape[2];
-        uint32_t kernel_width = source->shape[3];
-        uint32_t channel_blocks = (input_channels + 15u) / 16u;
-        uint32_t padded_k = channel_blocks * kernel_height * kernel_width * 16u;
-        bool prepack_phase = name == "dec_conv1a.weight";
-        uint32_t prepack_low_channels = 0u;
-        if (prepack_phase) {
-            if (input_channels <= 3u) {
-                throw std::runtime_error("unsupported dec_conv1a channel count");
-            }
-            prepack_low_channels = input_channels - 3u;
-            if ((prepack_low_channels % 16u) != 0u) {
-                throw std::runtime_error("unsupported dec_conv1a channel count");
-            }
-        }
-        uint32_t phase_k = prepack_low_channels / 16u * 4u * 16u;
-        auto packed = std::make_unique<Tensor>(
-            Shape({padded_k + 4u * phase_k, packed_output_channels}));
-        float16_t* destination = packed->cpu();
-        std::fill(destination, destination + packed->shape.count(), float16_t(0.0f));
-        float16_t* source_data = source->cpu();
-
-        for (uint32_t output_channel = 0; output_channel < output_channels; ++output_channel) {
-            for (uint32_t input_channel = 0; input_channel < input_channels; ++input_channel) {
-                for (uint32_t kernel_y = 0; kernel_y < kernel_height; ++kernel_y) {
-                    for (uint32_t kernel_x = 0; kernel_x < kernel_width; ++kernel_x) {
-                        uint32_t kernel_offset = kernel_y * kernel_width + kernel_x;
-                        uint32_t k = ((input_channel / 16u) * kernel_height * kernel_width +
-                                      kernel_offset) * 16u + input_channel % 16u;
-                        uint32_t source_index =
-                            ((output_channel * input_channels + input_channel) * kernel_height +
-                             kernel_y) * kernel_width + kernel_x;
-                        destination[k * packed_output_channels + output_channel] = source_data[source_index];
-                    }
-                }
-            }
-        }
-        if (prepack_phase) {
-            for (uint32_t phase_y = 0u; phase_y < 2u; ++phase_y) {
-                for (uint32_t phase_x = 0u; phase_x < 2u; ++phase_x) {
-                    uint32_t phase = phase_y * 2u + phase_x;
-                    for (uint32_t output_channel = 0u; output_channel < output_channels;
-                         ++output_channel) {
-                        for (uint32_t input_channel = 0u;
-                             input_channel < prepack_low_channels;
-                             ++input_channel) {
-                            for (uint32_t tap_y = 0u; tap_y < 2u; ++tap_y) {
-                                for (uint32_t tap_x = 0u; tap_x < 2u; ++tap_x) {
-                                    float sum = 0.0f;
-                                    for (uint32_t kernel_y = 0u; kernel_y < 3u; ++kernel_y) {
-                                        uint32_t mapped_y = phase_y == 0u
-                                            ? (kernel_y == 0u ? 0u : 1u)
-                                            : (kernel_y == 2u ? 1u : 0u);
-                                        if (mapped_y != tap_y) continue;
-                                        for (uint32_t kernel_x = 0u; kernel_x < 3u; ++kernel_x) {
-                                            uint32_t mapped_x = phase_x == 0u
-                                                ? (kernel_x == 0u ? 0u : 1u)
-                                                : (kernel_x == 2u ? 1u : 0u);
-                                            if (mapped_x != tap_x) continue;
-                                            uint32_t source_index =
-                                                ((output_channel * input_channels + input_channel) *
-                                                 kernel_height + kernel_y) * kernel_width + kernel_x;
-                                            sum += float(source_data[source_index]);
-                                        }
-                                    }
-                                    uint32_t tap = tap_y * 2u + tap_x;
-                                    uint32_t k = (input_channel / 16u * 4u + tap) * 16u +
-                                                 input_channel % 16u;
-                                    destination[(padded_k + phase * phase_k + k) *
-                                                    packed_output_channels + output_channel] =
-                                        float16_t(sum);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        packed->cpu_upload(false);
-        packed_parameters.emplace(name, std::move(packed));
-
+        if (packed) packed_parameters.emplace(name, std::move(packed));
     }
     SubmitCmd(true);
     packed_parameters_ = std::move(packed_parameters);
@@ -605,7 +696,7 @@ Tensor& Model::build(Graph& graph, Tensor& input) const {
         Tensor& weight = packed_parameter(weight_name);
         Tensor& bias = packed_parameter(bias_name);
         uint32_t output_channels = parameter(bias_name).shape[0];
-        uint32_t storage_channels = activation ? output_channels : (output_channels + 15u) & ~15u;
+        uint32_t storage_channels = activation ? output_channels : 8u;
         Tensor& output = graph.tensor(Shape({
             value.shape[0], value.shape[1], value.shape[2], storage_channels
         }));

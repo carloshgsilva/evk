@@ -44,10 +44,20 @@ const uint CHANNEL_SUBGROUPS = 8u;
 #endif
 const uint ROWS_PER_SUBGROUP = 64u;
 const uint ROWS_PER_WORKGROUP = 64u;
-const uint MATRIX_SIZE = 16u;
-const uint ROW_TILES = ROWS_PER_SUBGROUP / MATRIX_SIZE;
+const uint MATRIX_M = 16u;
+#ifdef OIDN_INPUT_K8
+const uint MATRIX_K = 8u;
+#else
+const uint MATRIX_K = 16u;
+#endif
+#ifdef OIDN_OUTPUT_N8
+const uint MATRIX_N = 8u;
+#else
+const uint MATRIX_N = 16u;
+#endif
+const uint ROW_TILES = ROWS_PER_SUBGROUP / MATRIX_M;
 const uint STAGED_WIDTH = ROWS_PER_SUBGROUP + 2u;
-const uint STAGED_ELEMENTS = 3u * STAGED_WIDTH * MATRIX_SIZE;
+const uint STAGED_ELEMENTS = 3u * STAGED_WIDTH * MATRIX_K;
 
 shared f16vec4 inputTiles[STAGED_ELEMENTS / 4u];
 
@@ -119,31 +129,31 @@ void main() {
     uint firstX = gl_WorkGroupID.x * ROWS_PER_WORKGROUP;
     uint firstY = gl_WorkGroupID.z;
     uint firstRow = firstY * width + firstX + rowGroup * ROWS_PER_SUBGROUP;
-    uint firstChannel = gl_WorkGroupID.y * CHANNEL_SUBGROUPS * MATRIX_SIZE +
-                        channelGroup * MATRIX_SIZE;
+    uint firstChannel = gl_WorkGroupID.y * CHANNEL_SUBGROUPS * MATRIX_N +
+                        channelGroup * MATRIX_N;
     uint loaderLane = channelGroup * SUBGROUP_SIZE + lane;
     uint spatialSize = width * height;
     uint sharedBase = rowGroup * STAGED_ELEMENTS;
     bool interior = firstX > 0u && firstX + ROWS_PER_WORKGROUP < width &&
                     firstY > 0u && firstY + 1u < height;
 
-    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_M, MATRIX_N,
             gl_MatrixUseAccumulator> accum[ROW_TILES];
     for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
-        accum[rowTile] = coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE,
-                                 MATRIX_SIZE, gl_MatrixUseAccumulator>(0.0);
+        accum[rowTile] = coopmat<float16_t, gl_ScopeSubgroup, MATRIX_M,
+                                 MATRIX_N, gl_MatrixUseAccumulator>(0.0);
     }
 
     uint channelBlocks = FIXED_CHANNEL_BLOCKS != 0u
-        ? FIXED_CHANNEL_BLOCKS : paddedK / (9u * MATRIX_SIZE);
+        ? FIXED_CHANNEL_BLOCKS : paddedK / (9u * MATRIX_K);
     for (uint channelBlock = 0u; channelBlock < channelBlocks; ++channelBlock) {
         {
             const uint vectorElements = STAGED_ELEMENTS / 4u;
             for (uint vectorIndex = loaderLane; vectorIndex < vectorElements;
                  vectorIndex += CHANNEL_SUBGROUPS * SUBGROUP_SIZE) {
                 uint index = vectorIndex * 4u;
-                uint inputChannel = channelBlock * MATRIX_SIZE + index % MATRIX_SIZE;
-                uint stagedPixel = index / MATRIX_SIZE;
+                uint inputChannel = channelBlock * MATRIX_K + index % MATRIX_K;
+                uint stagedPixel = index / MATRIX_K;
                 uint stagedY = stagedPixel / STAGED_WIDTH;
                 uint stagedX = stagedPixel - stagedY * STAGED_WIDTH;
                 f16vec4 value = f16vec4(0.0);
@@ -168,23 +178,23 @@ void main() {
         barrier();
 
         for (uint kernelOffset = 0u; kernelOffset < 9u; ++kernelOffset) {
-            uint chunkK = (channelBlock * 9u + kernelOffset) * MATRIX_SIZE;
+            uint chunkK = (channelBlock * 9u + kernelOffset) * MATRIX_K;
             if (firstChannel < outputChannelCount) {
-                coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+                coopmat<float16_t, gl_ScopeSubgroup, MATRIX_K, MATRIX_N,
                         gl_MatrixUseB> weights;
                 coopMatLoad(weights, weightTensor.x,
                             chunkK * outputChannelCount + firstChannel,
                             outputChannelCount, gl_CooperativeMatrixLayoutRowMajor);
 
                 for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
-                    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+                    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_M, MATRIX_K,
                             gl_MatrixUseA> values;
                     uint kernelY = kernelOffset / 3u;
                     uint kernelX = kernelOffset - kernelY * 3u;
                     uint inputOffset = sharedBase +
-                        (kernelY * STAGED_WIDTH + rowTile * MATRIX_SIZE + kernelX) *
-                        MATRIX_SIZE;
-                    coopMatLoad(values, inputTiles, inputOffset / 4u, MATRIX_SIZE / 4u,
+                        (kernelY * STAGED_WIDTH + rowTile * MATRIX_M + kernelX) *
+                        MATRIX_K;
+                    coopMatLoad(values, inputTiles, inputOffset / 4u, MATRIX_K / 4u,
                                 gl_CooperativeMatrixLayoutRowMajor);
                     accum[rowTile] = coopMatMulAdd(values, weights, accum[rowTile]);
                 }
@@ -194,7 +204,7 @@ void main() {
     }
 
     if (firstChannel >= outputChannelCount) return;
-    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_M, MATRIX_N,
             gl_MatrixUseAccumulator> biasValues;
     coopMatLoad(biasValues, biasTensor.x, firstChannel, outputChannelCount,
                 gl_CooperativeMatrixLayoutRowMajor);
@@ -207,7 +217,7 @@ void main() {
 #endif
     }
     for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
-        uint rowX = firstX + rowTile * MATRIX_SIZE;
+        uint rowX = firstX + rowTile * MATRIX_M;
         if (rowX >= width) continue;
         uint row = firstY * width + rowX;
         coopMatStore(accum[rowTile], outputTensor.x,

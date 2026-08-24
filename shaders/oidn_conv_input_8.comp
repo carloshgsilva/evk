@@ -1,0 +1,3 @@
+#define OIDN_NARROW
+#define OIDN_INPUT_K8
+#include "oidn_conv.comp"

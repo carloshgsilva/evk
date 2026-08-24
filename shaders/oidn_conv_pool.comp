@@ -25,6 +25,15 @@ PUSH(
 const uint MATRIX_SIZE = 16u;
 const uint CHANNELS = 32u;
 const uint CHANNEL_BLOCKS = 2u;
+#ifdef OIDN_OUTPUT_N8
+const uint MATRIX_N = 8u;
+const uint CHANNEL_GROUPS = 1u;
+const uint OUTPUT_CHANNELS = 8u;
+#else
+const uint MATRIX_N = 16u;
+const uint CHANNEL_GROUPS = 2u;
+const uint OUTPUT_CHANNELS = 32u;
+#endif
 const uint ROWS = 64u;
 const uint ROW_TILES = ROWS / MATRIX_SIZE;
 const uint OUTPUT_ROWS = 4u;
@@ -34,9 +43,15 @@ const uint STAGED_ROWS = OUTPUT_ROWS + 2u;
 const uint STAGED_ELEMENTS = STAGED_ROWS * STAGED_WIDTH * MATRIX_SIZE;
 
 shared f16vec4 inputTiles[STAGED_ELEMENTS / 4u];
-shared float16_t convolutionTiles[OUTPUT_ROWS * ROWS * CHANNELS];
+#ifndef OIDN_NO_POOL
+shared float16_t convolutionTiles[OUTPUT_ROWS * ROWS * OUTPUT_CHANNELS];
+#endif
 
+#ifdef OIDN_OUTPUT_N8
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#else
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 f16vec4 load4(uint scalarIndex) {
     return ReadBufferFp16x4(uint64_t(inputTensor)).x[scalarIndex / 4u];
@@ -45,18 +60,18 @@ f16vec4 load4(uint scalarIndex) {
 void main() {
     uint subgroup = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
-    uint outputRow = subgroup / 2u;
-    uint channelGroup = subgroup & 1u;
-    uint firstChannel = channelGroup * MATRIX_SIZE;
+    uint outputRow = subgroup / CHANNEL_GROUPS;
+    uint channelGroup = subgroup % CHANNEL_GROUPS;
+    uint firstChannel = channelGroup * MATRIX_N;
     uint firstX = gl_WorkGroupID.x * ROWS;
     uint firstY = gl_WorkGroupID.y * OUTPUT_ROWS;
     uint loaderLane = gl_LocalInvocationID.x;
 
-    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_N,
             gl_MatrixUseAccumulator> accum[ROW_TILES];
     for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
         accum[rowTile] = coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE,
-                                 MATRIX_SIZE, gl_MatrixUseAccumulator>(0.0);
+                                 MATRIX_N, gl_MatrixUseAccumulator>(0.0);
     }
 
     bool interior = firstX > 0u && firstX + ROWS < width &&
@@ -87,11 +102,11 @@ void main() {
             uint kernelY = kernelOffset / 3u;
             uint kernelX = kernelOffset - kernelY * 3u;
             uint chunkK = (channelBlock * 9u + kernelOffset) * MATRIX_SIZE;
-            coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+            coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_N,
                     gl_MatrixUseB> weights;
             coopMatLoad(weights, weightTensor.x,
-                        chunkK * CHANNELS + firstChannel,
-                        CHANNELS, gl_CooperativeMatrixLayoutRowMajor);
+                        chunkK * OUTPUT_CHANNELS + firstChannel,
+                        OUTPUT_CHANNELS, gl_CooperativeMatrixLayoutRowMajor);
             for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
                 coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
                         gl_MatrixUseA> values;
@@ -105,43 +120,57 @@ void main() {
         barrier();
     }
 
-    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_N,
             gl_MatrixUseAccumulator> biasValues;
-    coopMatLoad(biasValues, biasTensor.x, firstChannel, CHANNELS,
+    coopMatLoad(biasValues, biasTensor.x, firstChannel, OUTPUT_CHANNELS,
                 gl_CooperativeMatrixLayoutRowMajor);
     for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
         accum[rowTile] = accum[rowTile] + biasValues;
+#ifndef OIDN_NO_RELU
         for (uint element = 0u; element < accum[rowTile].length(); ++element) {
             accum[rowTile][element] = max(float16_t(0.0), accum[rowTile][element]);
         }
-        uint tileOffset = (outputRow * ROWS + rowTile * MATRIX_SIZE) * CHANNELS +
+#endif
+#ifdef OIDN_NO_POOL
+        uint outputX = firstX + rowTile * MATRIX_SIZE;
+        uint outputY = firstY + outputRow;
+        if (outputX < width && outputY < height) {
+            coopMatStore(accum[rowTile], outputTensor.x,
+                         (outputY * width + outputX) * OUTPUT_CHANNELS + firstChannel,
+                         OUTPUT_CHANNELS, gl_CooperativeMatrixLayoutRowMajor);
+        }
+#else
+        uint tileOffset = (outputRow * ROWS + rowTile * MATRIX_SIZE) * OUTPUT_CHANNELS +
                           firstChannel;
-        coopMatStore(accum[rowTile], convolutionTiles, tileOffset, CHANNELS,
+        coopMatStore(accum[rowTile], convolutionTiles, tileOffset, OUTPUT_CHANNELS,
                      gl_CooperativeMatrixLayoutRowMajor);
+#endif
     }
+#ifndef OIDN_NO_POOL
     barrier();
 
-    const uint pooledRowElements = (ROWS / 2u) * CHANNELS;
+    const uint pooledRowElements = (ROWS / 2u) * OUTPUT_CHANNELS;
     const uint pooledElements = POOLED_ROWS * pooledRowElements;
     uint outputWidth = width / 2u;
     for (uint index = loaderLane; index < pooledElements;
          index += gl_WorkGroupSize.x) {
         uint pooledRow = index / pooledRowElements;
         uint rowIndex = index - pooledRow * pooledRowElements;
-        uint pooledX = rowIndex / CHANNELS;
-        uint channel = rowIndex - pooledX * CHANNELS;
+        uint pooledX = rowIndex / OUTPUT_CHANNELS;
+        uint channel = rowIndex - pooledX * OUTPUT_CHANNELS;
         uint outputX = firstX / 2u + pooledX;
         if (outputX < outputWidth) {
             uint inputX = pooledX * 2u;
-            uint top = (pooledRow * 2u * ROWS + inputX) * CHANNELS + channel;
-            uint bottom = ((pooledRow * 2u + 1u) * ROWS + inputX) * CHANNELS +
+            uint top = (pooledRow * 2u * ROWS + inputX) * OUTPUT_CHANNELS + channel;
+            uint bottom = ((pooledRow * 2u + 1u) * ROWS + inputX) * OUTPUT_CHANNELS +
                           channel;
             float16_t value = max(
-                max(convolutionTiles[top], convolutionTiles[top + CHANNELS]),
-                max(convolutionTiles[bottom], convolutionTiles[bottom + CHANNELS]));
+                max(convolutionTiles[top], convolutionTiles[top + OUTPUT_CHANNELS]),
+                max(convolutionTiles[bottom], convolutionTiles[bottom + OUTPUT_CHANNELS]));
             uint outputY = gl_WorkGroupID.y * POOLED_ROWS + pooledRow;
-            outputTensor.x[(outputY * outputWidth + outputX) * CHANNELS + channel] =
+            outputTensor.x[(outputY * outputWidth + outputX) * OUTPUT_CHANNELS + channel] =
                 value;
         }
     }
+#endif
 }

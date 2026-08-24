@@ -123,9 +123,14 @@ void main() {
                         gl_MatrixUseB> weights;
                 uint phase = phaseY * 2u + phaseX;
                 uint phaseK = lowBlocks * 4u * MATRIX_SIZE;
+#ifdef OIDN_RGB_K8
+                uint phaseBase = lowBlocks * 9u * MATRIX_SIZE + 9u * 8u;
+#else
+                uint phaseBase = paddedK;
+#endif
                 uint chunkK = (channelBlock * 4u + tap) * MATRIX_SIZE;
                 coopMatLoad(weights, weightTensor.x,
-                            (paddedK + phase * phaseK + chunkK) * outputChannelCount +
+                            (phaseBase + phase * phaseK + chunkK) * outputChannelCount +
                                 firstChannel,
                             outputChannelCount, gl_CooperativeMatrixLayoutRowMajor);
 #else
@@ -160,13 +165,18 @@ void main() {
               }
             }
         } else {
-            const uint vectorElements = 3u * HIGH_TILE_WIDTH * MATRIX_SIZE / 4u;
+#ifdef OIDN_RGB_K8
+            const uint skipMatrixK = 8u;
+#else
+            const uint skipMatrixK = MATRIX_SIZE;
+#endif
+            const uint vectorElements = 3u * HIGH_TILE_WIDTH * skipMatrixK / 4u;
             uint skipBlock = channelBlock - lowBlocks;
             for (uint vectorIndex = loaderLane; vectorIndex < vectorElements;
                  vectorIndex += CHANNEL_SUBGROUPS * SUBGROUP_SIZE) {
                 uint scalarIndex = vectorIndex * 4u;
-                uint channel = skipBlock * MATRIX_SIZE + scalarIndex % MATRIX_SIZE;
-                uint pixel = scalarIndex / MATRIX_SIZE;
+                uint channel = skipBlock * skipMatrixK + scalarIndex % skipMatrixK;
+                uint pixel = scalarIndex / skipMatrixK;
                 uint tileY = pixel / HIGH_TILE_WIDTH;
                 uint tileX = pixel - tileY * HIGH_TILE_WIDTH;
                 int inputY = int(outputY) + int(tileY) - 1;
@@ -197,19 +207,25 @@ void main() {
               for (uint kernelOffset = 0u; kernelOffset < 9u; ++kernelOffset) {
                 uint kernelY = kernelOffset / 3u;
                 uint kernelX = kernelOffset - kernelY * 3u;
-                uint chunkK = (channelBlock * 9u + kernelOffset) * MATRIX_SIZE;
-                coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+                uint chunkK;
+#ifdef OIDN_RGB_K8
+                chunkK = lowBlocks * 9u * MATRIX_SIZE +
+                         skipBlock * 9u * skipMatrixK + kernelOffset * skipMatrixK;
+#else
+                chunkK = (channelBlock * 9u + kernelOffset) * MATRIX_SIZE;
+#endif
+                coopmat<float16_t, gl_ScopeSubgroup, skipMatrixK, MATRIX_SIZE,
                         gl_MatrixUseB> weights;
                 coopMatLoad(weights, weightTensor.x,
                             chunkK * outputChannelCount + firstChannel,
                             outputChannelCount, gl_CooperativeMatrixLayoutRowMajor);
                 for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
-                    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+                    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, skipMatrixK,
                             gl_MatrixUseA> values;
                     uint inputOffset = (kernelY * HIGH_TILE_WIDTH +
-                                        rowTile * MATRIX_SIZE * 2u + kernelX) * MATRIX_SIZE;
+                                        rowTile * MATRIX_SIZE * 2u + kernelX) * skipMatrixK;
                     coopMatLoad(values, inputTiles, inputOffset / 4u,
-                                MATRIX_SIZE * 2u / 4u,
+                                skipMatrixK * 2u / 4u,
                                 gl_CooperativeMatrixLayoutRowMajor);
                     accum[rowTile] = coopMatMulAdd(values, weights, accum[rowTile]);
                 }

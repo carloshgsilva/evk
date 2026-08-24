@@ -1,0 +1,2 @@
+#define OIDN_NO_POOL
+#include "oidn_conv_pool.comp"
