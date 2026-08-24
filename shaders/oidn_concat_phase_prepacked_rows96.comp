@@ -1,0 +1,5 @@
+#define OIDN_NARROW
+#define OIDN_RGB_K8
+#define OIDN_PREPACKED_WEIGHTS
+#define OIDN_ROWS_96
+#include "oidn_concat_phase.comp"

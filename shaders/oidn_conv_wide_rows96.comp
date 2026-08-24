@@ -1,0 +1,2 @@
+#define OIDN_ROWS_96
+#include "oidn_conv.comp"

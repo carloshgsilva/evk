@@ -1,0 +1,2 @@
+#define OIDN_ROWS_128
+#include "oidn_conv_decoder_rows.comp"

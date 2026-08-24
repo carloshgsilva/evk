@@ -42,8 +42,16 @@ const uint CHANNEL_SUBGROUPS = 4u;
 const uint SUBGROUPS_PER_WORKGROUP = 8u;
 const uint CHANNEL_SUBGROUPS = 8u;
 #endif
+#ifdef OIDN_ROWS_96
+const uint ROWS_PER_SUBGROUP = 96u;
+const uint ROWS_PER_WORKGROUP = 96u;
+#elif defined(OIDN_ROWS_80)
+const uint ROWS_PER_SUBGROUP = 80u;
+const uint ROWS_PER_WORKGROUP = 80u;
+#else
 const uint ROWS_PER_SUBGROUP = 64u;
 const uint ROWS_PER_WORKGROUP = 64u;
+#endif
 const uint MATRIX_M = 16u;
 #ifdef OIDN_INPUT_K8
 const uint MATRIX_K = 8u;

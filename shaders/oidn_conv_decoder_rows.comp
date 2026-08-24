@@ -1,0 +1,125 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+CONSTANT(0) uint FIXED_INPUT_CHANNELS = 0u;
+CONSTANT(1) uint FIXED_OUTPUT_CHANNELS = 0u;
+CONSTANT(2) uint FIXED_CHANNEL_BLOCKS = 0u;
+
+layout(buffer_reference) readonly buffer ReadBufferFp16 { float16_t x[]; };
+layout(buffer_reference, buffer_reference_align = 8) readonly buffer ReadBufferFp16x4 {
+    f16vec4 x[];
+};
+layout(buffer_reference) writeonly buffer WriteBufferFp16 { float16_t x[]; };
+PUSH(
+    ReadBufferFp16 inputTensor;
+    ReadBufferFp16 weightTensor;
+    ReadBufferFp16 biasTensor;
+    WriteBufferFp16 outputTensor;
+    uint width;
+    uint height;
+)
+
+const uint MATRIX_SIZE = 16u;
+#ifdef OIDN_ROWS_128
+const uint ROWS = 128u;
+#else
+const uint ROWS = 64u;
+#endif
+const uint ROW_TILES = ROWS / MATRIX_SIZE;
+const uint MAX_OUTPUT_ROWS = 4u;
+const uint STAGED_WIDTH = ROWS + 2u;
+const uint STAGED_ELEMENTS = (MAX_OUTPUT_ROWS + 2u) * STAGED_WIDTH * MATRIX_SIZE;
+
+shared f16vec4 inputTiles[STAGED_ELEMENTS / 4u];
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint channelGroups = FIXED_OUTPUT_CHANNELS / MATRIX_SIZE;
+    uint outputRows = 8u / channelGroups;
+    uint subgroup = gl_SubgroupID;
+    uint outputRow = subgroup / channelGroups;
+    uint firstChannel = (subgroup % channelGroups) * MATRIX_SIZE;
+    uint firstX = gl_WorkGroupID.x * ROWS;
+    uint firstY = gl_WorkGroupID.y * outputRows;
+    bool interior = firstX > 0u && firstX + ROWS < width &&
+                    firstY > 0u && firstY + outputRows < height;
+
+    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+            gl_MatrixUseAccumulator> accum[ROW_TILES];
+    for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
+        accum[rowTile] = coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE,
+                                 MATRIX_SIZE, gl_MatrixUseAccumulator>(0.0);
+    }
+
+    for (uint channelBlock = 0u; channelBlock < FIXED_CHANNEL_BLOCKS;
+         ++channelBlock) {
+        uint vectorElements = (outputRows + 2u) * STAGED_WIDTH * MATRIX_SIZE / 4u;
+        for (uint vectorIndex = gl_LocalInvocationID.x;
+             vectorIndex < vectorElements; vectorIndex += gl_WorkGroupSize.x) {
+            uint scalarIndex = vectorIndex * 4u;
+            uint channel = channelBlock * MATRIX_SIZE + scalarIndex % MATRIX_SIZE;
+            uint pixel = scalarIndex / MATRIX_SIZE;
+            uint tileY = pixel / STAGED_WIDTH;
+            uint tileX = pixel - tileY * STAGED_WIDTH;
+            int inputY = int(firstY) + int(tileY) - 1;
+            int inputX = int(firstX) + int(tileX) - 1;
+            f16vec4 value = f16vec4(0.0);
+            if (interior || (inputY >= 0 && inputY < int(height) &&
+                             inputX >= 0 && inputX < int(width))) {
+                uint inputIndex = (uint(inputY) * width + uint(inputX)) *
+                                  FIXED_INPUT_CHANNELS + channel;
+                value = ReadBufferFp16x4(uint64_t(inputTensor)).x[inputIndex / 4u];
+            }
+            inputTiles[vectorIndex] = value;
+        }
+        barrier();
+
+        for (uint kernelOffset = 0u; kernelOffset < 9u; ++kernelOffset) {
+            uint kernelY = kernelOffset / 3u;
+            uint kernelX = kernelOffset - kernelY * 3u;
+            uint chunkK = (channelBlock * 9u + kernelOffset) * MATRIX_SIZE;
+            coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+                    gl_MatrixUseB> weights;
+            coopMatLoad(weights, weightTensor.x,
+                        chunkK * FIXED_OUTPUT_CHANNELS + firstChannel,
+                        FIXED_OUTPUT_CHANNELS, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
+                coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+                        gl_MatrixUseA> values;
+                uint inputOffset = ((kernelY + outputRow) * STAGED_WIDTH +
+                                    rowTile * MATRIX_SIZE + kernelX) * MATRIX_SIZE;
+                coopMatLoad(values, inputTiles, inputOffset / 4u, MATRIX_SIZE / 4u,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                accum[rowTile] = coopMatMulAdd(values, weights, accum[rowTile]);
+            }
+        }
+        barrier();
+    }
+
+    coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
+            gl_MatrixUseAccumulator> biasValues;
+    coopMatLoad(biasValues, biasTensor.x, firstChannel, FIXED_OUTPUT_CHANNELS,
+                gl_CooperativeMatrixLayoutRowMajor);
+    for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
+        accum[rowTile] = accum[rowTile] + biasValues;
+        for (uint element = 0u; element < accum[rowTile].length(); ++element) {
+            accum[rowTile][element] = max(float16_t(0.0), accum[rowTile][element]);
+        }
+        uint outputX = firstX + rowTile * MATRIX_SIZE;
+        uint outputY = firstY + outputRow;
+        if (outputX < width && outputY < height) {
+            coopMatStore(accum[rowTile], outputTensor.x,
+                         (outputY * width + outputX) * FIXED_OUTPUT_CHANNELS +
+                             firstChannel,
+                         FIXED_OUTPUT_CHANNELS, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

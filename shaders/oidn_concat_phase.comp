@@ -40,13 +40,22 @@ const uint CHANNEL_SUBGROUPS = 4u;
 const uint CHANNEL_SUBGROUPS = 8u;
 #endif
 const uint MATRIX_SIZE = 16u;
+#ifdef OIDN_ROWS_96
+const uint ROWS = 96u;
+#elif defined(OIDN_ROWS_80)
+const uint ROWS = 80u;
+#else
 const uint ROWS = 64u;
+#endif
 const uint ROW_TILES = ROWS / MATRIX_SIZE;
 const uint LOW_TILE_WIDTH = ROWS + 1u;
 const uint HIGH_TILE_WIDTH = ROWS * 2u + 1u;
 const uint SHARED_ELEMENTS = 3u * HIGH_TILE_WIDTH * MATRIX_SIZE;
 
 shared f16vec4 inputTiles[SHARED_ELEMENTS / 4u];
+#ifdef OIDN_TAIL
+shared float16_t outputTail[CHANNEL_SUBGROUPS * MATRIX_SIZE * MATRIX_SIZE];
+#endif
 
 #ifdef OIDN_NARROW
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
@@ -247,8 +256,31 @@ void main() {
         }
         uint outputX = firstX + rowTile * MATRIX_SIZE * 2u;
         if (outputX >= width) continue;
+#ifdef OIDN_TAIL
+        if (outputX + (MATRIX_SIZE - 1u) * 2u < width) {
+            coopMatStore(accum[rowTile], outputTensor.x,
+                         (outputY * width + outputX) * outputChannelCount + firstChannel,
+                         outputChannelCount * 2u, gl_CooperativeMatrixLayoutRowMajor);
+        } else {
+            uint tailBase = channelGroup * MATRIX_SIZE * MATRIX_SIZE;
+            coopMatStore(accum[rowTile], outputTail, tailBase, MATRIX_SIZE,
+                         gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            for (uint index = lane; index < MATRIX_SIZE * MATRIX_SIZE;
+                 index += SUBGROUP_SIZE) {
+                uint tailX = outputX + (index / MATRIX_SIZE) * 2u;
+                uint channel = firstChannel + index % MATRIX_SIZE;
+                if (tailX < width && channel < outputChannelCount) {
+                    outputTensor.x[(outputY * width + tailX) * outputChannelCount + channel] =
+                        outputTail[tailBase + index];
+                }
+            }
+        }
+#else
         coopMatStore(accum[rowTile], outputTensor.x,
                      (outputY * width + outputX) * outputChannelCount + firstChannel,
                      outputChannelCount * 2u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
     }
 }
