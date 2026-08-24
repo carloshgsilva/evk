@@ -1967,7 +1967,7 @@ namespace evk {
 
         res->instancesBuffer = CreateBuffer({
             .name = "Instances Buffer",
-            .size = sizeof(VkAccelerationStructureInstanceKHR) * res->instances.size(),
+            .size = sizeof(VkAccelerationStructureInstanceKHR) * res->instances.size() * GetFrameBufferingCount(),
             .usage = BufferUsage::Storage | BufferUsage::AccelerationStructureInput,
             .memoryType = MemoryType::CPU_TO_GPU,
         });
@@ -2153,7 +2153,10 @@ namespace evk {
                 .accelerationStructureReference = internalBlas.accStructureDeviceAddress,
             };
         }
-        WriteBuffer(res.instancesBuffer, res.instances.data(), blasInstances.size() * sizeof(VkAccelerationStructureInstanceKHR));
+        uint64_t instance_frame_size = res.instances.size() * sizeof(VkAccelerationStructureInstanceKHR);
+        uint64_t instance_frame_offset = instance_frame_size * GetFrameIndex();
+        res.geometry.geometry.instances.data.deviceAddress = ToInternal(res.instancesBuffer).deviceAddress + instance_frame_offset;
+        WriteBuffer(res.instancesBuffer, res.instances.data(), blasInstances.size() * sizeof(VkAccelerationStructureInstanceKHR), instance_frame_offset);
 
         Buffer scratchBuffer = CreateBuffer({
             .name = "TLAS Scratch",
@@ -2173,9 +2176,9 @@ namespace evk {
         const VkAccelerationStructureBuildRangeInfoKHR* pBuildOffsetInfo = &buildOffsetInfo;
 
         VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-        vkCmdPipelineBarrier(GetFrame().cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        vkCmdPipelineBarrier(GetFrame().cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
         // Build the TLAS
         S.vkCmdBuildAccelerationStructuresKHR(GetFrame().cmd, 1, &res.buildInfo, &pBuildOffsetInfo);
     }
