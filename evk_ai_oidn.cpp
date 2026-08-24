@@ -137,7 +137,15 @@ struct Model::Kernels {
     evk::Pipeline prepacked_phase_concat_conv;
     evk::Pipeline conv_final;
     evk::Pipeline max_pool;
+    evk::Pipeline conv_pool;
     evk::Pipeline to_rgb;
+    evk::Pipeline fast_conv_3_32;
+    evk::Pipeline fast_conv_32_32;
+    evk::Pipeline fast_conv_64_64;
+    evk::Pipeline fast_conv_64_32;
+    evk::Pipeline fast_phase_32_32_64;
+    evk::Pipeline fast_phase_64_32_64;
+    evk::Pipeline fast_phase_32_3_32;
 
     Kernels() {
         if (!evk::GetFeatures().coopmat) {
@@ -163,13 +171,51 @@ struct Model::Kernels {
         prepacked_phase_concat_conv = create("oidn_concat_phase_prepacked");
         conv_final = create("oidn_conv_output");
         max_pool = create("oidn_max_pool");
+        conv_pool = create("oidn_conv_pool");
         to_rgb = create("oidn_to_rgb");
+        fast_conv_3_32 = create_regular("oidn_fast_conv_3_32", 3u, 32u);
+        fast_conv_32_32 = create_regular("oidn_fast_conv_32_32", 32u, 32u);
+        fast_conv_64_64 = create_regular("oidn_fast_conv_64_64", 64u, 64u);
+        fast_conv_64_32 = create_regular("oidn_fast_conv_64_32", 64u, 32u);
+        fast_phase_32_32_64 = create_phase(
+            "oidn_fast_phase_32_32_64", "oidn_concat_phase_narrow", 32u, 64u, 64u);
+        fast_phase_64_32_64 = create_phase(
+            "oidn_fast_phase_64_32_64", "oidn_concat_phase_narrow", 64u, 96u, 64u);
+        fast_phase_32_3_32 = create_phase(
+            "oidn_fast_phase_32_3_32", "oidn_concat_phase_prepacked", 32u, 35u, 32u);
     }
 
     static evk::Pipeline create(const char* name) {
         return evk::CreatePipeline({
             .name = name,
             .CS = evk::loadSpirvFile(std::string("shaders/bin/") + name + ".comp.spv"),
+        });
+    }
+
+    static evk::Pipeline create_regular(const char* name, uint32_t input_channels,
+                                        uint32_t output_channels) {
+        const char* shader = output_channels <= 64u ? "oidn_conv_narrow" : "oidn_conv";
+        return evk::CreatePipeline({
+            .name = name,
+            .CS = evk::loadSpirvFile(
+                std::string("shaders/bin/") + shader + ".comp.spv"),
+            .constants = evk::Constant{
+                0u, input_channels, output_channels,
+                (input_channels + 15u) / 16u},
+        });
+    }
+
+    static evk::Pipeline create_phase(const char* name, const char* shader,
+                                      uint32_t low_channels, uint32_t input_channels,
+                                      uint32_t output_channels) {
+        return evk::CreatePipeline({
+            .name = name,
+            .CS = evk::loadSpirvFile(
+                std::string("shaders/bin/") + shader + ".comp.spv"),
+            .constants = evk::Constant{
+                low_channels / 16u,
+                (input_channels + 15u) / 16u,
+                output_channels},
         });
     }
 
@@ -214,7 +260,15 @@ struct Model::Kernels {
         if ((skip.shape[2] % 32u) == 0u) {
             auto& cmd = evk::ai::GetCmd();
             uint32_t output_channels = output.shape[3];
-            if (skip.shape[3] == 3u) {
+            if (low_resolution.shape[3] == 32u && skip.shape[3] == 3u) {
+                cmd.bind(fast_phase_32_3_32);
+            } else if (low_resolution.shape[3] == 32u && skip.shape[3] == 32u &&
+                       output_channels == 64u) {
+                cmd.bind(fast_phase_32_32_64);
+            } else if (low_resolution.shape[3] == 64u && skip.shape[3] == 32u &&
+                       output_channels == 64u) {
+                cmd.bind(fast_phase_64_32_64);
+            } else if (skip.shape[3] == 3u) {
                 cmd.bind(prepacked_phase_concat_conv);
             } else {
                 cmd.bind(output_channels <= 64u ? narrow_phase_concat_conv : phase_concat_conv);
@@ -255,7 +309,19 @@ struct Model::Kernels {
         uint32_t padded_k = ((input_channels + 15u) / 16u) * 9u * 16u;
         auto& cmd = evk::ai::GetCmd();
         bool narrow = output_channels <= 64u;
-        if (narrow) {
+        const evk::Pipeline* specialized = nullptr;
+        if (!fused && input_channels == 3u && output_channels == 32u) {
+            specialized = &fast_conv_3_32;
+        } else if (!fused && input_channels == 32u && output_channels == 32u) {
+            specialized = &fast_conv_32_32;
+        } else if (!fused && input_channels == 64u && output_channels == 64u) {
+            specialized = &fast_conv_64_64;
+        } else if (!fused && input_channels == 64u && output_channels == 32u) {
+            specialized = &fast_conv_64_32;
+        }
+        if (specialized) {
+            cmd.bind(*specialized);
+        } else if (narrow) {
             cmd.bind(fused ? narrow_concat_conv : narrow_conv);
         } else {
             cmd.bind(fused ? concat_conv : conv);
@@ -294,6 +360,22 @@ struct Model::Kernels {
             output.shape[3],
         });
         cmd.dispatch((output.shape.count() + 255u) / 256u, 1u, 1u);
+        cmd.barrier();
+    }
+
+    void convolution_pooling(Tensor& input, Tensor& weight, Tensor& bias,
+                             Tensor& output) const {
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(conv_pool);
+        cmd.push(evk::Constant{
+            input.buffer.GetReference(),
+            weight.buffer.GetReference(),
+            bias.buffer.GetReference(),
+            output.buffer.GetReference(),
+            input.shape[2],
+            input.shape[1],
+        });
+        cmd.dispatch((input.shape[2] + 63u) / 64u, input.shape[1] / 4u, 1u);
         cmd.barrier();
     }
 
@@ -572,18 +654,33 @@ Tensor& Model::build(Graph& graph, Tensor& input) const {
         return output;
     };
 
+    auto conv_pool = [this, &graph, &conv, &pool](const char* conv_name,
+                                                  const char* pool_name,
+                                                  Tensor& value) -> Tensor& {
+        std::string bias_name = std::string(conv_name) + ".bias";
+        uint32_t output_channels = parameter(bias_name).shape[0];
+        if (value.shape[3] != 32u || output_channels != 32u ||
+            (value.shape[1] % 4u) != 0u) {
+            return pool(pool_name, conv(conv_name, value));
+        }
+
+        Tensor& weight = packed_parameter(std::string(conv_name) + ".weight");
+        Tensor& bias = packed_parameter(bias_name);
+        Tensor& output = graph.tensor(Shape({
+            value.shape[0], value.shape[1] / 2u, value.shape[2] / 2u, 32u
+        }));
+        output.name = std::string(conv_name) + ".conv2d";
+        output.forward_fn = [this, &value, &weight, &bias, &output]() {
+            kernels_->convolution_pooling(value, weight, bias, output);
+        };
+        return output;
+    };
+
     Tensor* x = &conv("enc_conv0", input);
-    x = &conv("enc_conv1", *x);
-    Tensor& pool1 = pool("pool1", *x);
-
-    x = &conv("enc_conv2", pool1);
-    Tensor& pool2 = pool("pool2", *x);
-
-    x = &conv("enc_conv3", pool2);
-    Tensor& pool3 = pool("pool3", *x);
-
-    x = &conv("enc_conv4", pool3);
-    Tensor& pool4 = pool("pool4", *x);
+    Tensor& pool1 = conv_pool("enc_conv1", "pool1", *x);
+    Tensor& pool2 = conv_pool("enc_conv2", "pool2", pool1);
+    Tensor& pool3 = conv_pool("enc_conv3", "pool3", pool2);
+    Tensor& pool4 = conv_pool("enc_conv4", "pool4", pool3);
 
     x = &conv("enc_conv5a", pool4);
     x = &conv("enc_conv5b", *x);

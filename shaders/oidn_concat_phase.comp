@@ -8,6 +8,10 @@
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 
+CONSTANT(0) uint FIXED_LOW_BLOCKS = 0u;
+CONSTANT(1) uint FIXED_CHANNEL_BLOCKS = 0u;
+CONSTANT(2) uint FIXED_OUTPUT_CHANNELS = 0u;
+
 layout(buffer_reference) readonly buffer ReadBufferFp16 { float16_t x[]; };
 layout(buffer_reference, buffer_reference_align = 8) readonly buffer ReadBufferFp16x4 {
     f16vec4 x[];
@@ -61,6 +65,8 @@ uint collapsedTap(uint phase, uint kernelIndex) {
 
 
 void main() {
+    uint outputChannelCount = FIXED_OUTPUT_CHANNELS != 0u
+        ? FIXED_OUTPUT_CHANNELS : outputChannels;
     uint lane = gl_SubgroupInvocationID;
     uint channelGroup = gl_SubgroupID;
     uint loaderLane = channelGroup * SUBGROUP_SIZE + lane;
@@ -70,8 +76,10 @@ void main() {
     uint firstX = gl_WorkGroupID.x * ROWS * 2u + phaseX;
     uint firstPixel = outputY * width + firstX;
     uint firstChannel = channelGroup * MATRIX_SIZE;
-    uint lowBlocks = lowChannels / MATRIX_SIZE;
-    uint channelBlocks = paddedK / (9u * MATRIX_SIZE);
+    uint lowBlocks = FIXED_LOW_BLOCKS != 0u
+        ? FIXED_LOW_BLOCKS : lowChannels / MATRIX_SIZE;
+    uint channelBlocks = FIXED_CHANNEL_BLOCKS != 0u
+        ? FIXED_CHANNEL_BLOCKS : paddedK / (9u * MATRIX_SIZE);
     bool interior = firstX > 0u && firstX + ROWS * 2u - 1u < width &&
                     outputY > 0u && outputY + 1u < height;
 
@@ -106,7 +114,7 @@ void main() {
             }
             barrier();
 
-            if (firstChannel < outputChannels) {
+            if (firstChannel < outputChannelCount) {
               for (uint tap = 0u; tap < 4u; ++tap) {
                 uint tapY = tap / 2u;
                 uint tapX = tap - tapY * 2u;
@@ -117,9 +125,9 @@ void main() {
                 uint phaseK = lowBlocks * 4u * MATRIX_SIZE;
                 uint chunkK = (channelBlock * 4u + tap) * MATRIX_SIZE;
                 coopMatLoad(weights, weightTensor.x,
-                            (paddedK + phase * phaseK + chunkK) * outputChannels +
+                            (paddedK + phase * phaseK + chunkK) * outputChannelCount +
                                 firstChannel,
-                            outputChannels, gl_CooperativeMatrixLayoutRowMajor);
+                            outputChannelCount, gl_CooperativeMatrixLayoutRowMajor);
 #else
                 coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
                         gl_MatrixUseB> weights =
@@ -134,8 +142,8 @@ void main() {
                         coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
                                 gl_MatrixUseB> weightPart;
                         coopMatLoad(weightPart, weightTensor.x,
-                                    chunkK * outputChannels + firstChannel,
-                                    outputChannels, gl_CooperativeMatrixLayoutRowMajor);
+                                    chunkK * outputChannelCount + firstChannel,
+                                    outputChannelCount, gl_CooperativeMatrixLayoutRowMajor);
                         weights = weights + weightPart;
                     }
                 }
@@ -185,7 +193,7 @@ void main() {
             }
             barrier();
 
-            if (firstChannel < outputChannels) {
+            if (firstChannel < outputChannelCount) {
               for (uint kernelOffset = 0u; kernelOffset < 9u; ++kernelOffset) {
                 uint kernelY = kernelOffset / 3u;
                 uint kernelX = kernelOffset - kernelY * 3u;
@@ -193,8 +201,8 @@ void main() {
                 coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
                         gl_MatrixUseB> weights;
                 coopMatLoad(weights, weightTensor.x,
-                            chunkK * outputChannels + firstChannel,
-                            outputChannels, gl_CooperativeMatrixLayoutRowMajor);
+                            chunkK * outputChannelCount + firstChannel,
+                            outputChannelCount, gl_CooperativeMatrixLayoutRowMajor);
                 for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
                     coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
                             gl_MatrixUseA> values;
@@ -211,10 +219,10 @@ void main() {
         barrier();
     }
 
-    if (firstChannel >= outputChannels) return;
+    if (firstChannel >= outputChannelCount) return;
     coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
             gl_MatrixUseAccumulator> biasValues;
-    coopMatLoad(biasValues, biasTensor.x, firstChannel, outputChannels,
+    coopMatLoad(biasValues, biasTensor.x, firstChannel, outputChannelCount,
                 gl_CooperativeMatrixLayoutRowMajor);
     for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
         accum[rowTile] = accum[rowTile] + biasValues;
@@ -224,7 +232,7 @@ void main() {
         uint outputX = firstX + rowTile * MATRIX_SIZE * 2u;
         if (outputX >= width) continue;
         coopMatStore(accum[rowTile], outputTensor.x,
-                     (outputY * width + outputX) * outputChannels + firstChannel,
-                     outputChannels * 2u, gl_CooperativeMatrixLayoutRowMajor);
+                     (outputY * width + outputX) * outputChannelCount + firstChannel,
+                     outputChannelCount * 2u, gl_CooperativeMatrixLayoutRowMajor);
     }
 }

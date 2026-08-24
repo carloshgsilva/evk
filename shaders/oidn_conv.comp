@@ -9,6 +9,9 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 
 CONSTANT(0) uint FUSED_UPSAMPLE_CONCAT = 0u;
+CONSTANT(1) uint FIXED_INPUT_CHANNELS = 0u;
+CONSTANT(2) uint FIXED_OUTPUT_CHANNELS = 0u;
+CONSTANT(3) uint FIXED_CHANNEL_BLOCKS = 0u;
 
 layout(buffer_reference) readonly buffer ReadBufferFp16 { float16_t x[]; };
 layout(buffer_reference, buffer_reference_align = 8) readonly buffer ReadBufferFp16x4 {
@@ -55,8 +58,10 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #endif
 
 float16_t loadInput(uint inputY, uint inputX, uint inputChannel) {
+    uint inputChannelCount = FIXED_INPUT_CHANNELS != 0u
+        ? FIXED_INPUT_CHANNELS : inputChannels;
     if (FUSED_UPSAMPLE_CONCAT == 0u) {
-        return inputTensor.x[(inputY * width + inputX) * inputChannels + inputChannel];
+        return inputTensor.x[(inputY * width + inputX) * inputChannelCount + inputChannel];
     }
     if (inputChannel < lowChannels) {
         uint lowIndex = ((inputY / 2u) * lowWidth + inputX / 2u) * lowChannels +
@@ -69,10 +74,12 @@ float16_t loadInput(uint inputY, uint inputX, uint inputChannel) {
 }
 
 f16vec4 loadInput4(uint inputY, uint inputX, uint inputChannel) {
+    uint inputChannelCount = FIXED_INPUT_CHANNELS != 0u
+        ? FIXED_INPUT_CHANNELS : inputChannels;
     uint scalarIndex;
     uint64_t address;
     if (FUSED_UPSAMPLE_CONCAT == 0u) {
-        scalarIndex = (inputY * width + inputX) * inputChannels + inputChannel;
+        scalarIndex = (inputY * width + inputX) * inputChannelCount + inputChannel;
         address = uint64_t(inputTensor);
     } else if (inputChannel < lowChannels) {
         scalarIndex = ((inputY / 2u) * lowWidth + inputX / 2u) * lowChannels +
@@ -87,8 +94,11 @@ f16vec4 loadInput4(uint inputY, uint inputX, uint inputChannel) {
 }
 
 bool canLoadInput4(uint inputChannel) {
+    uint inputChannelCount = FIXED_INPUT_CHANNELS != 0u
+        ? FIXED_INPUT_CHANNELS : inputChannels;
     if (FUSED_UPSAMPLE_CONCAT == 0u) {
-        return (inputChannels & 3u) == 0u && inputChannel + 3u < inputChannels;
+        return (inputChannelCount & 3u) == 0u &&
+               inputChannel + 3u < inputChannelCount;
     }
     if (inputChannel < lowChannels) {
         return (lowChannels & 3u) == 0u && inputChannel + 3u < lowChannels;
@@ -98,6 +108,10 @@ bool canLoadInput4(uint inputChannel) {
 }
 
 void main() {
+    uint inputChannelCount = FIXED_INPUT_CHANNELS != 0u
+        ? FIXED_INPUT_CHANNELS : inputChannels;
+    uint outputChannelCount = FIXED_OUTPUT_CHANNELS != 0u
+        ? FIXED_OUTPUT_CHANNELS : outputChannels;
     uint subgroup = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
     uint rowGroup = subgroup / CHANNEL_SUBGROUPS;
@@ -120,7 +134,8 @@ void main() {
                                  MATRIX_SIZE, gl_MatrixUseAccumulator>(0.0);
     }
 
-    uint channelBlocks = paddedK / (9u * MATRIX_SIZE);
+    uint channelBlocks = FIXED_CHANNEL_BLOCKS != 0u
+        ? FIXED_CHANNEL_BLOCKS : paddedK / (9u * MATRIX_SIZE);
     for (uint channelBlock = 0u; channelBlock < channelBlocks; ++channelBlock) {
         {
             const uint vectorElements = STAGED_ELEMENTS / 4u;
@@ -141,7 +156,7 @@ void main() {
                     value = loadInput4(uint(inputY), uint(inputX), inputChannel);
                 } else if (inBounds) {
                     for (uint component = 0u; component < 4u; ++component) {
-                        if (inputChannel + component < inputChannels) {
+                        if (inputChannel + component < inputChannelCount) {
                             value[component] = loadInput(uint(inputY), uint(inputX),
                                                          inputChannel + component);
                         }
@@ -154,12 +169,12 @@ void main() {
 
         for (uint kernelOffset = 0u; kernelOffset < 9u; ++kernelOffset) {
             uint chunkK = (channelBlock * 9u + kernelOffset) * MATRIX_SIZE;
-            if (firstChannel < outputChannels) {
+            if (firstChannel < outputChannelCount) {
                 coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
                         gl_MatrixUseB> weights;
                 coopMatLoad(weights, weightTensor.x,
-                            chunkK * outputChannels + firstChannel,
-                            outputChannels, gl_CooperativeMatrixLayoutRowMajor);
+                            chunkK * outputChannelCount + firstChannel,
+                            outputChannelCount, gl_CooperativeMatrixLayoutRowMajor);
 
                 for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
                     coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
@@ -178,10 +193,10 @@ void main() {
         barrier();
     }
 
-    if (firstChannel >= outputChannels) return;
+    if (firstChannel >= outputChannelCount) return;
     coopmat<float16_t, gl_ScopeSubgroup, MATRIX_SIZE, MATRIX_SIZE,
             gl_MatrixUseAccumulator> biasValues;
-    coopMatLoad(biasValues, biasTensor.x, firstChannel, outputChannels,
+    coopMatLoad(biasValues, biasTensor.x, firstChannel, outputChannelCount,
                 gl_CooperativeMatrixLayoutRowMajor);
     for (uint rowTile = 0u; rowTile < ROW_TILES; ++rowTile) {
         accum[rowTile] = accum[rowTile] + biasValues;
@@ -196,7 +211,7 @@ void main() {
         if (rowX >= width) continue;
         uint row = firstY * width + rowX;
         coopMatStore(accum[rowTile], outputTensor.x,
-                     row * outputChannels + firstChannel,
-                     outputChannels, gl_CooperativeMatrixLayoutRowMajor);
+                     row * outputChannelCount + firstChannel,
+                     outputChannelCount, gl_CooperativeMatrixLayoutRowMajor);
     }
 }
