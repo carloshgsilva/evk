@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <exception>
 #include <string.h>
 
 #include "win_dbg.h"
@@ -7,6 +8,7 @@
 #include "bench.h"
 
 void main_llm();
+void oidn_demo(const char* weights_path);
 void evk_tests();
 
 int main(int argc, char** argv) {
@@ -14,28 +16,36 @@ int main(int argc, char** argv) {
     bool do_test = false;
     bool do_bench = false;
     bool do_llm = false;
+    bool do_oidn = false;
+    const char* oidn_weights = "oidn-weights/rt_ldr.tza";
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--test") == 0) do_test = true;
         else if (strcmp(argv[i], "--bench") == 0) do_bench = true;
         else if (strcmp(argv[i], "--llm") == 0) do_llm = true;
+        else if (strcmp(argv[i], "--oidn") == 0) do_oidn = true;
+        else if (strcmp(argv[i], "--oidn-weights") == 0 && i + 1 < argc) {
+            oidn_weights = argv[++i];
+        }
     }
 
     // Default behavior (no flags): run both bench and tests (matches previous behavior)
-    if (!do_test && !do_bench && !do_llm) {
+    if (!do_test && !do_bench && !do_llm && !do_oidn) {
         do_test = true;
         do_bench = true;
     }
 
-    printf("[run] Options: --test=%s --bench=%s --llm=%s\n",
+    printf("[run] Options: --test=%s --bench=%s --llm=%s --oidn=%s\n",
            do_test ? "ON" : "OFF",
            do_bench ? "ON" : "OFF",
-           do_llm ? "ON" : "OFF");
+           do_llm ? "ON" : "OFF",
+           do_oidn ? "ON" : "OFF");
 
     bool evk_initialized = false;
     bool ai_initialized = false;
+    bool run_succeeded = true;
 
-    if (do_test || do_bench || do_llm) {
-        printf("[test] Starting tests...\n");
+    if (do_test || do_bench || do_llm || do_oidn) {
+        printf("[run] Initializing EVK...\n");
         set_unhandled_exception_filter();
 
         evk::InitializeEVK({
@@ -44,6 +54,7 @@ int main(int argc, char** argv) {
             .engineName = "evk_example_engine",
             .engineVersion = 1,
             .enableSwapchain = false,
+            .enableTimestamps = true,
         });
         evk::ai::initialize();
         evk_initialized = true;
@@ -60,6 +71,15 @@ int main(int argc, char** argv) {
         main_llm();
     }
 
+    if (do_oidn) {
+        try {
+            oidn_demo(oidn_weights);
+        } catch (const std::exception& error) {
+            fprintf(stderr, "[oidn] Error: %s\n", error.what());
+            run_succeeded = false;
+        }
+    }
+
     // Run the suite of tests when requested
     if (do_test) {
         evk_tests();
@@ -69,7 +89,7 @@ int main(int argc, char** argv) {
     if (ai_initialized) evk::ai::shutdown();
     if (evk_initialized) evk::Shutdown();
     if (do_test) printf("[test] All tests passed successfully!\n");
-    return 0;
+    return run_succeeded ? 0 : 1;
 }
 
 void evk_tests() {

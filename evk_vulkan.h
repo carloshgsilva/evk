@@ -35,7 +35,7 @@ namespace evk {
     const uint32_t DEFAULT_IMAGE_COUNT = 16384;
     const uint32_t DEFAULT_TLAS_COUNT = 16384;
     
-    const uint32_t PERF_QUERY_COUNT = 64;
+    const uint32_t PERF_QUERY_COUNT = 256;
     const uint32_t MAX_COMMAND_BUFFERS = 4;
 
     enum class CmdState : uint8_t {

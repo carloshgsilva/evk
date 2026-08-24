@@ -49,6 +49,12 @@ namespace evk::ai {
         evk::Pipeline causal_mask;
         evk::Pipeline relu;
         evk::Pipeline relu_bwd;
+        evk::Pipeline conv2d;
+        evk::Pipeline conv2d_3x3;
+        evk::Pipeline max_pool2d;
+        evk::Pipeline upsample2d;
+        evk::Pipeline concat;
+        evk::Pipeline nchw_to_rgb;
         evk::Pipeline gelu;
         evk::Pipeline gelu_bwd;
         evk::Pipeline scale;
@@ -233,6 +239,12 @@ namespace evk::ai {
         pipelines->causal_mask = create_named_compute_pipeline("causal_mask");
         pipelines->relu = create_named_compute_pipeline("relu");
         pipelines->relu_bwd = create_named_compute_pipeline("relu_bwd");
+        pipelines->conv2d = create_named_compute_pipeline("conv2d");
+        pipelines->conv2d_3x3 = create_named_compute_pipeline("conv2d_3x3");
+        pipelines->max_pool2d = create_named_compute_pipeline("max_pool2d");
+        pipelines->upsample2d = create_named_compute_pipeline("upsample2d");
+        pipelines->concat = create_named_compute_pipeline("concat");
+        pipelines->nchw_to_rgb = create_named_compute_pipeline("nchw_to_rgb");
         pipelines->gelu = create_named_compute_pipeline("gelu");
         pipelines->gelu_bwd = create_named_compute_pipeline("gelu_bwd");
         pipelines->scale = create_named_compute_pipeline("scale");
@@ -675,6 +687,186 @@ namespace evk::ai {
         cmd.dispatch(groupsX, 1, 1);
         cmd.barrier();
     }
+
+    void conv2d(Tensor& input, Tensor& weight, Tensor& bias, Tensor& output,
+                uint32_t stride, uint32_t padding) {
+        assert(input.shape.rank() == 4);
+        assert(weight.shape.rank() == 4);
+        assert(bias.shape.rank() == 1);
+        assert(output.shape.rank() == 4);
+        assert(stride > 0);
+
+        uint32_t batches = input.shape[0];
+        uint32_t input_channels = input.shape[1];
+        uint32_t input_height = input.shape[2];
+        uint32_t input_width = input.shape[3];
+        uint32_t output_channels = weight.shape[0];
+        uint32_t kernel_height = weight.shape[2];
+        uint32_t kernel_width = weight.shape[3];
+        uint32_t output_height =
+            (input_height + 2u * padding - kernel_height) / stride + 1u;
+        uint32_t output_width =
+            (input_width + 2u * padding - kernel_width) / stride + 1u;
+
+        assert(weight.shape[1] == input_channels);
+        assert(bias.shape[0] == output_channels);
+        assert(output.shape[0] == batches && output.shape[1] == output_channels);
+        assert(output.shape[2] == output_height && output.shape[3] == output_width);
+
+        auto& cmd = GetCmd();
+        bool use_3x3_fast_path = kernel_height == 3u && kernel_width == 3u && stride == 1u;
+        cmd.bind(use_3x3_fast_path ? pipelines->conv2d_3x3 : pipelines->conv2d);
+        struct PushConstants {
+            uint64_t input;
+            uint64_t weight;
+            uint64_t bias;
+            uint64_t output;
+            uint32_t batches;
+            uint32_t input_channels;
+            uint32_t input_height;
+            uint32_t input_width;
+            uint32_t output_channels;
+            uint32_t output_height;
+            uint32_t output_width;
+            uint32_t kernel_height;
+            uint32_t kernel_width;
+            uint32_t stride;
+            uint32_t padding;
+        } constants{
+            input.buffer.GetReference(), weight.buffer.GetReference(),
+            bias.buffer.GetReference(), output.buffer.GetReference(),
+            batches, input_channels, input_height, input_width,
+            output_channels, output_height, output_width,
+            kernel_height, kernel_width, stride, padding,
+        };
+        cmd.push(&constants, sizeof(constants));
+        uint32_t output_planes = use_3x3_fast_path
+            ? batches * ((output_channels + 7u) / 8u)
+            : batches * output_channels;
+        uint32_t spatial_tile_width = use_3x3_fast_path ? 16u : 8u;
+        cmd.dispatch((output_width + spatial_tile_width - 1u) / spatial_tile_width,
+                     (output_height + 7u) / 8u,
+                     output_planes);
+        cmd.barrier();
+    }
+
+    void max_pool2d(Tensor& input, Tensor& output,
+                    uint32_t kernel_size, uint32_t stride) {
+        assert(input.shape.rank() == 4 && output.shape.rank() == 4);
+        assert(kernel_size > 0 && stride > 0);
+
+        uint32_t batches = input.shape[0];
+        uint32_t channels = input.shape[1];
+        uint32_t input_height = input.shape[2];
+        uint32_t input_width = input.shape[3];
+        uint32_t output_height = (input_height - kernel_size) / stride + 1u;
+        uint32_t output_width = (input_width - kernel_size) / stride + 1u;
+        assert(output.shape[0] == batches && output.shape[1] == channels);
+        assert(output.shape[2] == output_height && output.shape[3] == output_width);
+
+        auto& cmd = GetCmd();
+        cmd.bind(pipelines->max_pool2d);
+        cmd.push(evk::Constant{
+            input.buffer.GetReference(),
+            output.buffer.GetReference(),
+            batches,
+            channels,
+            input_height,
+            input_width,
+            output_height,
+            output_width,
+            kernel_size,
+            stride,
+        });
+        cmd.dispatch((output_width + 7u) / 8u,
+                     (output_height + 7u) / 8u,
+                     batches * channels);
+        cmd.barrier();
+    }
+
+    void upsample2d(Tensor& input, Tensor& output, uint32_t scale) {
+        assert(input.shape.rank() == 4 && output.shape.rank() == 4);
+        assert(scale > 0);
+
+        uint32_t batches = input.shape[0];
+        uint32_t channels = input.shape[1];
+        uint32_t input_height = input.shape[2];
+        uint32_t input_width = input.shape[3];
+        uint32_t output_height = input_height * scale;
+        uint32_t output_width = input_width * scale;
+        assert(output.shape[0] == batches && output.shape[1] == channels);
+        assert(output.shape[2] == output_height && output.shape[3] == output_width);
+
+        auto& cmd = GetCmd();
+        cmd.bind(pipelines->upsample2d);
+        cmd.push(evk::Constant{
+            input.buffer.GetReference(),
+            output.buffer.GetReference(),
+            batches,
+            channels,
+            input_height,
+            input_width,
+            scale,
+        });
+        cmd.dispatch((output_width + 7u) / 8u,
+                     (output_height + 7u) / 8u,
+                     batches * channels);
+        cmd.barrier();
+    }
+
+    void concat_channels(Tensor& a, Tensor& b, Tensor& output) {
+        assert(a.shape.rank() == 4 && b.shape.rank() == 4 && output.shape.rank() == 4);
+        assert(a.shape[0] == b.shape[0]);
+        assert(a.shape[2] == b.shape[2] && a.shape[3] == b.shape[3]);
+
+        uint32_t batches = a.shape[0];
+        uint32_t channels_a = a.shape[1];
+        uint32_t channels_b = b.shape[1];
+        uint32_t height = a.shape[2];
+        uint32_t width = a.shape[3];
+        uint32_t total_elements = batches * (channels_a + channels_b) * height * width;
+        assert(output.shape[0] == batches);
+        assert(output.shape[1] == channels_a + channels_b);
+        assert(output.shape[2] == height && output.shape[3] == width);
+
+        auto& cmd = GetCmd();
+        cmd.bind(pipelines->concat);
+        cmd.push(evk::Constant{
+            a.buffer.GetReference(),
+            b.buffer.GetReference(),
+            output.buffer.GetReference(),
+            batches,
+            channels_a,
+            channels_b,
+            height,
+            width,
+            total_elements,
+        });
+        cmd.dispatch((total_elements + 255u) / 256u, 1u, 1u);
+        cmd.barrier();
+    }
+
+    void nchw_to_rgb(Tensor& input, evk::Buffer& output, uint32_t width,
+                     uint32_t height, uint32_t padded_width, uint32_t padded_height) {
+        assert(input.shape.rank() == 4 && input.shape[0] == 1u && input.shape[1] == 3u);
+        assert(input.shape[2] == padded_height && input.shape[3] == padded_width);
+        assert(width <= padded_width && height <= padded_height);
+
+        uint32_t pixel_count = width * height;
+        auto& cmd = GetCmd();
+        cmd.bind(pipelines->nchw_to_rgb);
+        cmd.push(evk::Constant{
+            input.buffer.GetReference(),
+            output.GetReference(),
+            width,
+            height,
+            padded_width,
+            padded_height,
+        });
+        cmd.dispatch((pixel_count + 255u) / 256u, 1u, 1u);
+        cmd.barrier();
+    }
+
 
     void gelu(Tensor& in, Tensor& out) {
         assert(in.shape.rank() == out.shape.rank());

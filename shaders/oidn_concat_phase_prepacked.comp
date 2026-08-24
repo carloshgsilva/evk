@@ -1,0 +1,3 @@
+#define OIDN_NARROW
+#define OIDN_PREPACKED_WEIGHTS
+#include "oidn_concat_phase.comp"

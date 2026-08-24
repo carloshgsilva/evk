@@ -1,0 +1,2 @@
+#define OIDN_NARROW
+#include "oidn_concat_phase.comp"

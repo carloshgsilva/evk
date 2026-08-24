@@ -1,0 +1,3 @@
+#define OIDN_NARROW
+#define OIDN_NO_RELU
+#include "oidn_conv.comp"

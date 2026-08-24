@@ -213,6 +213,25 @@ evk::CmdWait(idx);
 
 EVK enables cooperative matrices automatically when `VK_KHR_cooperative_matrix` and its device feature are available. Query `evk::GetFeatures().coopmat` before using AI kernels that depend on accelerated cooperative-matrix matmul, such as `evk::ai::matmul` and flash attention.
 
+### OIDN denoising
+
+`evk::ai::oidn::Denoiser` runs the official balanced, color-only OIDN RT LDR
+U-Net on Vulkan. It accepts and returns interleaved sRGB float pixels in
+`[0, 1]`. Images are padded to the model's 16-pixel alignment internally, so
+standard dimensions such as 1920x1080 can be passed directly.
+The optimized GPU path requires `VK_KHR_cooperative_matrix` support.
+
+Download `rt_ldr.tza` as described in `oidn-weights/README.md`, then run the
+deterministic path-traced demo:
+
+```powershell
+.\run.bat --oidn
+```
+
+The demo regenerates `oidn_noisy.bmp` and `oidn_denoised.bmp`; BMP files are
+ignored by Git. A non-default weights location can be passed with
+`--oidn-weights <path>`.
+
 ### Ray Tracing
 
 EVK enables ray tracing automatically when the Vulkan device supports the required extensions and features. Query it at runtime before creating ray tracing resources or selecting a ray tracing render path:

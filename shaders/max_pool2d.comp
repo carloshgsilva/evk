@@ -1,0 +1,45 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) readonly buffer ReadBufferFp16 { float16_t x[]; };
+layout(buffer_reference) buffer WriteBufferFp16 { float16_t x[]; };
+
+PUSH(
+    ReadBufferFp16 inputBuffer;
+    WriteBufferFp16 outputBuffer;
+    uint batches;
+    uint channels;
+    uint inputHeight;
+    uint inputWidth;
+    uint outputHeight;
+    uint outputWidth;
+    uint kernelSize;
+    uint stride;
+)
+
+COMPUTE(8, 8, 1)
+void main() {
+    uint ox = gl_GlobalInvocationID.x;
+    uint oy = gl_GlobalInvocationID.y;
+    uint plane = gl_GlobalInvocationID.z;
+    if (ox >= outputWidth || oy >= outputHeight || plane >= batches * channels) return;
+
+    uint n = plane / channels;
+    uint c = plane % channels;
+    float maximum = -3.402823466e+38;
+
+    for (uint ky = 0; ky < kernelSize; ++ky) {
+        uint iy = oy * stride + ky;
+        for (uint kx = 0; kx < kernelSize; ++kx) {
+            uint ix = ox * stride + kx;
+            uint inputIndex = ((n * channels + c) * inputHeight + iy) * inputWidth + ix;
+            maximum = max(maximum, float(inputBuffer.x[inputIndex]));
+        }
+    }
+
+    uint outputIndex = ((n * channels + c) * outputHeight + oy) * outputWidth + ox;
+    outputBuffer.x[outputIndex] = float16_t(maximum);
+}

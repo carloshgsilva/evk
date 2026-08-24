@@ -1,0 +1,34 @@
+#include "evk.frag"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) readonly buffer ReadBufferFp16 { float16_t x[]; };
+layout(buffer_reference) buffer WriteBufferFp32 { float x[]; };
+
+PUSH(
+    ReadBufferFp16 inputBuffer;
+    WriteBufferFp32 outputBuffer;
+    uint width;
+    uint height;
+    uint paddedWidth;
+    uint paddedHeight;
+)
+
+COMPUTE(256, 1, 1)
+void main() {
+    uint pixel = gl_GlobalInvocationID.x;
+    uint pixelCount = width * height;
+    if (pixel >= pixelCount) return;
+
+    uint y = pixel / width;
+    uint x = pixel - y * width;
+    uint paddedPixel = y * paddedWidth + x;
+    uint paddedSpatial = paddedWidth * paddedHeight;
+    for (uint channel = 0; channel < 3; ++channel) {
+        float value = float(inputBuffer.x[channel * paddedSpatial + paddedPixel]);
+        value = value >= 0.0 ? min(value, 1.0) : 0.0;
+        outputBuffer.x[pixel * 3 + channel] = value;
+    }
+}

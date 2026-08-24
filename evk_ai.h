@@ -244,6 +244,7 @@ struct Tensor {
     evk::Buffer cpu_buffer;
     std::unique_ptr<Tensor> grad_tensor;
     Shape shape = {};
+    std::string name;
 
     std::function<void()> forward_fn;
     std::function<void()> backward_fn;
@@ -535,6 +536,17 @@ namespace evk::ai {
     // ReLU backward: grad_in = grad_out * (in > 0 ? 1 : 0)
     void relu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in);
 
+    // Inference-oriented 2D image operations. Images use NCHW layout and
+    // convolution weights use OIHW layout.
+    void conv2d(Tensor& input, Tensor& weight, Tensor& bias, Tensor& output,
+                uint32_t stride = 1, uint32_t padding = 0);
+    void max_pool2d(Tensor& input, Tensor& output,
+                    uint32_t kernel_size = 2, uint32_t stride = 2);
+    void upsample2d(Tensor& input, Tensor& output, uint32_t scale = 2);
+    void concat_channels(Tensor& a, Tensor& b, Tensor& output);
+    void nchw_to_rgb(Tensor& input, evk::Buffer& output, uint32_t width,
+                     uint32_t height, uint32_t padded_width, uint32_t padded_height);
+
     // GELU activation (tanh approximation)
     // out = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     void gelu(Tensor& in, Tensor& out);
@@ -756,6 +768,80 @@ struct Graph {
         };
 
         return out;
+    }
+
+    // 2D image operators are forward-only. They are kept generic here while
+    // model-specific graph assembly belongs to the model integration.
+    Tensor& conv2d(Tensor& input, Tensor& weight, Tensor& bias,
+                   uint32_t stride = 1, uint32_t padding = 0) {
+        assert(input.shape.rank() == 4 && "conv2d input must be NCHW");
+        assert(weight.shape.rank() == 4 && "conv2d weight must be OIHW");
+        assert(bias.shape.rank() == 1 && "conv2d bias must be one-dimensional");
+        assert(stride > 0);
+        assert(input.shape[1] == weight.shape[1]);
+        assert(bias.shape[0] == weight.shape[0]);
+        assert(input.shape[2] + 2u * padding >= weight.shape[2]);
+        assert(input.shape[3] + 2u * padding >= weight.shape[3]);
+
+        uint32_t output_height =
+            (input.shape[2] + 2u * padding - weight.shape[2]) / stride + 1u;
+        uint32_t output_width =
+            (input.shape[3] + 2u * padding - weight.shape[3]) / stride + 1u;
+        nodes.push_back(std::make_unique<Tensor>(Shape({
+            input.shape[0], weight.shape[0], output_height, output_width
+        })));
+        Tensor& output = *nodes.back();
+        output.forward_fn = [&input, &weight, &bias, &output, stride, padding]() {
+            evk::ai::conv2d(input, weight, bias, output, stride, padding);
+        };
+        return output;
+    }
+
+    Tensor& max_pool2d(Tensor& input, uint32_t kernel_size = 2, uint32_t stride = 2) {
+        assert(input.shape.rank() == 4 && "max_pool2d input must be NCHW");
+        assert(kernel_size > 0 && stride > 0);
+        assert(input.shape[2] >= kernel_size && input.shape[3] >= kernel_size);
+
+        uint32_t output_height = (input.shape[2] - kernel_size) / stride + 1u;
+        uint32_t output_width = (input.shape[3] - kernel_size) / stride + 1u;
+        nodes.push_back(std::make_unique<Tensor>(Shape({
+            input.shape[0], input.shape[1], output_height, output_width
+        })));
+        Tensor& output = *nodes.back();
+        output.forward_fn = [&input, &output, kernel_size, stride]() {
+            evk::ai::max_pool2d(input, output, kernel_size, stride);
+        };
+        return output;
+    }
+
+    Tensor& upsample2d(Tensor& input, uint32_t scale = 2) {
+        assert(input.shape.rank() == 4 && "upsample2d input must be NCHW");
+        assert(scale > 0);
+
+        nodes.push_back(std::make_unique<Tensor>(Shape({
+            input.shape[0], input.shape[1], input.shape[2] * scale, input.shape[3] * scale
+        })));
+        Tensor& output = *nodes.back();
+        output.forward_fn = [&input, &output, scale]() {
+            evk::ai::upsample2d(input, output, scale);
+        };
+        return output;
+    }
+
+    Tensor& concat(Tensor& a, Tensor& b) {
+        assert(a.shape.rank() == 4 && b.shape.rank() == 4 &&
+               "concat inputs must be NCHW");
+        assert(a.shape[0] == b.shape[0]);
+        assert(a.shape[2] == b.shape[2] && a.shape[3] == b.shape[3]);
+
+        nodes.push_back(std::make_unique<Tensor>(Shape({
+            a.shape[0], a.shape[1] + b.shape[1], a.shape[2], a.shape[3]
+        })));
+        Tensor& output = *nodes.back();
+        output.forward_fn = [&a, &b, &output]() {
+            evk::ai::concat_channels(a, b, output);
+        };
+        return output;
     }
 
     Tensor& gelu(Tensor& a) {
@@ -1015,7 +1101,8 @@ struct Graph {
     // eval the graph
     // if backward is true, also run the backward pass
     // submit/wait control command buffer submission for batching
-    void eval(bool backward = false, bool submit = true, bool wait = true) {
+    void eval(bool backward = false, bool submit = true, bool wait = true,
+              bool profile = false) {
         evk::ai::GetCmd();
 
         // Zero gradients BEFORE running forward when doing a backward pass.
@@ -1027,7 +1114,11 @@ struct Graph {
 
         for(auto& node : nodes) {
             if (node->forward_fn) {
-                node->forward_fn();
+                if (profile && !node->name.empty()) {
+                    evk::ai::GetCmd().timestamp(node->name.c_str(), node->forward_fn);
+                } else {
+                    node->forward_fn();
+                }
             }
         }
 

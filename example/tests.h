@@ -1562,6 +1562,66 @@ void test_flash_attention_backward_scratch() {
     TEST(ok_dv);
 }
 
+void test_image_graph_ops() {
+    printf("test_image_graph_ops()\n");
+
+    Graph graph;
+    Tensor& input = graph.tensor({1, 1, 4, 4});
+    Tensor& weight = graph.tensor({1, 1, 3, 3});
+    Tensor& bias = graph.tensor({1});
+
+    float16_t* input_data = input.cpu();
+    for (uint32_t i = 0; i < 16u; ++i) {
+        input_data[i] = float16_t(float(i + 1u));
+    }
+    input.cpu_upload();
+    weight.fill(float16_t(1.0f));
+    bias.fill(float16_t(0.0f));
+
+    Tensor& convolved = graph.conv2d(input, weight, bias, 1u, 1u);
+    Tensor& pooled = graph.max_pool2d(convolved);
+    Tensor& upsampled = graph.upsample2d(pooled);
+    Tensor& concatenated = graph.concat(upsampled, input);
+    graph.eval();
+
+    const float expected_convolution[] = {
+        14, 24, 30, 22,
+        33, 54, 63, 45,
+        57, 90, 99, 69,
+        46, 72, 78, 54,
+    };
+    const float expected_pool[] = {54, 63, 90, 99};
+    const float expected_upsample[] = {
+        54, 54, 63, 63,
+        54, 54, 63, 63,
+        90, 90, 99, 99,
+        90, 90, 99, 99,
+    };
+
+    convolved.cpu_download();
+    pooled.cpu_download();
+    upsampled.cpu_download();
+    concatenated.cpu_download();
+
+    bool convolution_ok = true;
+    bool pool_ok = true;
+    bool upsample_ok = true;
+    bool concat_ok = true;
+    for (uint32_t i = 0; i < 16u; ++i) {
+        convolution_ok &= approx_eq(float(convolved.cpu()[i]), expected_convolution[i]);
+        upsample_ok &= approx_eq(float(upsampled.cpu()[i]), expected_upsample[i]);
+        concat_ok &= approx_eq(float(concatenated.cpu()[i]), expected_upsample[i]);
+        concat_ok &= approx_eq(float(concatenated.cpu()[16u + i]), float(i + 1u));
+    }
+    for (uint32_t i = 0; i < 4u; ++i) {
+        pool_ok &= approx_eq(float(pooled.cpu()[i]), expected_pool[i]);
+    }
+    TEST(convolution_ok);
+    TEST(pool_ok);
+    TEST(upsample_ok);
+    TEST(concat_ok);
+}
+
 void run_ai_kernel_tests() {
     test_add();
     test_matmul();
@@ -1582,4 +1642,5 @@ void run_ai_kernel_tests() {
     test_rms_norm_and_backward();
     test_greedy_sample();
     test_flash_attention_backward_scratch();
+    test_image_graph_ops();
 }
