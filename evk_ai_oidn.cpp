@@ -426,14 +426,13 @@ struct Model::Kernels {
     static evk::Pipeline create_conv_pool(const char* name,
                                           uint32_t input_channels,
                                           uint32_t output_channels) {
-        const char* shader = output_channels == 64u
-            ? "oidn_conv_pool_balanced" : "oidn_conv_pool_balanced_48";
+        uint32_t channels_per_workgroup = output_channels == 48u ? 48u : 64u;
         return evk::CreatePipeline({
             .name = name,
-            .CS = evk::loadSpirvFile(
-                std::string("shaders/bin/") + shader + ".comp.spv"),
+            .CS = evk::loadSpirvFile("shaders/bin/oidn_conv_pool_balanced.comp.spv"),
             .constants = evk::Constant{
-                input_channels, output_channels, input_channels / 16u},
+                input_channels, output_channels, input_channels / 16u,
+                channels_per_workgroup, channels_per_workgroup * 4u},
         });
     }
 

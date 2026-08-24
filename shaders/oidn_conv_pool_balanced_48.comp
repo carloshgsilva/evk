@@ -1,2 +1,0 @@
-#define OIDN_CHANNELS_48
-#include "oidn_conv_pool_balanced.comp"
