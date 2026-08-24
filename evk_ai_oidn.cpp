@@ -146,6 +146,14 @@ uint32_t collapsed_tap(uint32_t phase, uint32_t kernel_index) {
     return kernel_index == 2u ? 1u : 0u;
 }
 
+uint32_t decoder_skip_channels(const std::string& name, uint32_t input_channels) {
+    if (name == "dec_conv1a.weight") return 3u;
+    if (name == "dec_conv2a.weight") return 32u;
+    if (name == "dec_conv3a.weight") return input_channels == 96u ? 32u : 48u;
+    if (name == "dec_conv4a.weight") return input_channels == 64u ? 32u : 64u;
+    return 0u;
+}
+
 std::unique_ptr<Tensor> pack_weight(const std::string& name, Tensor& source) {
     uint32_t output_channels = source.shape[0];
     uint32_t input_channels = source.shape[1];
@@ -156,15 +164,11 @@ std::unique_ptr<Tensor> pack_weight(const std::string& name, Tensor& source) {
     bool compact_rgb_input = name == "enc_conv0.weight";
     bool compact_rgb_output = name == "dec_conv0.weight";
     bool compact_rgb_skip = name == "dec_conv1a.weight";
-    bool collapse_fast_phase =
-        (input_channels == 64u || input_channels == 96u) &&
-        output_channels == 64u && name.starts_with("dec_conv") &&
-        name.ends_with("a.weight");
-    bool collapse_phase = compact_rgb_skip || collapse_fast_phase;
+    uint32_t skip_channels = decoder_skip_channels(name, input_channels);
+    bool collapse_phase = skip_channels != 0u;
 
     uint32_t low_channels = 0u;
     if (collapse_phase) {
-        uint32_t skip_channels = compact_rgb_skip ? 3u : 32u;
         if (input_channels <= skip_channels) {
             throw std::runtime_error("unsupported collapsed phase channel count");
         }
@@ -292,9 +296,19 @@ struct Model::Kernels {
     evk::Pipeline fast_conv_32_32;
     evk::Pipeline fast_conv_64_64;
     evk::Pipeline fast_conv_64_32;
+    evk::Pipeline balanced_conv_32_48;
+    evk::Pipeline balanced_conv_48_64;
+    evk::Pipeline balanced_conv_64_80;
+    evk::Pipeline balanced_conv_80_96;
+    evk::Pipeline balanced_conv_96_96;
+    evk::Pipeline balanced_conv_112_112;
     evk::Pipeline fast_phase_32_32_64;
     evk::Pipeline fast_phase_64_32_64;
     evk::Pipeline fast_phase_32_3_32;
+    evk::Pipeline balanced_phase_96_64_112;
+    evk::Pipeline balanced_phase_112_48_96;
+    evk::Pipeline balanced_phase_96_32_64;
+    evk::Pipeline balanced_phase_64_3_64;
 
     Kernels() {
         if (!evk::GetFeatures().coopmat) {
@@ -329,12 +343,31 @@ struct Model::Kernels {
         fast_conv_32_32 = create_regular("oidn_fast_conv_32_32", 32u, 32u);
         fast_conv_64_64 = create_regular("oidn_fast_conv_64_64", 64u, 64u);
         fast_conv_64_32 = create_regular("oidn_fast_conv_64_32", 64u, 32u);
+        balanced_conv_32_48 = create_regular("oidn_balanced_conv_32_48", 32u, 48u);
+        balanced_conv_48_64 = create_regular("oidn_balanced_conv_48_64", 48u, 64u);
+        balanced_conv_64_80 = create_regular("oidn_balanced_conv_64_80", 64u, 80u);
+        balanced_conv_80_96 = create_regular("oidn_balanced_conv_80_96", 80u, 96u);
+        balanced_conv_96_96 = create_regular("oidn_balanced_conv_96_96", 96u, 96u);
+        balanced_conv_112_112 = create_regular(
+            "oidn_balanced_conv_112_112", 112u, 112u);
         fast_phase_32_32_64 = create_phase(
             "oidn_fast_phase_32_32_64", "oidn_concat_phase_collapsed", 32u, 64u, 64u);
         fast_phase_64_32_64 = create_phase(
             "oidn_fast_phase_64_32_64", "oidn_concat_phase_collapsed", 64u, 96u, 64u);
         fast_phase_32_3_32 = create_phase(
             "oidn_fast_phase_32_3_32", "oidn_concat_phase_prepacked", 32u, 35u, 32u);
+        balanced_phase_96_64_112 = create_phase(
+            "oidn_balanced_phase_96_64_112", "oidn_concat_phase_collapsed_wide",
+            96u, 160u, 112u);
+        balanced_phase_112_48_96 = create_phase(
+            "oidn_balanced_phase_112_48_96", "oidn_concat_phase_collapsed_wide",
+            112u, 160u, 96u);
+        balanced_phase_96_32_64 = create_phase(
+            "oidn_balanced_phase_96_32_64", "oidn_concat_phase_collapsed",
+            96u, 128u, 64u);
+        balanced_phase_64_3_64 = create_phase(
+            "oidn_balanced_phase_64_3_64", "oidn_concat_phase_prepacked",
+            64u, 67u, 64u);
     }
 
     static evk::Pipeline create(const char* name) {
@@ -446,6 +479,18 @@ struct Model::Kernels {
             } else if (low_resolution.shape[3] == 64u && skip.shape[3] == 32u &&
                        output_channels == 64u) {
                 cmd.bind(fast_phase_64_32_64);
+            } else if (low_resolution.shape[3] == 96u && skip.shape[3] == 64u &&
+                       output_channels == 112u) {
+                cmd.bind(balanced_phase_96_64_112);
+            } else if (low_resolution.shape[3] == 112u && skip.shape[3] == 48u &&
+                       output_channels == 96u) {
+                cmd.bind(balanced_phase_112_48_96);
+            } else if (low_resolution.shape[3] == 96u && skip.shape[3] == 32u &&
+                       output_channels == 64u) {
+                cmd.bind(balanced_phase_96_32_64);
+            } else if (low_resolution.shape[3] == 64u && skip.shape[3] == 3u &&
+                       output_channels == 64u) {
+                cmd.bind(balanced_phase_64_3_64);
             } else if (skip.shape[3] == 3u) {
                 cmd.bind(prepacked_phase_concat_conv);
             } else {
@@ -502,6 +547,18 @@ struct Model::Kernels {
             specialized = &fast_conv_64_64;
         } else if (!fused && input_channels == 64u && output_channels == 32u) {
             specialized = &fast_conv_64_32;
+        } else if (!fused && input_channels == 32u && output_channels == 48u) {
+            specialized = &balanced_conv_32_48;
+        } else if (!fused && input_channels == 48u && output_channels == 64u) {
+            specialized = &balanced_conv_48_64;
+        } else if (!fused && input_channels == 64u && output_channels == 80u) {
+            specialized = &balanced_conv_64_80;
+        } else if (!fused && input_channels == 80u && output_channels == 96u) {
+            specialized = &balanced_conv_80_96;
+        } else if (!fused && input_channels == 96u && output_channels == 96u) {
+            specialized = &balanced_conv_96_96;
+        } else if (!fused && input_channels == 112u && output_channels == 112u) {
+            specialized = &balanced_conv_112_112;
         }
         if (specialized) {
             cmd.bind(*specialized);
