@@ -215,14 +215,14 @@ EVK enables cooperative matrices automatically when `VK_KHR_cooperative_matrix` 
 
 ### OIDN denoising
 
-`evk::ai::oidn::Denoiser` runs the official balanced, color-only OIDN RT LDR
-U-Net on Vulkan. It accepts and returns interleaved sRGB float pixels in
+`evk::ai::oidn::Denoiser` runs the official fast or balanced color-only OIDN
+RT LDR U-Net on Vulkan. It accepts and returns interleaved sRGB float pixels in
 `[0, 1]`. Images are padded to the model's 16-pixel alignment internally, so
 standard dimensions such as 1920x1080 can be passed directly.
 The optimized GPU path requires `VK_KHR_cooperative_matrix` support.
 
-Download `rt_ldr.tza` as described in `oidn-weights/README.md`, then run the
-deterministic path-traced demo:
+Download `rt_ldr_small.tza` as described in `oidn-weights/README.md`, then run
+the deterministic path-traced demo in OIDN's Fast quality mode:
 
 ```powershell
 .\run.bat --oidn
@@ -230,7 +230,7 @@ deterministic path-traced demo:
 
 The demo regenerates `oidn_noisy.bmp` and `oidn_denoised.bmp`; BMP files are
 ignored by Git. A non-default weights location can be passed with
-`--oidn-weights <path>`.
+`--oidn-weights <path>`; pass `rt_ldr.tza` to use Balanced quality.
 
 ### Ray Tracing
 

@@ -385,7 +385,17 @@ void Model::load(const std::string& weights_path) {
         uint32_t channel_blocks = (input_channels + 15u) / 16u;
         uint32_t padded_k = channel_blocks * kernel_height * kernel_width * 16u;
         bool prepack_phase = name == "dec_conv1a.weight";
-        uint32_t phase_k = prepack_phase ? 64u / 16u * 4u * 16u : 0u;
+        uint32_t prepack_low_channels = 0u;
+        if (prepack_phase) {
+            if (input_channels <= 3u) {
+                throw std::runtime_error("unsupported dec_conv1a channel count");
+            }
+            prepack_low_channels = input_channels - 3u;
+            if ((prepack_low_channels % 16u) != 0u) {
+                throw std::runtime_error("unsupported dec_conv1a channel count");
+            }
+        }
+        uint32_t phase_k = prepack_low_channels / 16u * 4u * 16u;
         auto packed = std::make_unique<Tensor>(
             Shape({padded_k + 4u * phase_k, packed_output_channels}));
         float16_t* destination = packed->cpu();
@@ -413,7 +423,8 @@ void Model::load(const std::string& weights_path) {
                     uint32_t phase = phase_y * 2u + phase_x;
                     for (uint32_t output_channel = 0u; output_channel < output_channels;
                          ++output_channel) {
-                        for (uint32_t input_channel = 0u; input_channel < 64u;
+                        for (uint32_t input_channel = 0u;
+                             input_channel < prepack_low_channels;
                              ++input_channel) {
                             for (uint32_t tap_y = 0u; tap_y < 2u; ++tap_y) {
                                 for (uint32_t tap_x = 0u; tap_x < 2u; ++tap_x) {
@@ -454,15 +465,23 @@ void Model::load(const std::string& weights_path) {
     SubmitCmd(true);
     packed_parameters_ = std::move(packed_parameters);
 
-    // The base/balanced graph uses enc_conv0. Large and small variants have
-    // different topology/channel counts and are deliberately rejected here.
+    // The balanced and fast color-only models share this topology and differ
+    // only in their internal channel counts.
+    bool balanced_model = parameters_.contains("dec_conv4a.weight") &&
+                          parameter("dec_conv4a.weight").shape[0] == 112u &&
+                          parameters_.contains("dec_conv1a.weight") &&
+                          parameter("dec_conv1a.weight").shape[1] == 67u;
+    bool fast_model = parameters_.contains("dec_conv4a.weight") &&
+                      parameter("dec_conv4a.weight").shape[0] == 64u &&
+                      parameters_.contains("dec_conv1a.weight") &&
+                      parameter("dec_conv1a.weight").shape[1] == 35u;
     if (!parameters_.contains("enc_conv0.weight") ||
         parameter("enc_conv0.weight").shape[0] != 32u ||
         parameter("enc_conv0.weight").shape[1] != 3u ||
-        !parameters_.contains("dec_conv4a.weight") ||
-        parameter("dec_conv4a.weight").shape[0] != 112u) {
+        (!balanced_model && !fast_model)) {
         parameters_.clear();
-        throw std::runtime_error("weights are not the balanced color-only RT LDR OIDN model");
+        throw std::runtime_error(
+            "weights are not a supported color-only RT LDR OIDN model");
     }
 }
 

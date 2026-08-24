@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
     bool do_bench = false;
     bool do_llm = false;
     bool do_oidn = false;
-    const char* oidn_weights = "oidn-weights/rt_ldr.tza";
+    const char* oidn_weights = "oidn-weights/rt_ldr_small.tza";
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--test") == 0) do_test = true;
         else if (strcmp(argv[i], "--bench") == 0) do_bench = true;
