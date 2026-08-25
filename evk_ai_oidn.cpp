@@ -312,12 +312,15 @@ std::unique_ptr<Tensor> pack_weight(const std::string& name, Tensor& source) {
 
 struct Model::Kernels {
     evk::Pipeline conv;
-    evk::Pipeline concat_conv;
     evk::Pipeline narrow_conv;
-    evk::Pipeline narrow_concat_conv;
+    evk::Pipeline tail_conv;
+    evk::Pipeline narrow_tail_conv;
     evk::Pipeline phase_concat_conv;
     evk::Pipeline narrow_phase_concat_conv;
     evk::Pipeline prepacked_phase_concat_conv;
+    evk::Pipeline phase_tail_concat_conv;
+    evk::Pipeline narrow_phase_tail_concat_conv;
+    evk::Pipeline prepacked_phase_tail_concat_conv;
     evk::Pipeline conv_final;
     evk::Pipeline conv_final_rows;
     evk::Pipeline max_pool;
@@ -346,33 +349,37 @@ struct Model::Kernels {
     evk::Pipeline fast_phase_32_32_64;
     evk::Pipeline fast_phase_64_32_64;
     evk::Pipeline fast_phase_32_3_32;
+    evk::Pipeline fast_phase_32_32_64_tail;
+    evk::Pipeline fast_phase_64_32_64_tail;
+    evk::Pipeline fast_phase_32_3_32_tail;
     evk::Pipeline balanced_phase_96_64_112;
     evk::Pipeline balanced_phase_112_48_96_rows80;
     evk::Pipeline balanced_phase_96_32_64_rows96;
     evk::Pipeline balanced_phase_64_3_64_rows96;
+    evk::Pipeline balanced_phase_112_48_96_rows80_tail;
+    evk::Pipeline balanced_phase_96_32_64_rows96_tail;
+    evk::Pipeline balanced_phase_64_3_64_rows96_tail;
 
     Kernels() {
         if (!evk::GetFeatures().coopmat) {
             throw std::runtime_error("OIDN GPU inference requires cooperative matrix support");
         }
         conv = create("oidn_conv");
-        concat_conv = evk::CreatePipeline({
-            .name = "oidn_concat_conv",
-            .CS = detail::load_embedded_shader("oidn_conv"),
-            .constants = evk::Constant{uint32_t(1u)},
-        });
         narrow_conv = evk::CreatePipeline({
             .name = "oidn_narrow_conv",
             .CS = detail::load_embedded_shader("oidn_conv_narrow"),
         });
-        narrow_concat_conv = evk::CreatePipeline({
-            .name = "oidn_narrow_concat_conv",
-            .CS = detail::load_embedded_shader("oidn_conv_narrow"),
-            .constants = evk::Constant{uint32_t(1u)},
-        });
+        tail_conv = create_tail("oidn_tail_conv", "oidn_conv");
+        narrow_tail_conv = create_tail("oidn_narrow_tail_conv", "oidn_conv_narrow");
         phase_concat_conv = create("oidn_concat_phase");
         narrow_phase_concat_conv = create("oidn_concat_phase_narrow");
         prepacked_phase_concat_conv = create("oidn_concat_phase_prepacked");
+        phase_tail_concat_conv = create_phase_tail(
+            "oidn_phase_tail_concat_conv", "oidn_concat_phase");
+        narrow_phase_tail_concat_conv = create_phase_tail(
+            "oidn_narrow_phase_tail_concat_conv", "oidn_concat_phase_narrow");
+        prepacked_phase_tail_concat_conv = create_phase_tail(
+            "oidn_prepacked_phase_tail_concat_conv", "oidn_concat_phase_prepacked");
         conv_final = create("oidn_conv_output_8");
         conv_final_rows = create("oidn_conv_output_8_rows");
         max_pool = create("oidn_max_pool");
@@ -413,9 +420,18 @@ struct Model::Kernels {
             "oidn_fast_phase_64_32_64", "oidn_concat_phase_collapsed", 64u, 96u, 64u);
         fast_phase_32_3_32 = create_phase(
             "oidn_fast_phase_32_3_32", "oidn_concat_phase_prepacked", 32u, 35u, 32u);
+        fast_phase_32_32_64_tail = create_phase(
+            "oidn_fast_phase_32_32_64_tail", "oidn_concat_phase_collapsed",
+            32u, 64u, 64u, true);
+        fast_phase_64_32_64_tail = create_phase(
+            "oidn_fast_phase_64_32_64_tail", "oidn_concat_phase_collapsed",
+            64u, 96u, 64u, true);
+        fast_phase_32_3_32_tail = create_phase(
+            "oidn_fast_phase_32_3_32_tail", "oidn_concat_phase_prepacked",
+            32u, 35u, 32u, true);
         balanced_phase_96_64_112 = create_phase(
-            "oidn_balanced_phase_96_64_112", "oidn_concat_phase_tail",
-            96u, 160u, 112u);
+            "oidn_balanced_phase_96_64_112", "oidn_concat_phase_collapsed_wide",
+            96u, 160u, 112u, true);
         balanced_phase_112_48_96_rows80 = create_phase(
             "oidn_balanced_phase_112_48_96_rows80",
             "oidn_concat_phase_wide_rows80", 112u, 160u, 96u);
@@ -425,12 +441,37 @@ struct Model::Kernels {
         balanced_phase_64_3_64_rows96 = create_phase(
             "oidn_balanced_phase_64_3_64_rows96",
             "oidn_concat_phase_prepacked_rows96", 64u, 67u, 64u);
+        balanced_phase_112_48_96_rows80_tail = create_phase(
+            "oidn_balanced_phase_112_48_96_rows80_tail",
+            "oidn_concat_phase_wide_rows80", 112u, 160u, 96u, true);
+        balanced_phase_96_32_64_rows96_tail = create_phase(
+            "oidn_balanced_phase_96_32_64_rows96_tail",
+            "oidn_concat_phase_rows96", 96u, 128u, 64u, true);
+        balanced_phase_64_3_64_rows96_tail = create_phase(
+            "oidn_balanced_phase_64_3_64_rows96_tail",
+            "oidn_concat_phase_prepacked_rows96", 64u, 67u, 64u, true);
     }
 
     static evk::Pipeline create(const char* name) {
         return evk::CreatePipeline({
             .name = name,
             .CS = detail::load_embedded_shader(name),
+        });
+    }
+
+    static evk::Pipeline create_tail(const char* name, const char* shader) {
+        return evk::CreatePipeline({
+            .name = name,
+            .CS = detail::load_embedded_shader(shader),
+            .constants = evk::Constant{0u, 0u, 0u, 0u, 1u},
+        });
+    }
+
+    static evk::Pipeline create_phase_tail(const char* name, const char* shader) {
+        return evk::CreatePipeline({
+            .name = name,
+            .CS = detail::load_embedded_shader(shader),
+            .constants = evk::Constant{0u, 0u, 0u, 1u},
         });
     }
 
@@ -473,14 +514,15 @@ struct Model::Kernels {
 
     static evk::Pipeline create_phase(const char* name, const char* shader,
                                       uint32_t low_channels, uint32_t input_channels,
-                                      uint32_t output_channels) {
+                                      uint32_t output_channels, bool tail = false) {
         return evk::CreatePipeline({
             .name = name,
             .CS = detail::load_embedded_shader(shader),
             .constants = evk::Constant{
                 low_channels / 16u,
                 (input_channels + 15u) / 16u,
-                output_channels},
+                output_channels,
+                uint32_t(tail)},
         });
     }
 
@@ -556,98 +598,104 @@ struct Model::Kernels {
             return;
         }
 
-        cooperative_convolution(input.buffer, input.buffer, weight, bias, output,
-                                width, height, input_channels,
-                                width, input_channels, 0u, false);
+        cooperative_convolution(input.buffer, weight, bias, output,
+                                width, height, input_channels);
     }
 
     void concat_convolution(Tensor& low_resolution, Tensor& skip, Tensor& weight,
                             Tensor& bias, Tensor& output) const {
-        bool tail_shape = low_resolution.shape[3] == 96u &&
-                          skip.shape[3] == 64u && output.shape[3] == 112u;
-        if ((skip.shape[2] % 32u) == 0u || tail_shape) {
-            auto& cmd = evk::ai::GetCmd();
-            uint32_t output_channels = output.shape[3];
-            if (low_resolution.shape[3] == 32u && skip.shape[3] == 3u) {
-                cmd.bind(fast_phase_32_3_32);
-            } else if (low_resolution.shape[3] == 32u && skip.shape[3] == 32u &&
-                       output_channels == 64u) {
-                cmd.bind(fast_phase_32_32_64);
-            } else if (low_resolution.shape[3] == 64u && skip.shape[3] == 32u &&
-                       output_channels == 64u) {
-                cmd.bind(fast_phase_64_32_64);
-            } else if (low_resolution.shape[3] == 96u && skip.shape[3] == 64u &&
-                       output_channels == 112u) {
-                cmd.bind(balanced_phase_96_64_112);
-            } else if (low_resolution.shape[3] == 112u && skip.shape[3] == 48u &&
-                       output_channels == 96u) {
-                cmd.bind(balanced_phase_112_48_96_rows80);
-            } else if (low_resolution.shape[3] == 96u && skip.shape[3] == 32u &&
-                       output_channels == 64u) {
-                cmd.bind(balanced_phase_96_32_64_rows96);
-            } else if (low_resolution.shape[3] == 64u && skip.shape[3] == 3u &&
-                       output_channels == 64u) {
-                cmd.bind(balanced_phase_64_3_64_rows96);
-            } else if (skip.shape[3] == 3u) {
-                cmd.bind(prepacked_phase_concat_conv);
-            } else {
-                cmd.bind(output_channels <= 64u ? narrow_phase_concat_conv : phase_concat_conv);
-            }
-            cmd.push(evk::Constant{
-                low_resolution.buffer.GetReference(),
-                skip.buffer.GetReference(),
-                weight.buffer.GetReference(),
-                bias.buffer.GetReference(),
-                output.buffer.GetReference(),
-                skip.shape[2],
-                skip.shape[1],
-                low_resolution.shape[3] + skip.shape[3],
-                output_channels,
-                ((low_resolution.shape[3] + skip.shape[3] + 15u) / 16u) * 9u * 16u,
-                low_resolution.shape[2],
-                low_resolution.shape[3],
-                skip.shape[3],
-            });
-            bool rows96 = output_channels == 64u &&
-                ((low_resolution.shape[3] == 96u && skip.shape[3] == 32u) ||
-                 (low_resolution.shape[3] == 64u && skip.shape[3] == 3u));
-            bool rows80 = low_resolution.shape[3] == 112u &&
-                          skip.shape[3] == 48u && output_channels == 96u;
-            uint32_t rows = rows96 ? 96u : (rows80 ? 80u : 64u);
-            cmd.dispatch((skip.shape[2] / 2u + rows - 1u) / rows,
-                         skip.shape[1], 2u);
-            cmd.barrier();
-            return;
+        uint32_t output_channels = output.shape[3];
+        bool rows96 = output_channels == 64u &&
+            ((low_resolution.shape[3] == 96u && skip.shape[3] == 32u) ||
+             (low_resolution.shape[3] == 64u && skip.shape[3] == 3u));
+        bool rows80 = low_resolution.shape[3] == 112u &&
+                      skip.shape[3] == 48u && output_channels == 96u;
+        uint32_t rows = rows96 ? 96u : (rows80 ? 80u : 64u);
+        // Each matrix row writes 16 pixels with a stride of two.
+        bool phase_tail = (skip.shape[2] % 32u) != 0u;
+        auto choose = [phase_tail](const evk::Pipeline& regular,
+                                   const evk::Pipeline& tail)
+            -> const evk::Pipeline& {
+            return phase_tail ? tail : regular;
+        };
+
+        const evk::Pipeline* pipeline;
+        if (low_resolution.shape[3] == 32u && skip.shape[3] == 3u) {
+            pipeline = &choose(fast_phase_32_3_32, fast_phase_32_3_32_tail);
+        } else if (low_resolution.shape[3] == 32u && skip.shape[3] == 32u &&
+                   output_channels == 64u) {
+            pipeline = &choose(fast_phase_32_32_64, fast_phase_32_32_64_tail);
+        } else if (low_resolution.shape[3] == 64u && skip.shape[3] == 32u &&
+                   output_channels == 64u) {
+            pipeline = &choose(fast_phase_64_32_64, fast_phase_64_32_64_tail);
+        } else if (low_resolution.shape[3] == 96u && skip.shape[3] == 64u &&
+                   output_channels == 112u) {
+            pipeline = &balanced_phase_96_64_112;
+        } else if (low_resolution.shape[3] == 112u && skip.shape[3] == 48u &&
+                   output_channels == 96u) {
+            pipeline = &choose(balanced_phase_112_48_96_rows80,
+                               balanced_phase_112_48_96_rows80_tail);
+        } else if (low_resolution.shape[3] == 96u && skip.shape[3] == 32u &&
+                   output_channels == 64u) {
+            pipeline = &choose(balanced_phase_96_32_64_rows96,
+                               balanced_phase_96_32_64_rows96_tail);
+        } else if (low_resolution.shape[3] == 64u && skip.shape[3] == 3u &&
+                   output_channels == 64u) {
+            pipeline = &choose(balanced_phase_64_3_64_rows96,
+                               balanced_phase_64_3_64_rows96_tail);
+        } else if (skip.shape[3] == 3u) {
+            pipeline = &choose(prepacked_phase_concat_conv,
+                               prepacked_phase_tail_concat_conv);
+        } else if (output_channels <= 64u) {
+            pipeline = &choose(narrow_phase_concat_conv,
+                               narrow_phase_tail_concat_conv);
+        } else {
+            pipeline = &choose(phase_concat_conv, phase_tail_concat_conv);
         }
-        cooperative_convolution(low_resolution.buffer, skip.buffer, weight, bias, output,
-                                skip.shape[2], skip.shape[1],
-                                low_resolution.shape[3] + skip.shape[3],
-                                low_resolution.shape[2], low_resolution.shape[3],
-                                skip.shape[3], true);
+
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(*pipeline);
+        cmd.push(evk::Constant{
+            low_resolution.buffer.GetReference(),
+            skip.buffer.GetReference(),
+            weight.buffer.GetReference(),
+            bias.buffer.GetReference(),
+            output.buffer.GetReference(),
+            skip.shape[2],
+            skip.shape[1],
+            low_resolution.shape[3] + skip.shape[3],
+            output_channels,
+            ((low_resolution.shape[3] + skip.shape[3] + 15u) / 16u) * 9u * 16u,
+            low_resolution.shape[2],
+            low_resolution.shape[3],
+            skip.shape[3],
+        });
+        uint32_t phase_pixels = (skip.shape[2] + 1u) / 2u;
+        cmd.dispatch((phase_pixels + rows - 1u) / rows, skip.shape[1], 2u);
+        cmd.barrier();
     }
 
-    void cooperative_convolution(evk::Buffer& input, evk::Buffer& skip,
-                                 Tensor& weight, Tensor& bias, Tensor& output,
+    void cooperative_convolution(evk::Buffer& input, Tensor& weight,
+                                 Tensor& bias, Tensor& output,
                                  uint32_t width, uint32_t height,
-                                 uint32_t input_channels, uint32_t low_width,
-                                 uint32_t low_channels,
-                                 uint32_t skip_channels, bool fused) const {
+                                 uint32_t input_channels) const {
         uint32_t output_channels = output.shape[3];
         uint32_t padded_k = ((input_channels + 15u) / 16u) * 9u * 16u;
+        bool tail = (width % 16u) != 0u;
         auto& cmd = evk::ai::GetCmd();
-        if (!fused && input_channels == 64u && output_channels == 32u &&
+        if (!tail && input_channels == 64u && output_channels == 32u &&
             (height % 4u) == 0u) {
             decoder_convolution_rows(conv_64_32_rows, input, weight, bias, output,
                                      width, height, 4u);
             return;
         }
-        if (!fused && input_channels == 64u && output_channels == 64u &&
+        if (!tail && input_channels == 64u && output_channels == 64u &&
             (height % 2u) == 0u) {
             decoder_convolution_rows(conv_64_64_rows, input, weight, bias, output,
                                      width, height, 2u);
             return;
         }
-        if (!fused && input_channels == 32u && output_channels == 32u &&
+        if (!tail && input_channels == 32u && output_channels == 32u &&
             (height % 4u) == 0u) {
             convolution_rows(conv_32_rows, input, weight, bias, output,
                              width, height);
@@ -656,47 +704,51 @@ struct Model::Kernels {
         bool narrow = output_channels <= 64u;
         const evk::Pipeline* specialized = nullptr;
         uint32_t rows = 64u;
-        if (!fused && input_channels == 3u && output_channels == 32u) {
-            specialized = &fast_conv_3_32;
-        } else if (!fused && input_channels == 32u && output_channels == 32u) {
-            specialized = &fast_conv_32_32;
-        } else if (!fused && input_channels == 64u && output_channels == 64u) {
-            specialized = &fast_conv_64_64;
-        } else if (!fused && input_channels == 64u && output_channels == 32u) {
-            specialized = &fast_conv_64_32;
-        } else if (!fused && input_channels == 32u && output_channels == 48u) {
-            specialized = &balanced_conv_32_48;
-        } else if (!fused && input_channels == 48u && output_channels == 64u) {
-            specialized = &balanced_conv_48_64;
-        } else if (!fused && input_channels == 64u && output_channels == 80u) {
-            specialized = &balanced_conv_64_80;
-        } else if (!fused && input_channels == 80u && output_channels == 96u) {
-            specialized = &balanced_conv_80_96;
-        } else if (!fused && input_channels == 96u && output_channels == 96u) {
-            if ((width % 96u) == 0u) {
-                specialized = &balanced_conv_96_96_rows96;
-                rows = 96u;
-            } else {
-                specialized = &balanced_conv_96_96;
-            }
-        } else if (!fused && input_channels == 112u && output_channels == 112u) {
-            if ((width % 80u) == 0u) {
-                specialized = &balanced_conv_112_112_rows80;
-                rows = 80u;
-            } else {
-                specialized = &balanced_conv_112_112;
+        if (!tail) {
+            if (input_channels == 3u && output_channels == 32u) {
+                specialized = &fast_conv_3_32;
+            } else if (input_channels == 32u && output_channels == 32u) {
+                specialized = &fast_conv_32_32;
+            } else if (input_channels == 64u && output_channels == 64u) {
+                specialized = &fast_conv_64_64;
+            } else if (input_channels == 64u && output_channels == 32u) {
+                specialized = &fast_conv_64_32;
+            } else if (input_channels == 32u && output_channels == 48u) {
+                specialized = &balanced_conv_32_48;
+            } else if (input_channels == 48u && output_channels == 64u) {
+                specialized = &balanced_conv_48_64;
+            } else if (input_channels == 64u && output_channels == 80u) {
+                specialized = &balanced_conv_64_80;
+            } else if (input_channels == 80u && output_channels == 96u) {
+                specialized = &balanced_conv_80_96;
+            } else if (input_channels == 96u && output_channels == 96u) {
+                if ((width % 96u) == 0u) {
+                    specialized = &balanced_conv_96_96_rows96;
+                    rows = 96u;
+                } else {
+                    specialized = &balanced_conv_96_96;
+                }
+            } else if (input_channels == 112u && output_channels == 112u) {
+                if ((width % 80u) == 0u) {
+                    specialized = &balanced_conv_112_112_rows80;
+                    rows = 80u;
+                } else {
+                    specialized = &balanced_conv_112_112;
+                }
             }
         }
-        if (specialized) {
+        if (tail) {
+            cmd.bind(narrow ? narrow_tail_conv : tail_conv);
+        } else if (specialized) {
             cmd.bind(*specialized);
         } else if (narrow) {
-            cmd.bind(fused ? narrow_concat_conv : narrow_conv);
+            cmd.bind(narrow_conv);
         } else {
-            cmd.bind(fused ? concat_conv : conv);
+            cmd.bind(conv);
         }
         cmd.push(evk::Constant{
             input.GetReference(),
-            skip.GetReference(),
+            input.GetReference(),
             weight.buffer.GetReference(),
             bias.buffer.GetReference(),
             output.buffer.GetReference(),
@@ -705,9 +757,9 @@ struct Model::Kernels {
             input_channels,
             output_channels,
             padded_k,
-            low_width,
-            low_channels,
-            skip_channels,
+            width,
+            input_channels,
+            0u,
         });
         uint32_t channels_per_workgroup = narrow ? 64u : 128u;
         cmd.dispatch((width + rows - 1u) / rows,

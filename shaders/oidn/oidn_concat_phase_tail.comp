@@ -1,3 +1,0 @@
-#define OIDN_PREPACKED_WEIGHTS
-#define OIDN_TAIL
-#include "oidn_concat_phase.comp"
