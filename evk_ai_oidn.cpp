@@ -7,10 +7,15 @@
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace evk::ai::oidn {
+namespace detail {
+std::vector<uint8_t> load_embedded_shader(std::string_view name);
+}
+
 namespace {
 
 struct ArchiveTensor {
@@ -324,16 +329,16 @@ struct Model::Kernels {
         conv = create("oidn_conv");
         concat_conv = evk::CreatePipeline({
             .name = "oidn_concat_conv",
-            .CS = evk::loadSpirvFile("shaders/bin/oidn_conv.comp.spv"),
+            .CS = detail::load_embedded_shader("oidn_conv"),
             .constants = evk::Constant{uint32_t(1u)},
         });
         narrow_conv = evk::CreatePipeline({
             .name = "oidn_narrow_conv",
-            .CS = evk::loadSpirvFile("shaders/bin/oidn_conv_narrow.comp.spv"),
+            .CS = detail::load_embedded_shader("oidn_conv_narrow"),
         });
         narrow_concat_conv = evk::CreatePipeline({
             .name = "oidn_narrow_concat_conv",
-            .CS = evk::loadSpirvFile("shaders/bin/oidn_conv_narrow.comp.spv"),
+            .CS = detail::load_embedded_shader("oidn_conv_narrow"),
             .constants = evk::Constant{uint32_t(1u)},
         });
         phase_concat_conv = create("oidn_concat_phase");
@@ -394,7 +399,7 @@ struct Model::Kernels {
     static evk::Pipeline create(const char* name) {
         return evk::CreatePipeline({
             .name = name,
-            .CS = evk::loadSpirvFile(std::string("shaders/bin/") + name + ".comp.spv"),
+            .CS = detail::load_embedded_shader(name),
         });
     }
 
@@ -406,8 +411,7 @@ struct Model::Kernels {
         }
         return evk::CreatePipeline({
             .name = name,
-            .CS = evk::loadSpirvFile(
-                std::string("shaders/bin/") + shader + ".comp.spv"),
+            .CS = detail::load_embedded_shader(shader),
             .constants = evk::Constant{
                 0u, input_channels, output_channels,
                 (input_channels + 15u) / 16u},
@@ -418,7 +422,7 @@ struct Model::Kernels {
                                              uint32_t output_channels) {
         return evk::CreatePipeline({
             .name = name,
-            .CS = evk::loadSpirvFile("shaders/bin/oidn_conv_decoder_rows128.comp.spv"),
+            .CS = detail::load_embedded_shader("oidn_conv_decoder_rows128"),
             .constants = evk::Constant{64u, output_channels, 4u},
         });
     }
@@ -429,7 +433,7 @@ struct Model::Kernels {
         uint32_t channels_per_workgroup = output_channels == 48u ? 48u : 64u;
         return evk::CreatePipeline({
             .name = name,
-            .CS = evk::loadSpirvFile("shaders/bin/oidn_conv_pool_balanced.comp.spv"),
+            .CS = detail::load_embedded_shader("oidn_conv_pool_balanced"),
             .constants = evk::Constant{
                 input_channels, output_channels, input_channels / 16u,
                 channels_per_workgroup, channels_per_workgroup * 4u},
@@ -441,8 +445,7 @@ struct Model::Kernels {
                                       uint32_t output_channels) {
         return evk::CreatePipeline({
             .name = name,
-            .CS = evk::loadSpirvFile(
-                std::string("shaders/bin/") + shader + ".comp.spv"),
+            .CS = detail::load_embedded_shader(shader),
             .constants = evk::Constant{
                 low_channels / 16u,
                 (input_channels + 15u) / 16u,

@@ -19,12 +19,4 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Compile each shader
-for %%f in (shaders\*.comp) do (
-    glslc "%%f" -std=460 --target-env=vulkan1.3 -O -o "shaders/bin/%%~nf.comp.spv"
-    if errorlevel 1 (
-        exit /b 1
-    )
-)
-
 call build\evk_example.exe %*

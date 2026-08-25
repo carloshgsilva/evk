@@ -1,0 +1,110 @@
+#include "../common/evk.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) readonly buffer ReadBufferFp16 { float16_t x[]; };
+layout(buffer_reference) buffer WriteBufferFp16 { float16_t x[]; };
+
+PUSH(
+    ReadBufferFp16 inputBuffer;
+    ReadBufferFp16 weightBuffer;
+    ReadBufferFp16 biasBuffer;
+    WriteBufferFp16 outputBuffer;
+    uint batches;
+    uint inputChannels;
+    uint inputHeight;
+    uint inputWidth;
+    uint outputChannels;
+    uint outputHeight;
+    uint outputWidth;
+    uint kernelHeight;
+    uint kernelWidth;
+    uint stride;
+    uint padding;
+)
+
+const uint OUTPUT_CHANNEL_TILE = 8;
+const uint INPUT_CHANNEL_TILE = 4;
+const uint SPATIAL_TILE_X = 16;
+const uint SPATIAL_TILE_Y = 8;
+const uint INPUT_TILE_X = 18;
+const uint INPUT_TILE_Y = 10;
+const uint WORKGROUP_SIZE = SPATIAL_TILE_X * SPATIAL_TILE_Y;
+
+shared float16_t inputTile[INPUT_CHANNEL_TILE * INPUT_TILE_X * INPUT_TILE_Y];
+
+COMPUTE(SPATIAL_TILE_X, SPATIAL_TILE_Y, 1)
+void main() {
+    uint ox = gl_WorkGroupID.x * SPATIAL_TILE_X + gl_LocalInvocationID.x;
+    uint oy = gl_WorkGroupID.y * SPATIAL_TILE_Y + gl_LocalInvocationID.y;
+    uint outputChannelBlocks = (outputChannels + OUTPUT_CHANNEL_TILE - 1) / OUTPUT_CHANNEL_TILE;
+    uint n = gl_WorkGroupID.z / outputChannelBlocks;
+    uint outputChannelBase =
+        (gl_WorkGroupID.z - n * outputChannelBlocks) * OUTPUT_CHANNEL_TILE;
+    bool validPixel = ox < outputWidth && oy < outputHeight && n < batches;
+
+    float16_t sums[OUTPUT_CHANNEL_TILE];
+    for (uint outputOffset = 0; outputOffset < OUTPUT_CHANNEL_TILE; ++outputOffset) {
+        uint oc = outputChannelBase + outputOffset;
+        sums[outputOffset] = oc < outputChannels ? biasBuffer.x[oc] : float16_t(0.0);
+    }
+
+    uint lane = gl_LocalInvocationID.y * SPATIAL_TILE_X + gl_LocalInvocationID.x;
+    const uint tileElements = INPUT_CHANNEL_TILE * INPUT_TILE_X * INPUT_TILE_Y;
+    for (uint inputChannelBase = 0; inputChannelBase < inputChannels;
+         inputChannelBase += INPUT_CHANNEL_TILE) {
+        for (uint tileIndex = lane; tileIndex < tileElements; tileIndex += WORKGROUP_SIZE) {
+            uint inputOffset = tileIndex / (INPUT_TILE_X * INPUT_TILE_Y);
+            uint tilePixel = tileIndex % (INPUT_TILE_X * INPUT_TILE_Y);
+            uint tileY = tilePixel / INPUT_TILE_X;
+            uint tileX = tilePixel % INPUT_TILE_X;
+            uint ic = inputChannelBase + inputOffset;
+            int iy = int(gl_WorkGroupID.y * SPATIAL_TILE_Y + tileY) - int(padding);
+            int ix = int(gl_WorkGroupID.x * SPATIAL_TILE_X + tileX) - int(padding);
+
+            float16_t value = float16_t(0.0);
+            if (ic < inputChannels && iy >= 0 && iy < int(inputHeight) &&
+                ix >= 0 && ix < int(inputWidth) && n < batches) {
+                uint inputIndex = ((n * inputChannels + ic) * inputHeight + uint(iy)) *
+                                  inputWidth + uint(ix);
+                value = inputBuffer.x[inputIndex];
+            }
+            inputTile[tileIndex] = value;
+        }
+        barrier();
+
+        if (validPixel) {
+            for (uint inputOffset = 0; inputOffset < INPUT_CHANNEL_TILE; ++inputOffset) {
+                uint ic = inputChannelBase + inputOffset;
+                if (ic >= inputChannels) break;
+
+                for (uint ky = 0; ky < 3; ++ky) {
+                    for (uint kx = 0; kx < 3; ++kx) {
+                        uint tileIndex = (inputOffset * INPUT_TILE_Y +
+                                          gl_LocalInvocationID.y + ky) * INPUT_TILE_X +
+                                         gl_LocalInvocationID.x + kx;
+                        float16_t inputValue = inputTile[tileIndex];
+                        for (uint outputOffset = 0; outputOffset < OUTPUT_CHANNEL_TILE;
+                             ++outputOffset) {
+                            uint oc = outputChannelBase + outputOffset;
+                            if (oc >= outputChannels) break;
+                            uint weightIndex = ((oc * inputChannels + ic) * 3 + ky) * 3 + kx;
+                            sums[outputOffset] += inputValue * weightBuffer.x[weightIndex];
+                        }
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+
+    if (!validPixel) return;
+    for (uint outputOffset = 0; outputOffset < OUTPUT_CHANNEL_TILE; ++outputOffset) {
+        uint oc = outputChannelBase + outputOffset;
+        if (oc >= outputChannels) break;
+        uint outputIndex = ((n * outputChannels + oc) * outputHeight + oy) * outputWidth + ox;
+        outputBuffer.x[outputIndex] = float16_t(sums[outputOffset]);
+    }
+}

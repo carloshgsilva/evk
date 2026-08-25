@@ -1,12 +1,18 @@
 #include "evk_ai.h"
 
+#include <string_view>
+
 namespace evk::ai {
+    namespace detail {
+        std::vector<uint8_t> load_embedded_shader(std::string_view name);
+    }
+
     static evk::Cmd* g_cmd = nullptr;
 
     static evk::Pipeline create_named_compute_pipeline(const char* name) {
         return evk::CreatePipeline({
             .name = name,
-            .CS = evk::loadSpirvFile(std::string("shaders/bin/") + name + ".comp.spv"),
+            .CS = detail::load_embedded_shader(name),
         });
     }
 
@@ -106,7 +112,7 @@ namespace evk::ai {
         }
         evk::Pipeline pipeline = evk::CreatePipeline({
             .name = "matmul",
-            .CS = evk::loadSpirvFile("shaders/bin/matmul.comp.spv"),
+            .CS = detail::load_embedded_shader("matmul"),
             .constants = evk::Constant{
                 uint32_t(config.m),
                 uint32_t(config.k),
@@ -171,7 +177,7 @@ namespace evk::ai {
         }
         evk::Pipeline pipeline = evk::CreatePipeline({
             .name = "flash_attention",
-            .CS = evk::loadSpirvFile("shaders/bin/flash_attention.comp.spv"),
+            .CS = detail::load_embedded_shader("flash_attention"),
             .constants = evk::Constant{
                 uint32_t(config.B),
                 uint32_t(config.H),

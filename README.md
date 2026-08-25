@@ -32,8 +32,22 @@ To integrate into your project:
 
 ```cmake
 add_subdirectory(path/to/evk)
-target_link_libraries(your_target evk)
+
+# Vulkan only
+target_link_libraries(your_target PRIVATE evk::evk)
+
+# Generic AI graph and operators
+target_link_libraries(your_ai_target PRIVATE evk::ai)
+
+# OIDN, including evk::ai transitively
+target_link_libraries(your_oidn_target PRIVATE evk::oidn)
 ```
+
+The AI targets compile their GLSL shaders with `glslc` and embed the resulting
+SPIR-V in the library. Applications do not need to copy a shader directory or
+run from a specific working directory. Building either AI target requires the
+Vulkan SDK shader compiler; CMake uses `Vulkan_GLSLC_EXECUTABLE` discovered by
+`find_package(Vulkan)`.
 
 ## Usage
 

@@ -1,0 +1,125 @@
+#include "../common/evk.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_atomic_float : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+layout(buffer_reference) buffer BufferU16 { uint16_t x[]; };
+layout(buffer_reference) buffer BufferFp32 { float x[]; };
+
+PUSH(
+    BufferFp16 logitsBuffer;   // (totalPositions, vocabSize)
+    BufferU16 targetBuffer;    // (totalPositions)
+    BufferFp16 gradBuffer;     // (totalPositions, vocabSize)
+    BufferFp32 accumBuffer;    // float[2] -> {totalLoss, validCount}
+    uint vocabSize;            // V
+    uint totalPositions;       // B * N
+)
+
+// Shared reduction buffers sized for typical subgroup counts (covers up to 64 subgroups)
+const uint MAX_SUBGROUPS = 64;
+shared float sharedMax[MAX_SUBGROUPS];
+shared float sharedDenom[MAX_SUBGROUPS];
+shared float sharedInvDenom;
+shared float sharedLogDenom;
+
+const float LOG2E = 1.4426950408889634;
+const float LN2 = 0.6931471805599453;
+
+// Workgroup processes one row; tuned workgroup lowers per-thread loop trip count
+COMPUTE(768, 1, 1)
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= totalPositions) return;
+
+    uint lid = gl_LocalInvocationID.x; // 0..127
+    uint subgroupId = gl_SubgroupID;
+    uint subgroupCount = gl_NumSubgroups;
+    uint subgroupLane = gl_SubgroupInvocationID;
+    uint rowStart = row * vocabSize;
+    uint targetIdx = uint(targetBuffer.x[row]);
+    bool isValidTarget = (targetIdx != 0u) && (targetIdx < vocabSize);
+
+    // Zero gradients for invalid targets but keep workgroup synchronized
+    if (!isValidTarget) {
+        for (uint j = lid; j < vocabSize; j += gl_WorkGroupSize.x) {
+            gradBuffer.x[rowStart + j] = float16_t(0.0);
+        }
+    }
+
+    // Nothing to do if this position is masked out
+    if (!isValidTarget) {
+        return;
+    }
+
+    // Load global scale (1 / validCount)
+    float invValid = (accumBuffer.x[1] > 0.0) ? (1.0 / accumBuffer.x[1]) : 0.0;
+    if (invValid <= 0.0) {
+        return;
+    }
+
+    // Streaming log-sum-exp (two exp per logit)
+    float localMax = -3.402823466e+38; // -FLT_MAX
+    float localSum = 0.0;
+    for (uint j = lid; j < vocabSize; j += gl_WorkGroupSize.x) {
+        float v = float(logitsBuffer.x[rowStart + j]);
+        v = clamp(v, -65000.0, 65000.0);
+        float diff = v - localMax;
+        if (diff > 0.0) {
+            localSum = localSum * exp2(-diff * LOG2E) + 1.0;
+            localMax = v;
+        } else {
+            localSum += exp2(diff * LOG2E);
+        }
+    }
+
+    float subgroupMaxVal = subgroupMax(localMax);
+    float subgroupSum = subgroupAdd(localSum * exp2((localMax - subgroupMaxVal) * LOG2E));
+    if (subgroupLane == 0) {
+        sharedMax[subgroupId] = subgroupMaxVal;
+        sharedDenom[subgroupId] = subgroupSum;
+    }
+    barrier();
+    if (subgroupId == 0 && subgroupLane == 0) {
+        float rowMaxVal = sharedMax[0];
+        uint subgroupLimit = min(subgroupCount, MAX_SUBGROUPS);
+        for (uint s = 1; s < subgroupLimit; ++s) {
+            rowMaxVal = max(rowMaxVal, sharedMax[s]);
+        }
+
+        float denom = 0.0;
+        for (uint s = 0; s < subgroupLimit; ++s) {
+            float m = sharedMax[s];
+            float sum = sharedDenom[s];
+            denom += sum * exp2((m - rowMaxVal) * LOG2E);
+        }
+        denom = max(denom, 1e-20);
+        sharedMax[0] = rowMaxVal;
+        sharedDenom[0] = denom;
+        sharedInvDenom = 1.0 / denom;
+        sharedLogDenom = log2(denom) * LN2;
+    }
+    barrier();
+    float rowMax = sharedMax[0];
+    float invDenom = sharedInvDenom;
+    float logDenom = sharedLogDenom;
+
+    // Gradients and mean loss accumulation
+    for (uint j = lid; j < vocabSize; j += gl_WorkGroupSize.x) {
+        float logit = float(logitsBuffer.x[rowStart + j]);
+        logit = clamp(logit, -65000.0, 65000.0);
+        float expv = exp2((logit - rowMax) * LOG2E);
+        float grad = expv * invDenom * invValid;
+        if (j == targetIdx) {
+            grad -= invValid;
+            float targetLoss = (rowMax + logDenom) - logit; // = -log softmax(target)
+            atomicAdd(accumBuffer.x[0], targetLoss * invValid);
+        }
+        gradBuffer.x[rowStart + j] = float16_t(grad);
+    }
+}

@@ -1,0 +1,186 @@
+#include "../common/evk.glsl"
+
+// Flash Attention v2 forward (MQA) using cooperative matrices (tensor cores).
+// Tiled algorithm over (i,j) with online softmax per row. Accumulation goes
+// directly into the output buffer, and scratch is used only for the 16x16 P tile.
+// Layout (row-major):
+// Q,O: (B, N, D) with D = H * Dh (heads concatenated)
+// K,V: (B, N, Dh)
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_buffer_reference : enable
+
+CONSTANT(0) uint B = 0u;
+CONSTANT(1) uint H = 0u;
+CONSTANT(2) uint N = 0u;
+CONSTANT(3) uint D = 0u;
+CONSTANT(4) float SCALE = 0.0;
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 qBuf;
+    BufferFp16 kBuf;
+    BufferFp16 vBuf;
+    BufferFp16 oBuf;
+    BufferFp16 scratchBuf; // per (b,h,iTile) scratch: [Ptile(16*16)] in fp16
+)
+
+#define SUB_TILE 16u
+#define TILE_M 16u   // queries per tile
+#define TILE_J 16u   // keys per tile
+
+const uint C_ROWS = TILE_M / SUB_TILE; // 1
+const uint C_COLS = TILE_J / SUB_TILE; // 1
+
+// Shared tiles to reduce global memory traffic
+shared float16_t Psh[TILE_M * TILE_J]; // 16x16 unnormalized weights tile: exp(s - m_new)
+shared float16_t Dsh[TILE_M * TILE_M]; // reused only at the very end for final diagonal scale
+shared float16_t Ysh[TILE_M * SUB_TILE]; // temporary to reinterpret accumulator as B matrix
+// Keep per-kd accumulators in registers across j-tiles; we store a rescaled
+// accumulator y such that ˜O = sr[row] * y. At the end we convert to normalized O.
+const uint MAX_KD_TILES = 16u; // max Dh blocks (Dh <= 256)
+
+// Fast exp via base-2 exponential: exp(x) = exp2(x * log2(e))
+const float LOG2E = 1.4426950408889634074;
+
+// Workgroup maps: (x=1 per kernel), y over query tiles, z over combined (B*H)
+COMPUTE(32, 1, 1)
+void main() {
+    uint Dh = D / H;
+
+    uint tileRow = gl_WorkGroupID.y;                  // i tile index
+    uint bh = gl_WorkGroupID.z;                       // combined batch-head
+    uint b = bh / H;
+    uint h = bh % H;
+    if (b >= B) return;
+    uint i0 = tileRow * TILE_M;
+
+    // Base offsets
+    uint baseQ_B = b * (N * D);
+    uint baseK_B = b * (N * Dh);
+    uint baseV_B = b * (N * Dh);
+    uint baseO_B = b * (N * D);
+
+    // Initialize online softmax stats
+    float m[TILE_M];
+    float l[TILE_M];
+    [[unroll]] for (uint r = 0u; r < TILE_M; ++r) { m[r] = -3.402823466e+38; l[r] = 0.0; }
+
+    // Initialize per-kd accumulators to zero (registers)
+    uint lane = gl_SubgroupInvocationID;
+    uint kdTiles = Dh / SUB_TILE;
+    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> yAcc[MAX_KD_TILES];
+    uint kdTilesClamped = (kdTiles < MAX_KD_TILES) ? kdTiles : MAX_KD_TILES;
+    [[unroll]] for (uint kdIdx = 0u; kdIdx < kdTilesClamped; ++kdIdx) {
+        yAcc[kdIdx] = coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+    }
+    barrier();
+
+    // Initialize Dsh to zeros once; rows remain zero off-diagonal throughout the kernel
+    if (lane < TILE_M) {
+        [[unroll]] for (uint c = 0u; c < TILE_M; ++c) { Dsh[lane * TILE_M + c] = float16_t(0.0); }
+    }
+    barrier();
+
+    // Preload Q sub-tiles (per kd) once for this (i0,h) tile to avoid reloading every j0
+    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> qMats[MAX_KD_TILES];
+    for (uint k0 = 0u, kdIdx = 0u; kdIdx < kdTilesClamped; ++kdIdx, k0 += SUB_TILE) {
+        uint qOff = baseQ_B + (i0 * D) + (h * Dh) + k0; // top-left of Q tile for this kd
+        coopMatLoad(qMats[kdIdx], qBuf.x, qOff, D, gl_CooperativeMatrixLayoutRowMajor);
+    }
+
+    // Loop over key tiles j0
+    for (uint j0 = 0u; j0 < N; j0 += TILE_J) {
+        // Compute S_block (16x16) = Q_tile(16xDh) * K_tile^T(Dh x 16)
+        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> sTile =
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+
+        [[unroll]] for (uint k0 = 0u, kdIdx = 0u; k0 < Dh; k0 += SUB_TILE, ++kdIdx) {
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> kMat;
+            uint kOff = baseK_B + (j0 * Dh) + k0;           // top-left of K tile (column-major view)
+            coopMatLoad(kMat, kBuf.x, kOff, Dh, gl_CooperativeMatrixLayoutColumnMajor);
+
+            sTile = coopMatMulAdd(qMats[kdIdx], kMat, sTile);
+        }
+
+        // Store S_block into shared P tile (row-major, stride TILE_J)
+        coopMatStore(sTile, Psh, 0u, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
+
+        // Row-wise online softmax stats update and alpha (previous-scale) prep in parallel across lanes
+        if (lane < TILE_M) {
+            // Compute new max for this row
+            float m_new = m[lane];
+            [[unroll]] for (uint c = 0u; c < TILE_J; ++c) {
+                float s = float(Psh[lane * TILE_J + c]) * SCALE;
+                m_new = max(m_new, s);
+            }
+            // Compute new denom and overwrite Ptile row with unnormalized exp(s - m_new)
+            float l_new = l[lane] * exp2((m[lane] - m_new) * LOG2E);
+            [[unroll]] for (uint c = 0u; c < TILE_J; ++c) {
+                float s = float(Psh[lane * TILE_J + c]) * SCALE;
+                float w = exp2((s - m_new) * LOG2E);
+                l_new += w;
+                Psh[lane * TILE_J + c] = float16_t(w);
+            }
+            // Prepare Dsh as diagonal(alpha) where alpha = exp(m_old - m_new) to scale previous accumulator
+            float alpha = exp2((m[lane] - m_new) * LOG2E);
+            Dsh[lane * TILE_M + lane] = float16_t(alpha);
+            m[lane] = m_new;
+            l[lane] = l_new;
+        }
+        barrier();
+
+        // For each kd tile, accumulate y = alpha*y + P*V (P is unnormalized weights)
+        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> pMat;
+        coopMatLoad(pMat, Psh, 0u, TILE_J, gl_CooperativeMatrixLayoutRowMajor);
+        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> dMat;
+        coopMatLoad(dMat, Dsh, 0u, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
+
+        [[unroll]] for (uint kd0 = 0u, kdIdx = 0u; kd0 < Dh; kd0 += SUB_TILE, ++kdIdx) {
+            // Load V tile for this kd
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> vMat;
+            uint vOff = baseV_B + (j0 * Dh) + kd0; // top-left (j0,kd0)
+            coopMatLoad(vMat, vBuf.x, vOff, Dh, gl_CooperativeMatrixLayoutRowMajor);
+
+            // Convert previous accumulator to B by storing to shared and reloading
+            coopMatStore(yAcc[kdIdx], Ysh, 0u, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> yPrevB;
+            coopMatLoad(yPrevB, Ysh, 0u, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
+
+            // Apply y = alpha*y + P*V
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> yTmp =
+                coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+            yTmp = coopMatMulAdd(dMat, yPrevB, yTmp);
+            yAcc[kdIdx] = coopMatMulAdd(pMat, vMat, yTmp);
+        }
+    }
+
+    // After processing all j tiles, write final O from shared accumulators to global.
+    // Build Dsh as diag(gamma) where gamma[row] = 1 / l[row], and apply once.
+    if (lane < TILE_M) {
+        float gamma = (l[lane] > 0.0) ? (1.0 / l[lane]) : 0.0;
+        Dsh[lane * TILE_M + lane] = float16_t(gamma);
+    }
+    barrier();
+
+    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseA> dFinal;
+    coopMatLoad(dFinal, Dsh, 0u, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
+    [[unroll]] for (uint kd0 = 0u, kdIdx = 0u; kd0 < Dh; kd0 += SUB_TILE, ++kdIdx) {
+        // Convert accumulator to B for final diagonal scaling
+        coopMatStore(yAcc[kdIdx], Ysh, 0u, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
+        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseB> yFinalB;
+        coopMatLoad(yFinalB, Ysh, 0u, TILE_M, gl_CooperativeMatrixLayoutRowMajor);
+
+        coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator> oAccFinal =
+            coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE, gl_MatrixUseAccumulator>(0.0);
+        oAccFinal = coopMatMulAdd(dFinal, yFinalB, oAccFinal);
+        uint oSubOff = baseO_B + (i0 * D) + (h * Dh) + kd0;
+        coopMatStore(oAccFinal, oBuf.x, oSubOff, D, gl_CooperativeMatrixLayoutRowMajor);
+    }
+}
+

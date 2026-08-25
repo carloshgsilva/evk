@@ -1,0 +1,58 @@
+#include "../common/evk.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) readonly buffer ReadBufferFp16 { float16_t x[]; };
+layout(buffer_reference) buffer WriteBufferFp16 { float16_t x[]; };
+
+PUSH(
+    ReadBufferFp16 inputBuffer;
+    ReadBufferFp16 weightBuffer;
+    ReadBufferFp16 biasBuffer;
+    WriteBufferFp16 outputBuffer;
+    uint batches;
+    uint inputChannels;
+    uint inputHeight;
+    uint inputWidth;
+    uint outputChannels;
+    uint outputHeight;
+    uint outputWidth;
+    uint kernelHeight;
+    uint kernelWidth;
+    uint stride;
+    uint padding;
+)
+
+// NCHW input/output and OIHW weights.
+COMPUTE(8, 8, 1)
+void main() {
+    uint ox = gl_GlobalInvocationID.x;
+    uint oy = gl_GlobalInvocationID.y;
+    uint outputPlane = gl_GlobalInvocationID.z;
+    if (ox >= outputWidth || oy >= outputHeight || outputPlane >= batches * outputChannels) return;
+
+    uint n = outputPlane / outputChannels;
+    uint oc = outputPlane % outputChannels;
+    float sum = float(biasBuffer.x[oc]);
+
+    for (uint ic = 0; ic < inputChannels; ++ic) {
+        for (uint ky = 0; ky < kernelHeight; ++ky) {
+            int iy = int(oy * stride + ky) - int(padding);
+            if (iy < 0 || iy >= int(inputHeight)) continue;
+
+            for (uint kx = 0; kx < kernelWidth; ++kx) {
+                int ix = int(ox * stride + kx) - int(padding);
+                if (ix < 0 || ix >= int(inputWidth)) continue;
+
+                uint inputIndex = ((n * inputChannels + ic) * inputHeight + uint(iy)) * inputWidth + uint(ix);
+                uint weightIndex = ((oc * inputChannels + ic) * kernelHeight + ky) * kernelWidth + kx;
+                sum += float(inputBuffer.x[inputIndex]) * float(weightBuffer.x[weightIndex]);
+            }
+        }
+    }
+
+    uint outputIndex = ((n * outputChannels + oc) * outputHeight + oy) * outputWidth + ox;
+    outputBuffer.x[outputIndex] = float16_t(sum);
+}

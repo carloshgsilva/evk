@@ -1,0 +1,32 @@
+#include "../common/evk.glsl"
+
+// SGD (Stochastic Gradient Descent) compute shader
+// Updates parameters: param = param - learning_rate * gradient
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 paramBuffer;
+    BufferFp16 gradientBuffer;
+    float learningRate;
+    uint totalElements;
+)
+
+
+COMPUTE(256, 1, 1)
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    // Update parameter: param = param - learning_rate * gradient
+    if (gid < totalElements) {
+        float param = float(paramBuffer.x[gid]);
+        float gradient = float(gradientBuffer.x[gid]);
+        paramBuffer.x[gid] = float16_t(param - learningRate * gradient);
+    }
+}

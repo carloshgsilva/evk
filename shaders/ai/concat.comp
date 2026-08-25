@@ -1,0 +1,42 @@
+#include "../common/evk.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) readonly buffer ReadBufferFp16 { float16_t x[]; };
+layout(buffer_reference) buffer WriteBufferFp16 { float16_t x[]; };
+
+PUSH(
+    ReadBufferFp16 inputA;
+    ReadBufferFp16 inputB;
+    WriteBufferFp16 outputBuffer;
+    uint batches;
+    uint channelsA;
+    uint channelsB;
+    uint height;
+    uint width;
+    uint totalElements;
+)
+
+// Concatenates NCHW tensors on the channel dimension.
+COMPUTE(256, 1, 1)
+void main() {
+    uint outputIndex = gl_GlobalInvocationID.x;
+    if (outputIndex >= totalElements) return;
+
+    uint spatial = height * width;
+    uint outputChannels = channelsA + channelsB;
+    uint plane = outputIndex / spatial;
+    uint pixel = outputIndex % spatial;
+    uint n = plane / outputChannels;
+    uint c = plane % outputChannels;
+
+    if (c < channelsA) {
+        uint inputIndex = (n * channelsA + c) * spatial + pixel;
+        outputBuffer.x[outputIndex] = inputA.x[inputIndex];
+    } else {
+        uint inputIndex = (n * channelsB + c - channelsA) * spatial + pixel;
+        outputBuffer.x[outputIndex] = inputB.x[inputIndex];
+    }
+}

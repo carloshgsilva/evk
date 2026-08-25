@@ -1,0 +1,86 @@
+#include "../common/evk.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) readonly buffer ReadBufferFp16 { float16_t x[]; };
+layout(buffer_reference) writeonly buffer WriteBufferFp16 { float16_t x[]; };
+PUSH(
+    ReadBufferFp16 inputTensor;
+    ReadBufferFp16 weightTensor;
+    ReadBufferFp16 bias;
+    WriteBufferFp16 outputTensor;
+    uint width;
+    uint height;
+    uint inputChannels;
+    uint paddedK;
+)
+
+const uint TILE_X = 16u;
+const uint TILE_Y = 8u;
+const uint INPUT_TILE_X = TILE_X + 2u;
+const uint INPUT_TILE_Y = TILE_Y + 2u;
+const uint CHANNEL_TILE = 16u;
+const uint WORKGROUP_SIZE = TILE_X * TILE_Y;
+shared float16_t inputTile[INPUT_TILE_X * INPUT_TILE_Y * CHANNEL_TILE];
+
+COMPUTE(16, 8, 1)
+void main() {
+    uint outputX = gl_GlobalInvocationID.x;
+    uint outputY = gl_GlobalInvocationID.y;
+    bool validPixel = outputX < width && outputY < height;
+
+    float16_t sum0 = bias.x[0];
+    float16_t sum1 = bias.x[1];
+    float16_t sum2 = bias.x[2];
+    uint lane = gl_LocalInvocationID.y * TILE_X + gl_LocalInvocationID.x;
+    uint channelBlocks = paddedK / (9u * CHANNEL_TILE);
+    for (uint channelBlock = 0u; channelBlock < channelBlocks; ++channelBlock) {
+        for (uint index = lane; index < INPUT_TILE_X * INPUT_TILE_Y * CHANNEL_TILE;
+             index += WORKGROUP_SIZE) {
+            uint inputChannel = channelBlock * CHANNEL_TILE + index % CHANNEL_TILE;
+            uint tilePixel = index / CHANNEL_TILE;
+            uint tileX = tilePixel % INPUT_TILE_X;
+            uint tileY = tilePixel / INPUT_TILE_X;
+            int inputX = int(gl_WorkGroupID.x * TILE_X + tileX) - 1;
+            int inputY = int(gl_WorkGroupID.y * TILE_Y + tileY) - 1;
+            float16_t value = float16_t(0.0);
+            if (inputChannel < inputChannels && inputX >= 0 && inputX < int(width) &&
+                inputY >= 0 && inputY < int(height)) {
+                uint inputIndex = (uint(inputY) * width + uint(inputX)) *
+                                  inputChannels + inputChannel;
+                value = inputTensor.x[inputIndex];
+            }
+            inputTile[index] = value;
+        }
+        barrier();
+
+        if (validPixel) {
+            uint localX = gl_LocalInvocationID.x + 1u;
+            uint localY = gl_LocalInvocationID.y + 1u;
+            for (uint kernelY = 0u; kernelY < 3u; ++kernelY) {
+                for (uint kernelX = 0u; kernelX < 3u; ++kernelX) {
+                    uint kernelOffset = kernelY * 3u + kernelX;
+                    uint inputBase = ((localY + kernelY - 1u) * INPUT_TILE_X +
+                                      localX + kernelX - 1u) * CHANNEL_TILE;
+                    uint weightBase = (channelBlock * 9u + kernelOffset) *
+                                      CHANNEL_TILE * 3u;
+                    for (uint channel = 0u; channel < CHANNEL_TILE; ++channel) {
+                        float16_t value = inputTile[inputBase + channel];
+                        uint weightIndex = weightBase + channel * 3u;
+                        sum0 += value * weightTensor.x[weightIndex];
+                        sum1 += value * weightTensor.x[weightIndex + 1u];
+                        sum2 += value * weightTensor.x[weightIndex + 2u];
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+    if (!validPixel) return;
+    uint outputIndex = (outputY * width + outputX) * 3u;
+    outputTensor.x[outputIndex] = sum0;
+    outputTensor.x[outputIndex + 1u] = sum1;
+    outputTensor.x[outputIndex + 2u] = sum2;
+}
