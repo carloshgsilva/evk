@@ -13,6 +13,7 @@
 namespace evk::ai {
     evk::Cmd& GetCmd();
     uint64_t SubmitCmd(bool wait = true);
+    void WithCmd(evk::Cmd& cmd, const std::function<void()>& record);
 }
 
 struct float16_t {

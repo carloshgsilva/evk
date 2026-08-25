@@ -1,5 +1,6 @@
 #include "evk_ai.h"
 
+#include <stdexcept>
 #include <string_view>
 
 namespace evk::ai {
@@ -8,6 +9,22 @@ namespace evk::ai {
     }
 
     static evk::Cmd* g_cmd = nullptr;
+
+    void WithCmd(evk::Cmd& cmd, const std::function<void()>& record) {
+        if (g_cmd && g_cmd != &cmd) {
+            throw std::logic_error("cannot record AI commands while another AI command is active");
+        }
+
+        evk::Cmd* previous = g_cmd;
+        g_cmd = &cmd;
+        try {
+            record();
+        } catch (...) {
+            g_cmd = previous;
+            throw;
+        }
+        g_cmd = previous;
+    }
 
     static evk::Pipeline create_named_compute_pipeline(const char* name) {
         return evk::CreatePipeline({

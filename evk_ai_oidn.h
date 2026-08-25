@@ -26,8 +26,13 @@ public:
     bool loaded() const { return !parameters_.empty(); }
 
     Tensor& build(Graph& graph, Tensor& input) const;
+    void convert_from_rgba(evk::Image& input, Tensor& output, uint32_t width,
+                           uint32_t height, uint32_t padded_width,
+                           uint32_t padded_height) const;
     void convert_to_rgb(Tensor& input, evk::Buffer& output, uint32_t width,
                         uint32_t height, uint32_t padded_width) const;
+    void convert_to_rgba(Tensor& input, evk::Image& output, uint32_t width,
+                         uint32_t height, uint32_t padded_width) const;
 
 private:
     struct Kernels;
@@ -52,6 +57,12 @@ public:
 
     void denoise(std::span<const float> input_rgb, std::span<float> output_rgb,
                  bool profile = false);
+
+    // Records denoising between RGBA8Unorm or RGBA16Sfloat storage images
+    // without submitting or waiting. Images must match the denoiser dimensions
+    // and already be in the General layout. Output alpha is set to one.
+    void denoise(evk::Cmd& cmd, evk::Image& input_rgba, evk::Image& output_rgba);
+
     const std::vector<evk::TimestampEntry>& timings() const { return timings_; }
     const CpuTimings& cpu_timings() const { return cpu_timings_; }
 

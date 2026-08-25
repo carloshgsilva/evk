@@ -1,0 +1,35 @@
+#include "../common/evk.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) writeonly buffer WriteBufferFp16 { float16_t x[]; };
+PUSH(
+    RID inputImage;
+    WriteBufferFp16 outputTensor;
+    uint width;
+    uint height;
+    uint paddedWidth;
+    uint paddedHeight;
+)
+
+COMPUTE(256, 1, 1)
+void main() {
+    uint pixel = gl_GlobalInvocationID.x;
+    uint paddedPixels = paddedWidth * paddedHeight;
+    if (pixel >= paddedPixels) return;
+
+    uint x = pixel % paddedWidth;
+    uint y = pixel / paddedWidth;
+    f16vec3 value = f16vec3(0.0);
+    if (x < width && y < height) {
+        vec3 inputValue = imageLoad(Image2DR[inputImage], ivec2(x, y)).rgb;
+        value = f16vec3(clamp(inputValue, vec3(0.0), vec3(1.0)));
+    }
+
+    uint outputIndex = pixel * 3u;
+    outputTensor.x[outputIndex + 0u] = value.x;
+    outputTensor.x[outputIndex + 1u] = value.y;
+    outputTensor.x[outputIndex + 2u] = value.z;
+}

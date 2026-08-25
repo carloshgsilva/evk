@@ -246,6 +246,31 @@ The demo regenerates `oidn_noisy.bmp` and `oidn_denoised.bmp`; BMP files are
 ignored by Git. A non-default weights location can be passed with
 `--oidn-weights <path>`; pass `rt_ldr.tza` to use Balanced quality.
 
+For an engine render loop, record OIDN directly into the render command. This
+path does not submit, wait, upload, or read back:
+
+```cpp
+evk::ai::oidn::Denoiser denoiser(weightsPath, width, height);
+
+auto& cmd = evk::CmdBegin();
+// PathTrace and compose into pathTracedImage first.
+cmd.barrier(pathTracedImage, currentLayout, evk::ImageLayout::General);
+cmd.barrier(denoisedImage, evk::ImageLayout::Undefined,
+            evk::ImageLayout::General);
+
+denoiser.denoise(cmd, pathTracedImage, denoisedImage);
+
+cmd.barrier(denoisedImage, evk::ImageLayout::General,
+            evk::ImageLayout::ShaderRead);
+// Display denoisedImage, then submit the render command normally.
+```
+
+The GPU overload accepts `RGBA8Unorm` or `RGBA16Sfloat` storage images in the
+`General` layout. Input RGB contains display-referred sRGB values in `[0, 1]`;
+tone-map and convert a path tracer's linear HDR output before denoising. A
+`Denoiser` owns reusable intermediate GPU buffers and must remain alive until
+commands recorded from it finish executing.
+
 ### Ray Tracing
 
 EVK enables ray tracing automatically when the Vulkan device supports the required extensions and features. Query it at runtime before creating ray tracing resources or selecting a ray tracing render path:

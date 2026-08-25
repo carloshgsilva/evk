@@ -210,6 +210,44 @@ void oidn_demo(const char* weights_path) {
     auto inference_begin = std::chrono::steady_clock::now();
     denoiser.denoise(noisy, denoised, true);
     auto inference_end = std::chrono::steady_clock::now();
+
+    std::vector<float16_t> noisy_rgba(size_t(width) * height * 4u,
+                                      float16_t(1.0f));
+    for (size_t pixel = 0; pixel < size_t(width) * height; ++pixel) {
+        noisy_rgba[pixel * 4u + 0u] = noisy[pixel * 3u + 0u];
+        noisy_rgba[pixel * 4u + 1u] = noisy[pixel * 3u + 1u];
+        noisy_rgba[pixel * 4u + 2u] = noisy[pixel * 3u + 2u];
+    }
+    evk::Image input_image = evk::CreateImage({
+        .extent = {width, height},
+        .format = evk::Format::RGBA16Sfloat,
+        .usage = evk::ImageUsage::Storage | evk::ImageUsage::TransferDst,
+    });
+    evk::Image output_image = evk::CreateImage({
+        .extent = {width, height},
+        .format = evk::Format::RGBA16Sfloat,
+        .usage = evk::ImageUsage::Storage,
+    });
+    auto& image_cmd = evk::CmdBegin();
+    image_cmd.barrier(input_image, evk::ImageLayout::Undefined,
+                      evk::ImageLayout::TransferDst);
+    image_cmd.copy(noisy_rgba.data(), input_image,
+                   noisy_rgba.size() * sizeof(float16_t));
+    image_cmd.barrier(input_image, evk::ImageLayout::TransferDst,
+                      evk::ImageLayout::General);
+    image_cmd.barrier(output_image, evk::ImageLayout::Undefined,
+                      evk::ImageLayout::General);
+    int image_timestamp = image_cmd.beginTimestamp("oidn_record_image");
+    denoiser.denoise(image_cmd, input_image, output_image);
+    image_cmd.endTimestamp(image_timestamp);
+    evk::CmdWait(image_cmd.submit());
+    double gpu_record_image_ms = 0.0;
+    for (const evk::TimestampEntry& timing : evk::CmdTimestamps()) {
+        if (std::string(timing.name) == "oidn_record_image") {
+            gpu_record_image_ms = timing.end - timing.start;
+        }
+    }
+
     save_image("oidn_denoised.bmp", width, height, denoised);
 
     auto milliseconds = [](auto begin, auto end) {
@@ -223,6 +261,7 @@ void oidn_demo(const char* weights_path) {
     printf("cpu_graph: %.3f ms\n", cpu_timings.graph_ms);
     printf("cpu_download: %.3f ms\n", cpu_timings.download_ms);
     printf("cpu_output_unpack: %.3f ms\n", cpu_timings.output_unpack_ms);
+    printf("gpu_record_image: %.3f ms\n", gpu_record_image_ms);
 
     double gpu_graph = 0.0;
     double gpu_conv2d = 0.0;

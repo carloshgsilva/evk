@@ -32,6 +32,33 @@ uint32_t round_up_image_dimension(uint32_t value) {
     return (value + 15u) & ~15u;
 }
 
+bool has_storage(evk::ImageUsage usage) {
+    return (uint32_t(usage) & uint32_t(evk::ImageUsage::Storage)) != 0u;
+}
+
+bool is_supported_image_format(evk::Format format) {
+    return format == evk::Format::RGBA8Unorm ||
+           format == evk::Format::RGBA16Sfloat;
+}
+
+void validate_rgba_image(evk::Image& image, uint32_t width, uint32_t height,
+                         const char* role) {
+    const evk::ImageDesc& desc = evk::GetDesc(image);
+    if (!has_storage(desc.usage)) {
+        throw std::runtime_error(std::string("OIDN ") + role +
+                                 " image requires Storage usage");
+    }
+    if (desc.extent.width != width || desc.extent.height != height ||
+        desc.extent.depth != 1u) {
+        throw std::runtime_error(std::string("OIDN ") + role +
+                                 " image dimensions do not match the denoiser");
+    }
+    if (!is_supported_image_format(desc.format)) {
+        throw std::runtime_error(std::string("OIDN ") + role +
+            " image must use RGBA8Unorm or RGBA16Sfloat");
+    }
+}
+
 template<typename T>
 T read_value(const std::vector<uint8_t>& bytes, size_t& offset) {
     if (offset > bytes.size() || sizeof(T) > bytes.size() - offset) {
@@ -301,7 +328,9 @@ struct Model::Kernels {
     evk::Pipeline conv_32_rows;
     evk::Pipeline conv_64_32_rows;
     evk::Pipeline conv_64_64_rows;
+    evk::Pipeline from_rgba_image;
     evk::Pipeline to_rgb;
+    evk::Pipeline to_rgba_image;
     evk::Pipeline fast_conv_3_32;
     evk::Pipeline fast_conv_32_32;
     evk::Pipeline fast_conv_64_64;
@@ -357,7 +386,9 @@ struct Model::Kernels {
         conv_32_rows = create("oidn_conv_32_rows");
         conv_64_32_rows = create_decoder_rows("oidn_conv_64_32_rows", 32u);
         conv_64_64_rows = create_decoder_rows("oidn_conv_64_64_rows", 64u);
+        from_rgba_image = create("oidn_from_rgba_image");
         to_rgb = create("oidn_to_rgb");
+        to_rgba_image = create("oidn_to_rgba_image");
         fast_conv_3_32 = create_regular(
             "oidn_fast_conv_3_32", 3u, 32u, "oidn_conv_input_8");
         fast_conv_32_32 = create_regular("oidn_fast_conv_32_32", 32u, 32u);
@@ -729,6 +760,24 @@ struct Model::Kernels {
         cmd.barrier();
     }
 
+    void convert_from_rgba(evk::Image& input, Tensor& output, uint32_t width,
+                           uint32_t height, uint32_t padded_width,
+                           uint32_t padded_height) const {
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(from_rgba_image);
+        cmd.push(evk::Constant{
+            input.GetRID(),
+            output.buffer.GetReference(),
+            width,
+            height,
+            padded_width,
+            padded_height,
+        });
+        uint32_t pixels = padded_width * padded_height;
+        cmd.dispatch((pixels + 255u) / 256u, 1u, 1u);
+        cmd.barrier();
+    }
+
     void convert_to_rgb(Tensor& input, evk::Buffer& output, uint32_t width,
                         uint32_t height, uint32_t padded_width) const {
         auto& cmd = evk::ai::GetCmd();
@@ -743,6 +792,23 @@ struct Model::Kernels {
         });
         uint32_t elements = width * height * 3u;
         cmd.dispatch((elements + 255u) / 256u, 1u, 1u);
+        cmd.barrier();
+    }
+
+    void convert_to_rgba(Tensor& input, evk::Image& output, uint32_t width,
+                         uint32_t height, uint32_t padded_width) const {
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(to_rgba_image);
+        cmd.push(evk::Constant{
+            input.buffer.GetReference(),
+            output.GetRID(),
+            width,
+            height,
+            padded_width,
+            input.shape[3],
+        });
+        uint32_t pixels = width * height;
+        cmd.dispatch((pixels + 255u) / 256u, 1u, 1u);
         cmd.barrier();
     }
 };
@@ -843,6 +909,18 @@ Tensor& Model::packed_parameter(const std::string& name) const {
 void Model::convert_to_rgb(Tensor& input, evk::Buffer& output, uint32_t width,
                            uint32_t height, uint32_t padded_width) const {
     kernels_->convert_to_rgb(input, output, width, height, padded_width);
+}
+
+void Model::convert_from_rgba(evk::Image& input, Tensor& output, uint32_t width,
+                              uint32_t height, uint32_t padded_width,
+                              uint32_t padded_height) const {
+    kernels_->convert_from_rgba(input, output, width, height,
+                                padded_width, padded_height);
+}
+
+void Model::convert_to_rgba(Tensor& input, evk::Image& output, uint32_t width,
+                            uint32_t height, uint32_t padded_width) const {
+    kernels_->convert_to_rgba(input, output, width, height, padded_width);
 }
 
 Tensor& Model::build(Graph& graph, Tensor& input) const {
@@ -1040,6 +1118,20 @@ void Denoiser::denoise(std::span<const float> input_rgb, std::span<float> output
         .download_ms = elapsed_ms(download_begin, download_end),
         .output_unpack_ms = elapsed_ms(output_unpack_begin, output_unpack_end),
     };
+}
+
+void Denoiser::denoise(evk::Cmd& cmd, evk::Image& input_rgba,
+                       evk::Image& output_rgba) {
+    validate_rgba_image(input_rgba, width_, height_, "input");
+    validate_rgba_image(output_rgba, width_, height_, "output");
+
+    evk::ai::WithCmd(cmd, [&]() {
+        cmd.barrier();
+        model_.convert_from_rgba(input_rgba, *input_, width_, height_,
+                                 padded_width_, padded_height_);
+        graph_.eval(false, false, false, false);
+        model_.convert_to_rgba(*output_, output_rgba, width_, height_, padded_width_);
+    });
 }
 
 } // namespace evk::ai::oidn
