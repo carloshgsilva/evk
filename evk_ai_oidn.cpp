@@ -25,6 +25,15 @@ struct ArchiveTensor {
     uint64_t offset = 0;
 };
 
+struct ImageInputs {
+    evk::RID color;
+    evk::RID albedo;
+    evk::RID normal;
+    evk::RID unused = 0;
+};
+
+static_assert(sizeof(ImageInputs) == 16u);
+
 uint32_t round_up_image_dimension(uint32_t value) {
     if (value == 0 || value > std::numeric_limits<uint32_t>::max() - 15u) {
         throw std::runtime_error("OIDN image dimensions are invalid");
@@ -39,6 +48,13 @@ bool has_storage(evk::ImageUsage usage) {
 bool is_supported_image_format(evk::Format format) {
     return format == evk::Format::RGBA8Unorm ||
            format == evk::Format::RGBA16Sfloat;
+}
+
+bool is_supported_normal_format(evk::Format format) {
+    return format == evk::Format::RGBA8Snorm ||
+           format == evk::Format::RGBA16Snorm ||
+           format == evk::Format::RGBA16Sfloat ||
+           format == evk::Format::RGBA32Sfloat;
 }
 
 void validate_rgba_image(evk::Image& image, uint32_t width, uint32_t height,
@@ -56,6 +72,22 @@ void validate_rgba_image(evk::Image& image, uint32_t width, uint32_t height,
     if (!is_supported_image_format(desc.format)) {
         throw std::runtime_error(std::string("OIDN ") + role +
             " image must use RGBA8Unorm or RGBA16Sfloat");
+    }
+}
+
+void validate_normal_image(evk::Image& image, uint32_t width, uint32_t height) {
+    const evk::ImageDesc& desc = evk::GetDesc(image);
+    if (desc.extent.width != width || desc.extent.height != height ||
+        desc.extent.depth != 1u) {
+        throw std::runtime_error("OIDN normal image dimensions do not match the denoiser");
+    }
+    if (!has_storage(desc.usage)) {
+        throw std::runtime_error("OIDN normal image requires Storage usage");
+    }
+    if (!is_supported_normal_format(desc.format)) {
+        throw std::runtime_error(
+            "OIDN normal image must use RGBA8Snorm, RGBA16Snorm, "
+            "RGBA16Sfloat, or RGBA32Sfloat");
     }
 }
 
@@ -179,7 +211,15 @@ uint32_t collapsed_tap(uint32_t phase, uint32_t kernel_index) {
 }
 
 uint32_t decoder_skip_channels(const std::string& name, uint32_t input_channels) {
-    if (name == "dec_conv1a.weight") return 3u;
+    if (name == "dec_conv1a.weight") {
+        if (input_channels == 35u || input_channels == 41u) {
+            return input_channels - 32u;
+        }
+        if (input_channels == 67u || input_channels == 73u) {
+            return input_channels - 64u;
+        }
+        return 0u;
+    }
     if (name == "dec_conv2a.weight") return 32u;
     if (name == "dec_conv3a.weight") return input_channels == 96u ? 32u : 48u;
     if (name == "dec_conv4a.weight") return input_channels == 64u ? 32u : 64u;
@@ -193,10 +233,10 @@ std::unique_ptr<Tensor> pack_weight(const std::string& name, Tensor& source) {
     uint32_t kernel_width = source.shape[3];
     uint32_t kernel_elements = kernel_height * kernel_width;
 
-    bool compact_rgb_input = name == "enc_conv0.weight";
+    bool compact_rgb_input = name == "enc_conv0.weight" && input_channels == 3u;
     bool compact_rgb_output = name == "dec_conv0.weight";
-    bool compact_rgb_skip = name == "dec_conv1a.weight";
     uint32_t skip_channels = decoder_skip_channels(name, input_channels);
+    bool compact_rgb_skip = name == "dec_conv1a.weight" && skip_channels == 3u;
     bool collapse_phase = skip_channels != 0u;
 
     uint32_t low_channels = 0u;
@@ -812,18 +852,39 @@ struct Model::Kernels {
         cmd.barrier();
     }
 
-    void convert_from_rgba(evk::Image& input, Tensor& output, uint32_t width,
+    void convert_from_rgba(evk::Image& color, Tensor& output, uint32_t width,
                            uint32_t height, uint32_t padded_width,
                            uint32_t padded_height) const {
         auto& cmd = evk::ai::GetCmd();
         cmd.bind(from_rgba_image);
         cmd.push(evk::Constant{
-            input.GetRID(),
+            ImageInputs{color.GetRID(), color.GetRID(), color.GetRID()},
             output.buffer.GetReference(),
             width,
             height,
             padded_width,
             padded_height,
+            3u,
+        });
+        uint32_t pixels = padded_width * padded_height;
+        cmd.dispatch((pixels + 255u) / 256u, 1u, 1u);
+        cmd.barrier();
+    }
+
+    void convert_from_rgba(evk::Image& color, evk::Image& albedo,
+                           evk::Image& normal, Tensor& output, uint32_t width,
+                           uint32_t height, uint32_t padded_width,
+                           uint32_t padded_height) const {
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(from_rgba_image);
+        cmd.push(evk::Constant{
+            ImageInputs{color.GetRID(), albedo.GetRID(), normal.GetRID()},
+            output.buffer.GetReference(),
+            width,
+            height,
+            padded_width,
+            padded_height,
+            9u,
         });
         uint32_t pixels = padded_width * padded_height;
         cmd.dispatch((pixels + 255u) / 256u, 1u, 1u);
@@ -922,24 +983,30 @@ void Model::load(const std::string& weights_path) {
     SubmitCmd(true);
     packed_parameters_ = std::move(packed_parameters);
 
-    // The balanced and fast color-only models share this topology and differ
-    // only in their internal channel counts.
+    uint32_t input_channels = parameters_.contains("enc_conv0.weight")
+        ? parameter("enc_conv0.weight").shape[1] : 0u;
+    bool supported_inputs = input_channels == 3u || input_channels == 9u;
+
+    // The balanced and fast RT LDR models share this topology and differ only
+    // in their internal channel counts and optional auxiliary inputs.
     bool balanced_model = parameters_.contains("dec_conv4a.weight") &&
                           parameter("dec_conv4a.weight").shape[0] == 112u &&
                           parameters_.contains("dec_conv1a.weight") &&
-                          parameter("dec_conv1a.weight").shape[1] == 67u;
+                          parameter("dec_conv1a.weight").shape[1] ==
+                              64u + input_channels;
     bool fast_model = parameters_.contains("dec_conv4a.weight") &&
                       parameter("dec_conv4a.weight").shape[0] == 64u &&
                       parameters_.contains("dec_conv1a.weight") &&
-                      parameter("dec_conv1a.weight").shape[1] == 35u;
+                      parameter("dec_conv1a.weight").shape[1] ==
+                          32u + input_channels;
     if (!parameters_.contains("enc_conv0.weight") ||
         parameter("enc_conv0.weight").shape[0] != 32u ||
-        parameter("enc_conv0.weight").shape[1] != 3u ||
+        !supported_inputs ||
         (!balanced_model && !fast_model)) {
         parameters_.clear();
-        throw std::runtime_error(
-            "weights are not a supported color-only RT LDR OIDN model");
+        throw std::runtime_error("weights are not a supported RT LDR OIDN model");
     }
+    input_channels_ = input_channels;
 }
 
 Tensor& Model::parameter(const std::string& name) const {
@@ -970,6 +1037,15 @@ void Model::convert_from_rgba(evk::Image& input, Tensor& output, uint32_t width,
                                 padded_width, padded_height);
 }
 
+void Model::convert_from_rgba(evk::Image& color, evk::Image& albedo,
+                              evk::Image& normal, Tensor& output,
+                              uint32_t width, uint32_t height,
+                              uint32_t padded_width,
+                              uint32_t padded_height) const {
+    kernels_->convert_from_rgba(color, albedo, normal, output, width, height,
+                                padded_width, padded_height);
+}
+
 void Model::convert_to_rgba(Tensor& input, evk::Image& output, uint32_t width,
                             uint32_t height, uint32_t padded_width) const {
     kernels_->convert_to_rgba(input, output, width, height, padded_width);
@@ -979,8 +1055,9 @@ Tensor& Model::build(Graph& graph, Tensor& input) const {
     if (!loaded()) {
         throw std::runtime_error("OIDN model is not loaded");
     }
-    if (input.shape.rank() != 4 || input.shape[0] != 1u || input.shape[3] != 3u) {
-        throw std::runtime_error("OIDN input must have shape [1, height, width, 3]");
+    if (input.shape.rank() != 4 || input.shape[0] != 1u ||
+        input.shape[3] != input_channels_) {
+        throw std::runtime_error("OIDN input channel count does not match the weights");
     }
     if ((input.shape[1] % 16u) != 0u || (input.shape[2] % 16u) != 0u) {
         throw std::runtime_error("OIDN input height and width must be multiples of 16");
@@ -1097,12 +1174,15 @@ Denoiser::Denoiser(const std::string& weights_path, uint32_t width, uint32_t hei
       padded_width_(round_up_image_dimension(width)),
       padded_height_(round_up_image_dimension(height)),
       model_(weights_path) {
-    uint64_t padded_values = uint64_t(padded_width_) * padded_height_ * 3u;
+    uint64_t padded_values = uint64_t(padded_width_) * padded_height_ *
+                             model_.input_channels();
     if (padded_values > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("OIDN image dimensions are too large");
     }
 
-    input_ = &graph_.tensor(Shape({1u, padded_height_, padded_width_, 3u}));
+    input_ = &graph_.tensor(Shape({
+        1u, padded_height_, padded_width_, model_.input_channels()
+    }));
     output_ = &model_.build(graph_, *input_);
     uint64_t output_size = uint64_t(width_) * height_ * 3u * sizeof(float);
     output_gpu_ = evk::CreateBuffer({
@@ -1116,30 +1196,74 @@ Denoiser::Denoiser(const std::string& weights_path, uint32_t width, uint32_t hei
     });
 }
 
-void Denoiser::denoise(std::span<const float> input_rgb, std::span<float> output_rgb,
+void Denoiser::denoise(std::span<const float> color_rgb, std::span<float> output_rgb,
                        bool profile) {
+    if (uses_auxiliary_inputs()) {
+        throw std::runtime_error(
+            "OIDN weights require color, albedo, and normal inputs");
+    }
+    denoise_cpu(color_rgb, {}, {}, output_rgb, profile);
+}
+
+void Denoiser::denoise(std::span<const float> color_rgb,
+                       std::span<const float> albedo_rgb,
+                       std::span<const float> normal_xyz,
+                       std::span<float> output_rgb, bool profile) {
+    if (!uses_auxiliary_inputs()) {
+        throw std::runtime_error(
+            "OIDN weights do not accept albedo and normal inputs");
+    }
+    denoise_cpu(color_rgb, albedo_rgb, normal_xyz, output_rgb, profile);
+}
+
+void Denoiser::denoise_cpu(std::span<const float> color_rgb,
+                           std::span<const float> albedo_rgb,
+                           std::span<const float> normal_xyz,
+                           std::span<float> output_rgb, bool profile) {
     using Clock = std::chrono::steady_clock;
     auto elapsed_ms = [](Clock::time_point begin, Clock::time_point end) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
     };
     auto input_pack_begin = Clock::now();
     size_t value_count = size_t(width_) * height_ * 3u;
-    if (input_rgb.size() != value_count || output_rgb.size() != value_count) {
-        throw std::runtime_error("OIDN input and output must contain width * height * 3 values");
+    if (color_rgb.size() != value_count || output_rgb.size() != value_count) {
+        throw std::runtime_error(
+            "OIDN color and output must contain width * height * 3 values");
+    }
+    if (uses_auxiliary_inputs() &&
+        (albedo_rgb.size() != value_count || normal_xyz.size() != value_count)) {
+        throw std::runtime_error(
+            "OIDN albedo and normal must contain width * height * 3 values");
     }
 
     float16_t* input_data = input_->cpu();
     uint32_t padded_spatial = padded_width_ * padded_height_;
-    std::fill(input_data, input_data + size_t(padded_spatial) * 3u, float16_t(0.0f));
+    uint32_t input_channels = model_.input_channels();
+    std::fill(input_data, input_data + size_t(padded_spatial) * input_channels,
+              float16_t(0.0f));
     for (uint32_t y = 0; y < height_; ++y) {
         for (uint32_t x = 0; x < width_; ++x) {
             uint32_t source_pixel = y * width_ + x;
             uint32_t padded_pixel = y * padded_width_ + x;
+            size_t input_index = size_t(padded_pixel) * input_channels;
             for (uint32_t channel = 0; channel < 3u; ++channel) {
-                float value = input_rgb[size_t(source_pixel) * 3u + channel];
+                size_t source_index = size_t(source_pixel) * 3u + channel;
+                float value = color_rgb[source_index];
                 if (!(value >= 0.0f)) value = 0.0f;
-                input_data[padded_pixel * 3u + channel] =
+                input_data[input_index + channel] =
                     float16_t((std::min)(value, 1.0f));
+
+                if (input_channels == 9u) {
+                    value = albedo_rgb[source_index];
+                    if (!(value >= 0.0f)) value = 0.0f;
+                    input_data[input_index + 3u + channel] =
+                        float16_t((std::min)(value, 1.0f));
+
+                    value = normal_xyz[source_index];
+                    if (value != value) value = 0.0f;
+                    input_data[input_index + 6u + channel] =
+                        float16_t((std::clamp)(value, -1.0f, 1.0f));
+                }
             }
         }
     }
@@ -1174,6 +1298,10 @@ void Denoiser::denoise(std::span<const float> input_rgb, std::span<float> output
 
 void Denoiser::denoise(evk::Cmd& cmd, evk::Image& input_rgba,
                        evk::Image& output_rgba) {
+    if (uses_auxiliary_inputs()) {
+        throw std::runtime_error(
+            "OIDN weights require color, albedo, and normal inputs");
+    }
     validate_rgba_image(input_rgba, width_, height_, "input");
     validate_rgba_image(output_rgba, width_, height_, "output");
 
@@ -1181,6 +1309,27 @@ void Denoiser::denoise(evk::Cmd& cmd, evk::Image& input_rgba,
         cmd.barrier();
         model_.convert_from_rgba(input_rgba, *input_, width_, height_,
                                  padded_width_, padded_height_);
+        graph_.eval(false, false, false, false);
+        model_.convert_to_rgba(*output_, output_rgba, width_, height_, padded_width_);
+    });
+}
+
+void Denoiser::denoise(evk::Cmd& cmd, evk::Image& color_rgba,
+                       evk::Image& albedo_rgba, evk::Image& normal_rgba,
+                       evk::Image& output_rgba) {
+    if (!uses_auxiliary_inputs()) {
+        throw std::runtime_error(
+            "OIDN weights do not accept albedo and normal inputs");
+    }
+    validate_rgba_image(color_rgba, width_, height_, "color");
+    validate_rgba_image(albedo_rgba, width_, height_, "albedo");
+    validate_normal_image(normal_rgba, width_, height_);
+    validate_rgba_image(output_rgba, width_, height_, "output");
+
+    evk::ai::WithCmd(cmd, [&]() {
+        cmd.barrier();
+        model_.convert_from_rgba(color_rgba, albedo_rgba, normal_rgba, *input_,
+                                 width_, height_, padded_width_, padded_height_);
         graph_.eval(false, false, false, false);
         model_.convert_to_rgba(*output_, output_rgba, width_, height_, padded_width_);
     });

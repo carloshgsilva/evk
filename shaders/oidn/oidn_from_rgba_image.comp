@@ -6,12 +6,13 @@
 
 layout(buffer_reference) writeonly buffer WriteBufferFp16 { float16_t x[]; };
 PUSH(
-    RID inputImage;
+    ivec4 inputImages;
     WriteBufferFp16 outputTensor;
     uint width;
     uint height;
     uint paddedWidth;
     uint paddedHeight;
+    uint inputChannels;
 )
 
 COMPUTE(256, 1, 1)
@@ -24,12 +25,32 @@ void main() {
     uint y = pixel / paddedWidth;
     f16vec3 value = f16vec3(0.0);
     if (x < width && y < height) {
-        vec3 inputValue = imageLoad(Image2DR[inputImage], ivec2(x, y)).rgb;
-        value = f16vec3(clamp(inputValue, vec3(0.0), vec3(1.0)));
+        value = f16vec3(clamp(
+            imageLoad(Image2DR[inputImages.x], ivec2(x, y)).rgb,
+            vec3(0.0), vec3(1.0)));
     }
 
-    uint outputIndex = pixel * 3u;
+    uint outputIndex = pixel * inputChannels;
     outputTensor.x[outputIndex + 0u] = value.x;
     outputTensor.x[outputIndex + 1u] = value.y;
     outputTensor.x[outputIndex + 2u] = value.z;
+
+    if (inputChannels == 9u) {
+        f16vec3 albedo = f16vec3(0.0);
+        f16vec3 normal = f16vec3(0.0);
+        if (x < width && y < height) {
+            albedo = f16vec3(clamp(
+                imageLoad(Image2DR[inputImages.y], ivec2(x, y)).rgb,
+                vec3(0.0), vec3(1.0)));
+            normal = f16vec3(clamp(
+                imageLoad(Image2DR[inputImages.z], ivec2(x, y)).rgb,
+                vec3(-1.0), vec3(1.0)));
+        }
+        outputTensor.x[outputIndex + 3u] = albedo.x;
+        outputTensor.x[outputIndex + 4u] = albedo.y;
+        outputTensor.x[outputIndex + 5u] = albedo.z;
+        outputTensor.x[outputIndex + 6u] = normal.x;
+        outputTensor.x[outputIndex + 7u] = normal.y;
+        outputTensor.x[outputIndex + 8u] = normal.z;
+    }
 }

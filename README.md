@@ -229,10 +229,11 @@ EVK enables cooperative matrices automatically when `VK_KHR_cooperative_matrix` 
 
 ### OIDN denoising
 
-`evk::ai::oidn::Denoiser` runs the official fast or balanced color-only OIDN
-RT LDR U-Net on Vulkan. It accepts and returns interleaved sRGB float pixels in
-`[0, 1]`. Images are padded to the model's 16-pixel alignment internally, so
-standard dimensions such as 1920x1080 can be passed directly.
+`evk::ai::oidn::Denoiser` runs the official fast or balanced OIDN RT LDR U-Net
+on Vulkan. Both color-only and color+albedo+normal models are supported. Color
+and albedo use values in `[0, 1]`; normals are signed world-space or view-space
+vectors in `[-1, 1]`. Images are padded to the model's 16-pixel alignment
+internally, so standard dimensions such as 1920x1080 can be passed directly.
 The optimized GPU path requires `VK_KHR_cooperative_matrix` support.
 
 Download `rt_ldr_small.tza` as described in `oidn-weights/README.md`, then run
@@ -244,7 +245,8 @@ the deterministic path-traced demo in OIDN's Fast quality mode:
 
 The demo regenerates `oidn_noisy.bmp` and `oidn_denoised.bmp`; BMP files are
 ignored by Git. A non-default weights location can be passed with
-`--oidn-weights <path>`; pass `rt_ldr.tza` to use Balanced quality.
+`--oidn-weights <path>`. The demo detects whether the selected weights require
+the generated albedo and normal guides.
 
 For an engine render loop, record OIDN directly into the render command. This
 path does not submit, wait, upload, or read back:
@@ -260,16 +262,22 @@ cmd.barrier(denoisedImage, evk::ImageLayout::Undefined,
 
 denoiser.denoise(cmd, pathTracedImage, denoisedImage);
 
+// With rt_ldr_alb_nrm weights:
+// denoiser.denoise(cmd, pathTracedImage, albedoImage, normalImage,
+//                  denoisedImage);
+
 cmd.barrier(denoisedImage, evk::ImageLayout::General,
             evk::ImageLayout::ShaderRead);
 // Display denoisedImage, then submit the render command normally.
 ```
 
-The GPU overload accepts `RGBA8Unorm` or `RGBA16Sfloat` storage images in the
-`General` layout. Input RGB contains display-referred sRGB values in `[0, 1]`;
-tone-map and convert a path tracer's linear HDR output before denoising. A
-`Denoiser` owns reusable intermediate GPU buffers and must remain alive until
-commands recorded from it finish executing.
+Color, albedo, and output images accept `RGBA8Unorm` or `RGBA16Sfloat` storage
+images in the `General` layout. Normal images accept `RGBA8Snorm`,
+`RGBA16Snorm`, `RGBA16Sfloat`, or `RGBA32Sfloat`. Do not remap normals to
+`[0, 1]`. Color input contains display-referred sRGB values; tone-map and
+convert a path tracer's linear HDR output before denoising. A `Denoiser` owns
+reusable intermediate GPU buffers and must remain alive until commands recorded
+from it finish executing.
 
 ### Ray Tracing
 

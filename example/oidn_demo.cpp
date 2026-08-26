@@ -141,9 +141,20 @@ float linear_to_srgb(float value) {
         : 1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f;
 }
 
-std::vector<float> render_path_traced_image(uint32_t width, uint32_t height) {
+struct RenderOutput {
+    std::vector<float> color;
+    std::vector<float> albedo;
+    std::vector<float> normal;
+};
+
+RenderOutput render_path_traced_image(uint32_t width, uint32_t height) {
     constexpr uint32_t samples_per_pixel = 4;
-    std::vector<float> image(size_t(width) * height * 3u);
+    size_t value_count = size_t(width) * height * 3u;
+    RenderOutput output{
+        .color = std::vector<float>(value_count),
+        .albedo = std::vector<float>(value_count),
+        .normal = std::vector<float>(value_count),
+    };
     Vec3 camera{0.0f, 0.15f, 0.7f};
     float aspect = float(width) / float(height);
 
@@ -151,6 +162,8 @@ std::vector<float> render_path_traced_image(uint32_t width, uint32_t height) {
         for (uint32_t x = 0; x < width; ++x) {
             Random random{0x9E3779B9u ^ (x + y * width + 1u) * 747796405u};
             Vec3 color;
+            Vec3 albedo;
+            Vec3 normal;
             for (uint32_t sample = 0; sample < samples_per_pixel; ++sample) {
                 float u = (float(x) + random.next()) / float(width);
                 float v = (float(y) + random.next()) / float(height);
@@ -159,17 +172,41 @@ std::vector<float> render_path_traced_image(uint32_t width, uint32_t height) {
                     1.0f - 2.0f * v,
                     -1.65f,
                 });
+                Hit primary_hit = intersect_scene(camera, direction);
+                if (primary_hit.found) {
+                    albedo = albedo + primary_hit.albedo;
+                    normal = normal + primary_hit.normal;
+                }
                 color = color + trace(camera, direction, random);
             }
-            color = color * (1.0f / float(samples_per_pixel));
+            float sample_weight = 1.0f / float(samples_per_pixel);
+            color = color * sample_weight;
+            albedo = albedo * sample_weight;
+            normal = normal * sample_weight;
 
             size_t index = (size_t(y) * width + x) * 3u;
-            image[index + 0] = (std::min)(linear_to_srgb(color.x), 1.0f);
-            image[index + 1] = (std::min)(linear_to_srgb(color.y), 1.0f);
-            image[index + 2] = (std::min)(linear_to_srgb(color.z), 1.0f);
+            output.color[index + 0] = (std::min)(linear_to_srgb(color.x), 1.0f);
+            output.color[index + 1] = (std::min)(linear_to_srgb(color.y), 1.0f);
+            output.color[index + 2] = (std::min)(linear_to_srgb(color.z), 1.0f);
+            output.albedo[index + 0] = albedo.x;
+            output.albedo[index + 1] = albedo.y;
+            output.albedo[index + 2] = albedo.z;
+            output.normal[index + 0] = normal.x;
+            output.normal[index + 1] = normal.y;
+            output.normal[index + 2] = normal.z;
         }
     }
-    return image;
+    return output;
+}
+
+std::vector<float16_t> to_rgba16(const std::vector<float>& rgb) {
+    std::vector<float16_t> rgba(rgb.size() / 3u * 4u, float16_t(1.0f));
+    for (size_t pixel = 0; pixel < rgb.size() / 3u; ++pixel) {
+        rgba[pixel * 4u + 0u] = rgb[pixel * 3u + 0u];
+        rgba[pixel * 4u + 1u] = rgb[pixel * 3u + 1u];
+        rgba[pixel * 4u + 2u] = rgb[pixel * 3u + 2u];
+    }
+    return rgba;
 }
 
 void save_image(const char* path, uint32_t width, uint32_t height,
@@ -198,27 +235,38 @@ void oidn_demo(const char* weights_path) {
 
     printf("[oidn] Rendering deterministic %ux%u path-traced input...\n", width, height);
     auto pathtrace_begin = std::chrono::steady_clock::now();
-    std::vector<float> noisy = render_path_traced_image(width, height);
+    RenderOutput rendered = render_path_traced_image(width, height);
     auto pathtrace_end = std::chrono::steady_clock::now();
-    save_image("oidn_noisy.bmp", width, height, noisy);
+    save_image("oidn_noisy.bmp", width, height, rendered.color);
 
     printf("[oidn] Loading %s\n", weights_path);
     auto load_begin = std::chrono::steady_clock::now();
     evk::ai::oidn::Denoiser denoiser(weights_path, width, height);
     auto load_end = std::chrono::steady_clock::now();
-    std::vector<float> denoised(noisy.size());
+    std::vector<float> denoised(rendered.color.size());
     auto inference_begin = std::chrono::steady_clock::now();
-    denoiser.denoise(noisy, denoised, true);
+    if (denoiser.uses_auxiliary_inputs()) {
+        denoiser.denoise(rendered.color, rendered.albedo, rendered.normal,
+                         denoised, true);
+    } else {
+        denoiser.denoise(rendered.color, denoised, true);
+    }
     auto inference_end = std::chrono::steady_clock::now();
 
-    std::vector<float16_t> noisy_rgba(size_t(width) * height * 4u,
-                                      float16_t(1.0f));
-    for (size_t pixel = 0; pixel < size_t(width) * height; ++pixel) {
-        noisy_rgba[pixel * 4u + 0u] = noisy[pixel * 3u + 0u];
-        noisy_rgba[pixel * 4u + 1u] = noisy[pixel * 3u + 1u];
-        noisy_rgba[pixel * 4u + 2u] = noisy[pixel * 3u + 2u];
-    }
-    evk::Image input_image = evk::CreateImage({
+    std::vector<float16_t> color_rgba = to_rgba16(rendered.color);
+    std::vector<float16_t> albedo_rgba = to_rgba16(rendered.albedo);
+    std::vector<float16_t> normal_rgba = to_rgba16(rendered.normal);
+    evk::Image color_image = evk::CreateImage({
+        .extent = {width, height},
+        .format = evk::Format::RGBA16Sfloat,
+        .usage = evk::ImageUsage::Storage | evk::ImageUsage::TransferDst,
+    });
+    evk::Image albedo_image = evk::CreateImage({
+        .extent = {width, height},
+        .format = evk::Format::RGBA16Sfloat,
+        .usage = evk::ImageUsage::Storage | evk::ImageUsage::TransferDst,
+    });
+    evk::Image normal_image = evk::CreateImage({
         .extent = {width, height},
         .format = evk::Format::RGBA16Sfloat,
         .usage = evk::ImageUsage::Storage | evk::ImageUsage::TransferDst,
@@ -229,16 +277,26 @@ void oidn_demo(const char* weights_path) {
         .usage = evk::ImageUsage::Storage,
     });
     auto& image_cmd = evk::CmdBegin();
-    image_cmd.barrier(input_image, evk::ImageLayout::Undefined,
-                      evk::ImageLayout::TransferDst);
-    image_cmd.copy(noisy_rgba.data(), input_image,
-                   noisy_rgba.size() * sizeof(float16_t));
-    image_cmd.barrier(input_image, evk::ImageLayout::TransferDst,
-                      evk::ImageLayout::General);
+    auto upload_image = [&](evk::Image& image,
+                            std::vector<float16_t>& rgba) {
+        image_cmd.barrier(image, evk::ImageLayout::Undefined,
+                          evk::ImageLayout::TransferDst);
+        image_cmd.copy(rgba.data(), image, rgba.size() * sizeof(float16_t));
+        image_cmd.barrier(image, evk::ImageLayout::TransferDst,
+                          evk::ImageLayout::General);
+    };
+    upload_image(color_image, color_rgba);
+    upload_image(albedo_image, albedo_rgba);
+    upload_image(normal_image, normal_rgba);
     image_cmd.barrier(output_image, evk::ImageLayout::Undefined,
                       evk::ImageLayout::General);
     int image_timestamp = image_cmd.beginTimestamp("oidn_record_image");
-    denoiser.denoise(image_cmd, input_image, output_image);
+    if (denoiser.uses_auxiliary_inputs()) {
+        denoiser.denoise(image_cmd, color_image, albedo_image, normal_image,
+                         output_image);
+    } else {
+        denoiser.denoise(image_cmd, color_image, output_image);
+    }
     image_cmd.endTimestamp(image_timestamp);
     evk::CmdWait(image_cmd.submit());
     double gpu_record_image_ms = 0.0;
@@ -288,10 +346,10 @@ void oidn_demo(const char* weights_path) {
     printf("gpu_concat: %.3f ms\n", gpu_concat);
 
     double absolute_difference = 0.0;
-    for (size_t i = 0; i < noisy.size(); ++i) {
-        absolute_difference += std::abs(double(noisy[i] - denoised[i]));
+    for (size_t i = 0; i < rendered.color.size(); ++i) {
+        absolute_difference += std::abs(double(rendered.color[i] - denoised[i]));
     }
-    absolute_difference /= double(noisy.size());
+    absolute_difference /= double(rendered.color.size());
     printf("[oidn] Mean absolute change: %.6f\n", absolute_difference);
     printf("[oidn] Wrote oidn_noisy.bmp and oidn_denoised.bmp\n");
 }
