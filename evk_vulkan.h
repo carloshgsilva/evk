@@ -114,6 +114,16 @@ namespace evk {
         VkDevice device;
         VkQueue queue;
         uint32_t queueFamily;
+        PFN_vkCreateSwapchainKHR vulkanCreateSwapchainKHR = vkCreateSwapchainKHR;
+        PFN_vkDestroySwapchainKHR vulkanDestroySwapchainKHR = vkDestroySwapchainKHR;
+        PFN_vkGetSwapchainImagesKHR vulkanGetSwapchainImagesKHR = vkGetSwapchainImagesKHR;
+        PFN_vkAcquireNextImageKHR vulkanAcquireNextImageKHR = vkAcquireNextImageKHR;
+        PFN_vkQueuePresentKHR vulkanQueuePresentKHR = vkQueuePresentKHR;
+        PFN_vkDeviceWaitIdle vulkanDeviceWaitIdle = vkDeviceWaitIdle;
+        PFN_vkVoidFunction vulkanCreateWin32SurfaceKHR = nullptr;
+        PFN_vkDestroySurfaceKHR vulkanDestroySurfaceKHR = vkDestroySurfaceKHR;
+        uint32_t pluginGraphicsQueueIndex = 0;
+        uint32_t pluginComputeQueueIndex = 0;
         VmaAllocator allocator;
         float timestampPeriod = 0.0f;
         VkDeviceSize accelerationStructureScratchAlignment = 1;
@@ -178,6 +188,13 @@ namespace evk {
     };
     State& GetState();
     void SetState(State* state);
+
+    VkImage GetVulkanImage(const Image& image);
+    VkImageView GetVulkanImageView(const Image& image);
+    VkCommandBuffer GetVulkanCommandBuffer(const Cmd& cmd);
+    VkResult CreateVulkanWin32Surface(void* windowHandle, VkSurfaceKHR* surface);
+    void WaitIdle();
+    void ResetVulkanHooks();
 
 #define DEFINE_TO_INTERNAL(libClass) \
     static inline Internal_##libClass& ToInternal(const libClass& ref) { return *((Internal_##libClass*)ref.res); }

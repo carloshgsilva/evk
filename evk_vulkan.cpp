@@ -1,3 +1,16 @@
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef VK_USE_PLATFORM_WIN32_KHR
+#define VK_USE_PLATFORM_WIN32_KHR
+#endif
+#include <windows.h>
+#endif
+
 #include "evk_vulkan.h"
 
 #define VMA_IMPLEMENTATION
@@ -806,6 +819,18 @@ namespace evk {
         return GetState().features;
     }
 
+    VkImage GetVulkanImage(const Image& image) {
+        return ToInternal(image).image;
+    }
+
+    VkImageView GetVulkanImageView(const Image& image) {
+        return ToInternal(image).view;
+    }
+
+    VkCommandBuffer GetVulkanCommandBuffer(const Cmd& cmd) {
+        return static_cast<CommandBufferData*>(cmd._internal)->cmd;
+    }
+
     Extent GetSwapchainExtent() {
         auto& S = GetState();
         return S.swapchainImages.empty() ? Extent{} : GetDesc(S.swapchainImages[S.swapchainIndex]).extent;
@@ -829,6 +854,12 @@ namespace evk {
         S.imageCount = desc.bindless.imageCount;
         S.samplerCount = desc.bindless.imageCount;
         S.tlasCount = desc.bindless.tlasCount;
+        const auto interposedGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+            desc.vulkanGetInstanceProcAddr
+        );
+        const auto interposedGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            desc.vulkanGetDeviceProcAddr
+        );
 
         // Application and Instance
         {
@@ -1031,11 +1062,19 @@ namespace evk {
             EVK_ASSERT(S.queueFamily < familyProps.size(), "could not find graphics queue family!");
             S.features.timestamps = desc.enableTimestamps && familyProps[S.queueFamily].timestampValidBits != 0;
 
-            float priority0 = 1.0f;
+            const uint32_t requestedQueueCount = 1 + desc.extraGraphicsQueueCount + desc.extraComputeQueueCount;
+            EVK_ASSERT(requestedQueueCount <= familyProps[S.queueFamily].queueCount,
+                "graphics queue family has %u queues, but %u were requested",
+                familyProps[S.queueFamily].queueCount, requestedQueueCount);
+            std::vector<float> queuePriorities(requestedQueueCount, 1.0f);
             VkDeviceQueueCreateInfo deviceQueueci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
             deviceQueueci.queueFamilyIndex = S.queueFamily;
-            deviceQueueci.queueCount = 1;
-            deviceQueueci.pQueuePriorities = &priority0;
+            deviceQueueci.queueCount = requestedQueueCount;
+            deviceQueueci.pQueuePriorities = queuePriorities.data();
+            S.pluginGraphicsQueueIndex = desc.extraGraphicsQueueCount > 0 ? 1 : 0;
+            S.pluginComputeQueueIndex = desc.extraComputeQueueCount > 0
+                ? 1 + desc.extraGraphicsQueueCount
+                : 0;
 
             // Base device features (only enable what the device reports as supported)
             VkPhysicalDeviceFeatures supportedBase = {};
@@ -1073,6 +1112,12 @@ namespace evk {
                 }
                 deviceExtensions.push_back(name);
             };
+
+            for (const std::string& extension : desc.deviceExtensions) {
+                EVK_ASSERT(isExtensionSupported(extension.c_str()),
+                    "required device extension '%s' is not supported", extension.c_str());
+                addDeviceExtensionIfSupported(extension.c_str());
+            }
 
             // Query supported feature structs so we only request what is available.
             VkPhysicalDeviceFeatures2 supportedFeatures2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -1249,7 +1294,7 @@ namespace evk {
             // Conditionally enable swapchain device extension only if swapchain support requested
             if (desc.enableSwapchain) {
                 EVK_ASSERT(isExtensionSupported(VK_KHR_SWAPCHAIN_EXTENSION_NAME), "Device extension '%s' not found!", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-                deviceExtensions.insert(deviceExtensions.begin(), VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+                addDeviceExtensionIfSupported(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
             }
 
 // Check device extensions support
@@ -1277,6 +1322,40 @@ namespace evk {
 
             CHECK_VK(vkCreateDevice(S.physicalDevice, &deviceci, nullptr, &S.device));
             vkGetDeviceQueue(S.device, S.queueFamily, 0, &S.queue);
+
+            if (interposedGetDeviceProcAddr) {
+                auto get = [&](const char* name) {
+                    return interposedGetDeviceProcAddr(S.device, name);
+                };
+                S.vulkanCreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(
+                    get("vkCreateSwapchainKHR")
+                );
+                S.vulkanDestroySwapchainKHR = reinterpret_cast<PFN_vkDestroySwapchainKHR>(
+                    get("vkDestroySwapchainKHR")
+                );
+                S.vulkanGetSwapchainImagesKHR = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(
+                    get("vkGetSwapchainImagesKHR")
+                );
+                S.vulkanAcquireNextImageKHR = reinterpret_cast<PFN_vkAcquireNextImageKHR>(
+                    get("vkAcquireNextImageKHR")
+                );
+                S.vulkanQueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(
+                    get("vkQueuePresentKHR")
+                );
+                S.vulkanDeviceWaitIdle = reinterpret_cast<PFN_vkDeviceWaitIdle>(
+                    get("vkDeviceWaitIdle")
+                );
+            }
+            if (interposedGetInstanceProcAddr) {
+#if defined(_WIN32)
+                S.vulkanCreateWin32SurfaceKHR = interposedGetInstanceProcAddr(
+                    S.instance, "vkCreateWin32SurfaceKHR"
+                );
+#endif
+                S.vulkanDestroySurfaceKHR = reinterpret_cast<PFN_vkDestroySurfaceKHR>(
+                    interposedGetInstanceProcAddr(S.instance, "vkDestroySurfaceKHR")
+                );
+            }
         }
 
         // Get PFNs
@@ -1462,7 +1541,7 @@ namespace evk {
 
         // Fences only cover vkQueueSubmit; presentation is queued separately. Ensure the device is idle
         // before destroying swapchain-related semaphores and other Vulkan objects.
-        CHECK_VK(vkDeviceWaitIdle(S.device));
+        CHECK_VK(S.vulkanDeviceWaitIdle(S.device));
 
         // Clean up pending deletions first
         {
@@ -1533,8 +1612,8 @@ namespace evk {
         vkDestroyDescriptorSetLayout(S.device, S.descriptorSetLayout, nullptr);
         vkDestroyPipelineLayout(S.device, S.pipelineLayout, nullptr);
         if(S.swapchain != nullptr) {
-            vkDestroySwapchainKHR(S.device, S.swapchain, nullptr);
-            vkDestroySurfaceKHR(S.instance, S.surface, nullptr);
+            S.vulkanDestroySwapchainKHR(S.device, S.swapchain, nullptr);
+            S.vulkanDestroySurfaceKHR(S.instance, S.surface, nullptr);
         }
         vkDestroyDevice(S.device, nullptr);
         vkDestroyInstance(S.instance, nullptr);
@@ -1564,7 +1643,7 @@ namespace evk {
     }
     bool RecreateSwapchain() {
         auto& S = GetState();
-        CHECK_VK(vkDeviceWaitIdle(S.device));
+        CHECK_VK(S.vulkanDeviceWaitIdle(S.device));
         EVK_ASSERT(S.surface != nullptr, "Surface is not initialized!");
         S.swapchainRecreateRequested = false;
 
@@ -1640,14 +1719,14 @@ namespace evk {
             .oldSwapchain = oldSwapchain,
         };
 
-        CHECK_VK(vkCreateSwapchainKHR(S.device, &swapchainci, nullptr, &S.swapchain));
+        CHECK_VK(S.vulkanCreateSwapchainKHR(S.device, &swapchainci, nullptr, &S.swapchain));
 
         // Get swapchain images
         uint32_t swapchainImageCount = 0;
         std::vector<VkImage> images;
-        CHECK_VK(vkGetSwapchainImagesKHR(S.device, S.swapchain, &swapchainImageCount, nullptr));
+        CHECK_VK(S.vulkanGetSwapchainImagesKHR(S.device, S.swapchain, &swapchainImageCount, nullptr));
         images.resize(swapchainImageCount);
-        CHECK_VK(vkGetSwapchainImagesKHR(S.device, S.swapchain, &swapchainImageCount, images.data()));
+        CHECK_VK(S.vulkanGetSwapchainImagesKHR(S.device, S.swapchain, &swapchainImageCount, images.data()));
         
         // Clean up old swapchain images
         for (auto& img : S.swapchainImages) {
@@ -1679,7 +1758,7 @@ namespace evk {
         }
         S.swapchainIndex = 0;
 
-        vkDestroySwapchainKHR(S.device, oldSwapchain, nullptr);
+        S.vulkanDestroySwapchainKHR(S.device, oldSwapchain, nullptr);
 
         return true;
     }
@@ -1894,6 +1973,56 @@ namespace evk {
     void Cmd::dispatch(uint32_t countX, uint32_t countY, uint32_t countZ) {
         CommandBufferData* cb = (CommandBufferData*)_internal;
         vkCmdDispatch(cb->cmd, countX, countY, countZ);
+    }
+
+    VkResult CreateVulkanWin32Surface(void* windowHandle, VkSurfaceKHR* surface) {
+#if defined(_WIN32)
+        auto& S = GetState();
+        VkWin32SurfaceCreateInfoKHR createInfo = {VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+        createInfo.hinstance = GetModuleHandleW(nullptr);
+        createInfo.hwnd = static_cast<HWND>(windowHandle);
+        auto createSurface = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
+            S.vulkanCreateWin32SurfaceKHR
+        );
+        if (!createSurface) {
+            createSurface = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(
+                vkGetInstanceProcAddr(S.instance, "vkCreateWin32SurfaceKHR")
+            );
+        }
+        return createSurface
+            ? createSurface(S.instance, &createInfo, nullptr, surface)
+            : VK_ERROR_EXTENSION_NOT_PRESENT;
+#else
+        (void)windowHandle;
+        (void)surface;
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+#endif
+    }
+
+    void WaitIdle() {
+        auto& S = GetState();
+        CHECK_VK(S.vulkanDeviceWaitIdle(S.device));
+    }
+
+    void ResetVulkanHooks() {
+        auto& S = GetState();
+        S.vulkanCreateSwapchainKHR = vkCreateSwapchainKHR;
+        S.vulkanDestroySwapchainKHR = vkDestroySwapchainKHR;
+        S.vulkanGetSwapchainImagesKHR = vkGetSwapchainImagesKHR;
+        S.vulkanAcquireNextImageKHR = vkAcquireNextImageKHR;
+        S.vulkanQueuePresentKHR = vkQueuePresentKHR;
+        S.vulkanDeviceWaitIdle = vkDeviceWaitIdle;
+        S.vulkanCreateWin32SurfaceKHR = nullptr;
+        S.vulkanDestroySurfaceKHR = vkDestroySurfaceKHR;
+    }
+
+    void Cmd::restoreBindings() {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        State& state = GetState();
+        vkCmdBindDescriptorSets(cb->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            state.pipelineLayout, 0, 1, &state.descriptorSet, 0, nullptr);
+        vkCmdBindDescriptorSets(cb->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            state.pipelineLayout, 0, 1, &state.descriptorSet, 0, nullptr);
     }
     
     void Cmd::barrier(Image& image, ImageLayout oldLayout, ImageLayout newLayout, uint32_t mip, uint32_t mipCount, uint32_t layer, uint32_t layerCount) {
@@ -2323,10 +2452,10 @@ namespace evk {
         }
         // Use the command buffer's own imageReadySemaphore for acquire
         uint32_t acquiredIndex = 0;
-        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
+        VkResult r = S.vulkanAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
             RecreateSwapchain();
-            r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
+            r = S.vulkanAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
         }
 
         cb->swapchainIndex = acquiredIndex;
@@ -2353,10 +2482,10 @@ namespace evk {
             RecreateSwapchain();
         }
         uint32_t acquiredIndex = 0;
-        VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
+        VkResult r = S.vulkanAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
             RecreateSwapchain();
-            r = vkAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
+            r = S.vulkanAcquireNextImageKHR(S.device, S.swapchain, UINT64_MAX, cb->imageReadySemaphore, VK_NULL_HANDLE, &acquiredIndex);
         }
 
         cb->swapchainIndex = acquiredIndex;
@@ -2674,7 +2803,7 @@ namespace evk {
             present.swapchainCount = 1;
             present.pSwapchains = &S.swapchain;
             present.pImageIndices = &cb->swapchainIndex;
-            VkResult r = vkQueuePresentKHR(S.queue, &present);
+            VkResult r = S.vulkanQueuePresentKHR(S.queue, &present);
 
             if (r == VK_ERROR_OUT_OF_DATE_KHR) {
                 RecreateSwapchain();

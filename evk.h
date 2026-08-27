@@ -336,6 +336,11 @@ namespace evk {
         std::uint32_t engineVersion = 0;
         std::vector<std::string> instanceLayers = {};
         std::vector<std::string> instanceExtensions = {};
+        std::vector<std::string> deviceExtensions = {};
+        void* vulkanGetInstanceProcAddr = nullptr;
+        void* vulkanGetDeviceProcAddr = nullptr;
+        uint32_t extraGraphicsQueueCount = 0;
+        uint32_t extraComputeQueueCount = 0;
         uint32_t frameBufferingCount = 3;
         bool enableSwapchain = false; // VK_KHR_swapchain
         bool enableValidation = false;
@@ -389,6 +394,9 @@ namespace evk {
 
         // Dispatch a compute shader
         void dispatch(uint32_t countX, uint32_t countY = 1, uint32_t countZ = 1);
+
+        // Restore EVK bindings after an external API records into this command buffer.
+        void restoreBindings();
 
         // Memory barriers
         void barrier(Image& image, ImageLayout oldLayout, ImageLayout newLayout, uint32_t mip = 0, uint32_t mipCount = 1, uint32_t layer = 0, uint32_t layerCount = 1);
