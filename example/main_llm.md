@@ -50,16 +50,9 @@ The run prints:
 - `val_completion_mse`: greedy-decoded coordinate MSE on the 10 predicted triangles only
 
 ### Outputs
-After training, the demo exports:
-- `output/mesh_target.obj` - reference validation mesh for seed 0
-- `output/mesh_pred.obj` - completion for validation seed 0, conditioned on its first 2 triangles
-- `output/mesh_pred_seed0.obj`
-- `output/mesh_pred_seed1.obj`
-- `output/mesh_pred_seed2.obj`
-
-`mesh_pred*.obj` files are paired completions: each uses the first 2 triangles from its matching validation target and predicts the remaining 10.
-
-`output/mesh_val_evolution.obj` keeps the full target mesh in the first column of each row and appends conditioned completion samples over training so target/prediction comparisons stay meaningful.
+The demo only exports `output/mesh_val_evolution.obj`. It keeps the full target
+mesh in the first column of each row and appends conditioned completion samples
+over training so target/prediction comparisons stay meaningful.
 
 ### Run
 Use:

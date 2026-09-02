@@ -427,32 +427,6 @@ float completion_mse(const std::vector<float>& pred_mesh,
     return float(sum_sq / double(count));
 }
 
-void export_obj(const std::filesystem::path& path,
-                const std::vector<float>& features,
-                uint32_t tri_count,
-                float exist_threshold = 0.5f) {
-    std::filesystem::create_directories(path.parent_path());
-    std::ofstream out(path);
-    if (!out.is_open()) {
-        return;
-    }
-
-    uint32_t vertex_index = 1;
-    for (uint32_t t = 0; t < tri_count; ++t) {
-        uint32_t base_idx = t * kMeshFeatureDim;
-        float exist = features[base_idx + 9] / kExistScale;
-        if (exist < exist_threshold) {
-            continue;
-        }
-
-        out << "v " << features[base_idx + 0] << " " << features[base_idx + 1] << " " << features[base_idx + 2] << "\n";
-        out << "v " << features[base_idx + 3] << " " << features[base_idx + 4] << " " << features[base_idx + 5] << "\n";
-        out << "v " << features[base_idx + 6] << " " << features[base_idx + 7] << " " << features[base_idx + 8] << "\n";
-        out << "f " << vertex_index << " " << vertex_index + 2 << " " << vertex_index + 1 << "\n";
-        vertex_index += 3;
-    }
-}
-
 void append_obj(const std::filesystem::path& path,
                 const std::vector<float>& features,
                 uint32_t tri_count,
@@ -819,21 +793,6 @@ void main_llm() {
 
     if (sampled_tokens.empty()) {
         sample_autoregressive(model, sample_condition_meshes, sampled_tokens, scratch_targets);
-    }
-
-    std::vector<float> pred_first_mesh;
-    decode_generated_mesh(sampled_tokens, 0, pred_first_mesh);
-    copy_condition_prefix(val[0].first_target_mesh, pred_first_mesh);
-
-    export_obj("output/mesh_target.obj", val[0].first_target_mesh, kTrianglesPerMesh);
-    export_obj("output/mesh_pred.obj", pred_first_mesh, kTrianglesPerMesh);
-
-    for (uint32_t s = 0; s < 3; ++s) {
-        decode_generated_mesh(sampled_tokens, s, pred_first_mesh);
-        copy_condition_prefix(val[s].first_target_mesh, pred_first_mesh);
-        export_obj(std::filesystem::path("output") / ("mesh_pred_seed" + std::to_string(s) + ".obj"),
-                   pred_first_mesh,
-                   kTrianglesPerMesh);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
