@@ -164,17 +164,11 @@ struct Shape {
     uint32_t values[MAX_DIMENSIONS] = {};
     uint32_t size = 0;
 
-    Shape() {
-        size = 0;
-    }
-    Shape(std::initializer_list<uint32_t> shape_values) {
+    Shape() = default;
+    Shape(std::initializer_list<uint32_t> shape_values)
+        : size(uint32_t(shape_values.size())) {
         assert(shape_values.size() <= MAX_DIMENSIONS);
-        this->size = uint32_t(shape_values.size());
-        int i = 0;
-        for (auto it = shape_values.begin(); it != shape_values.end(); ++it) {
-            this->values[i] = *it;
-            ++i;
-        }
+        std::copy(shape_values.begin(), shape_values.end(), values);
     }
 
     uint32_t operator[] (int index) const {
@@ -187,6 +181,11 @@ struct Shape {
     // return the number of dimensions/rank
     uint32_t rank() const {
         return size;
+    }
+
+    friend bool operator==(const Shape& a, const Shape& b) {
+        return a.size == b.size &&
+               std::equal(a.values, a.values + a.size, b.values);
     }
 
     uint32_t number_of_elements(uint32_t index = 0) const {

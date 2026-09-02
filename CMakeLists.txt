@@ -25,28 +25,27 @@ add_library(evk::evk ALIAS evk)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/evk_embed_shaders.cmake")
 
 file(GLOB EVK_AI_SHADERS CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ai/*.comp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ai/*.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/oidn/*.comp")
 
-add_library(evk_ai EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/evk_ai.cpp")
+add_library(evk_ai EXCLUDE_FROM_ALL
+    "${CMAKE_CURRENT_SOURCE_DIR}/evk_ai.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/evk_ai_ir.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/evk_ai_image_compiler.cpp")
 target_include_directories(evk_ai PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(evk_ai PUBLIC cxx_std_20)
 target_link_libraries(evk_ai PUBLIC evk)
 evk_embed_shaders(evk_ai "evk::ai::detail" ${EVK_AI_SHADERS})
 add_library(evk::ai ALIAS evk_ai)
 
-# evk::ai::oidn
-file(GLOB EVK_OIDN_SHADERS CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/oidn/*.comp")
-
 add_library(evk_oidn EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/evk_ai_oidn.cpp")
 target_include_directories(evk_oidn PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(evk_oidn PUBLIC cxx_std_20)
 target_link_libraries(evk_oidn PUBLIC evk_ai)
-evk_embed_shaders(evk_oidn "evk::ai::oidn::detail" ${EVK_OIDN_SHADERS})
 add_library(evk::oidn ALIAS evk_oidn)
 
 if(EVK_BUILD_EXAMPLE)
-  add_executable(evk_example 
+  add_executable(evk_example
       "${CMAKE_CURRENT_SOURCE_DIR}/example/main.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/example/main_llm.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/example/oidn_demo.cpp"

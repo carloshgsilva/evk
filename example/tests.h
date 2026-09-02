@@ -1,5 +1,6 @@
 
 #include <evk_ai.h>
+#include <evk_ai_ir.h>
 
 #define TEST(expr) if((expr)) { printf(" TEST(" #expr ") [PASS]\n"); } else { printf(" TEST(" #expr ") [FAIL] [%s:%d]\n", __FILE__, __LINE__); exit(1); }
 
@@ -1622,7 +1623,86 @@ void test_image_graph_ops() {
     TEST(concat_ok);
 }
 
+void test_ai_fusion_plan() {
+    printf("test_ai_fusion_plan()\n");
+
+    namespace ai = evk::ai;
+    ai::DataStore data;
+    ai::Graph graph;
+    auto constant = [&data, &graph](Shape shape) {
+        ai::DataId id = data.add({
+            .desc = ai::TensorDesc{shape},
+            .values = std::vector<float16_t>(shape.count()),
+        });
+        return graph.constant(id, {shape});
+    };
+
+    ai::ValueId input = graph.input({Shape({1, 32, 16, 16})});
+    ai::ValueId encoder_weight = constant({32, 32, 3, 3});
+    ai::ValueId encoder_bias = constant({32});
+    ai::ValueId encoder = graph.conv2d(
+        input, encoder_weight, encoder_bias,
+        ai::Conv2D{.pad_y = 1, .pad_x = 1});
+    encoder = graph.relu(encoder);
+    ai::ValueId pooled = graph.max_pool2d(encoder);
+
+    ai::ValueId decoder_weight = constant({32, 64, 3, 3});
+    ai::ValueId decoder_bias = constant({32});
+    ai::ValueId upsampled = graph.upsample2d(pooled);
+    ai::ValueId joined = graph.concat(upsampled, input, 1);
+    ai::ValueId decoder = graph.conv2d(
+        joined, decoder_weight, decoder_bias,
+        ai::Conv2D{.pad_y = 1, .pad_x = 1});
+    decoder = graph.relu(decoder);
+    graph.add_output(decoder);
+
+    graph.validate(data);
+    ai::Plan plan = ai::build_fusion_plan(graph);
+    TEST(plan.size() == 2u);
+    TEST(plan[0].kernel == ai::Kernel::Conv2DReluMaxPool2D);
+    TEST(plan[0].nodes.size() == 3u);
+    TEST(plan[1].kernel == ai::Kernel::Upsample2DConcatConv2DRelu);
+    TEST(plan[1].nodes.size() == 4u);
+}
+
+void test_ai_generic_fallback() {
+    printf("test_ai_generic_fallback()\n");
+
+    namespace ai = evk::ai;
+    ai::Graph graph;
+    ai::ValueId first = graph.input({Shape({1, 1, 1, 2})}, "first");
+    ai::ValueId second = graph.input({Shape({1, 1, 1, 2})}, "second");
+    graph.add_output(graph.relu(first, "first.relu"));
+    graph.add_output(graph.relu(second, "second.relu"));
+    ai::DataStore data;
+
+    ai::Executable executable = ai::compile(graph, data);
+    TEST(executable.input_layout(0) == ai::Layout::NCHW);
+    TEST(executable.input_layout(1) == ai::Layout::NCHW);
+    TEST(executable.output_layout(0) == ai::Layout::NCHW);
+    TEST(executable.output_layout(1) == ai::Layout::NCHW);
+    executable.input(0).cpu()[0] = float16_t(-2.0f);
+    executable.input(0).cpu()[1] = float16_t(1.5f);
+    executable.input(1).cpu()[0] = float16_t(-0.5f);
+    executable.input(1).cpu()[1] = float16_t(3.0f);
+    executable.input(0).cpu_upload(false);
+    executable.input(1).cpu_upload(false);
+    executable.eval();
+    executable.output(0).cpu_download();
+    executable.output(1).cpu_download();
+
+    TEST(executable.plan().size() == 2u);
+    TEST(executable.plan()[0].kernel == ai::Kernel::Relu);
+    TEST(executable.plan()[1].kernel == ai::Kernel::Relu);
+    TEST(approx_eq(float(executable.output(0).cpu()[0]), 0.0f));
+    TEST(approx_eq(float(executable.output(0).cpu()[1]), 1.5f));
+    TEST(approx_eq(float(executable.output(1).cpu()[0]), 0.0f));
+    TEST(approx_eq(float(executable.output(1).cpu()[1]), 3.0f));
+}
+
 void run_ai_kernel_tests() {
+    test_ai_fusion_plan();
+    test_ai_generic_fallback();
     test_add();
     test_matmul();
     test_matmul_broadcast();

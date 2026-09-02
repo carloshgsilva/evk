@@ -227,10 +227,55 @@ evk::CmdWait(idx);
 
 EVK enables cooperative matrices automatically when `VK_KHR_cooperative_matrix` and its device feature are available. Query `evk::GetFeatures().coopmat` before using AI kernels that depend on accelerated cooperative-matrix matmul, such as `evk::ai::matmul` and flash attention.
 
+### Semantic AI graphs and automatic fusion
+
+`evk::ai::Graph` describes computation in logical NCHW tensors. It contains no
+Vulkan resources, layouts, dispatches, packed weights, or model-specific
+kernels. `evk::ai::compile()` validates the graph and builds an executable plan
+from the built-in kernel catalog for the current GPU:
+
+```cpp
+#include <evk_ai_ir.h>
+
+evk::ai::DataStore data;
+auto weight = data.add({
+    .desc = {Shape({32, 3, 3, 3})},
+    .values = std::vector<float16_t>(32u * 3u * 3u * 3u),
+});
+auto bias = data.add({
+    .desc = {Shape({32})},
+    .values = std::vector<float16_t>(32u),
+});
+
+evk::ai::Graph graph;
+auto input = graph.input({Shape({1, 3, 1088, 1920})}, "color");
+auto w = graph.constant(weight, {Shape({32, 3, 3, 3})}, "conv.weight");
+auto b = graph.constant(bias, {Shape({32})}, "conv.bias");
+auto output = graph.conv2d(input, w, b, {.pad_y = 1, .pad_x = 1});
+output = graph.relu(output);
+graph.add_output(output);
+
+auto executable = evk::ai::compile(graph, data);
+// The plan may contain one conv2d_relu dispatch rather than two dispatches.
+// Bindings expose the compiler-selected physical layout.
+auto layout = executable.input_layout();
+// Populate executable.input().cpu() according to that layout first.
+executable.input().cpu_upload(false);
+executable.eval();
+```
+
+Fusion is legal only across single-use intermediate values, so skips and graph
+outputs keep their semantic values alive. The first optimized catalog targets
+batch-one FP16 3x3 image convolutions, convolution+ReLU, pooled encoder blocks,
+and upsample+concat decoder blocks on cooperative-matrix GPUs. Other supported
+graphs lower to the ordinary per-operation Vulkan kernels.
+
 ### OIDN denoising
 
 `evk::ai::oidn::Denoiser` runs the official fast or balanced OIDN RT LDR U-Net
-on Vulkan. Both color-only and color+albedo+normal models are supported. Color
+on Vulkan. OIDN contributes only the semantic topology and logical weights;
+the generic `evk::ai` compiler selects fusion, layouts, packed weights, and
+dispatches. Both color-only and color+albedo+normal models are supported. Color
 and albedo use values in `[0, 1]`; normals are signed world-space or view-space
 vectors in `[-1, 1]`. Images are padded to the model's 16-pixel alignment
 internally, so standard dimensions such as 1920x1080 can be passed directly.
