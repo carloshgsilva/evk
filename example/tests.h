@@ -219,6 +219,61 @@ void test_matmul_broadcast() {
     TEST(ok);
 }
 
+void test_matmul_weight_backward_cpu_reference() {
+    printf("test_matmul_weight_backward_cpu_reference()\n");
+    constexpr uint32_t B = 16u;
+    constexpr uint32_t M = 112u;
+    constexpr uint32_t K = 16u;
+    constexpr uint32_t N = 16u;
+    Tensor input({B, M, K});
+    Tensor grad_output({B, M, N});
+    Tensor grad_weight({K, N});
+
+    for (uint32_t i = 0u; i < input.shape.count(); ++i) {
+        input.cpu()[i] = float16_t(0.08f * std::sin(float(i) * 0.13f));
+    }
+    for (uint32_t i = 0u; i < grad_output.shape.count(); ++i) {
+        grad_output.cpu()[i] =
+            float16_t(0.07f * std::cos(float(i) * 0.09f));
+    }
+    input.cpu_upload();
+    grad_output.cpu_upload();
+    grad_weight.fill(0.0f);
+    evk::ai::matmul_weight_backward(input, grad_output, grad_weight);
+    Tensor legacy_partials({B, K, N});
+    Tensor legacy_grad_weight({K, N});
+    legacy_grad_weight.fill(0.0f);
+    evk::ai::matmul(input, grad_output, legacy_partials,
+                    true, false, false, 16, 16);
+    evk::ai::sum_batch(legacy_partials, legacy_grad_weight, B, K * N);
+    grad_weight.cpu_download(false);
+    legacy_grad_weight.cpu_download(false);
+    evk::ai::SubmitCmd(true);
+
+    bool ok = true;
+    bool legacy_exact = true;
+    for (uint32_t k = 0u; k < K; ++k) {
+        for (uint32_t n = 0u; n < N; ++n) {
+            float expected = 0.0f;
+            for (uint32_t batch = 0u; batch < B; ++batch) {
+                float batch_sum = 0.0f;
+                for (uint32_t row = 0u; row < M; ++row) {
+                    batch_sum +=
+                        float(input.cpu()[(batch * M + row) * K + k]) *
+                        float(grad_output.cpu()[(batch * M + row) * N + n]);
+                }
+                expected += float(float16_t(batch_sum));
+            }
+            ok &= approx_eq(float(grad_weight.cpu()[k * N + n]),
+                            expected, 2e-2f);
+            legacy_exact &= grad_weight.cpu()[k * N + n].value ==
+                            legacy_grad_weight.cpu()[k * N + n].value;
+        }
+    }
+    TEST(ok);
+    TEST(legacy_exact);
+}
+
 void test_mse_loss() {
     printf("test_mse_loss()\n");
     // Test 1: Simple 1D tensors
@@ -1316,6 +1371,253 @@ void test_position_add_and_backward() {
     }
 }
 
+void test_gated_delta_forward_backward_and_recurrent() {
+    printf("test_gated_delta_forward_backward_and_recurrent()\n");
+    constexpr uint32_t B = 1u;
+    constexpr uint32_t N = 3u;
+    constexpr uint32_t D = 4u;
+    constexpr uint32_t H = 2u;
+    constexpr uint32_t Dh = D / H;
+    constexpr uint32_t P = 3u * D + 2u * H;
+    constexpr float decay_bias = -4.0f;
+    constexpr float rope_base = 10000.0f;
+
+    std::vector<float> projection_values(B * N * P);
+    std::vector<float> grad_output_values(B * N * D);
+    for (uint32_t i = 0; i < projection_values.size(); ++i) {
+        projection_values[i] = float(float16_t(0.03f * float(int(i % 17u) - 8)));
+    }
+    for (uint32_t i = 0; i < grad_output_values.size(); ++i) {
+        grad_output_values[i] = float(float16_t(0.05f * float(int(i % 7u) - 3)));
+    }
+
+    auto cpu_forward = [&](const std::vector<float>& projection,
+                           std::vector<float>& output_values,
+                           std::vector<float>* history_values) {
+        output_values.assign(B * N * D, 0.0f);
+        if (history_values) history_values->assign(B * N * H * Dh * Dh, 0.0f);
+        for (uint32_t batch = 0; batch < B; ++batch) {
+            for (uint32_t head = 0; head < H; ++head) {
+                float state[Dh * Dh] = {};
+                for (uint32_t position = 0; position < N; ++position) {
+                    uint32_t row = batch * N + position;
+                    uint32_t projection_start = row * P;
+                    uint32_t vector_start = row * D + head * Dh;
+                    float query[Dh] = {};
+                    float key[Dh] = {};
+                    for (uint32_t feature = 0; feature < Dh; feature += 2u) {
+                        uint32_t global_feature = head * Dh + feature;
+                        float angle = float(position) * std::pow(
+                            rope_base,
+                            -2.0f * float(global_feature / 2u) / float(D));
+                        float c = std::cos(angle);
+                        float s = std::sin(angle);
+                        for (uint32_t segment = 0; segment < 2u; ++segment) {
+                            uint32_t offset = projection_start + segment * D + global_feature;
+                            float x = projection[offset];
+                            float y = projection[offset + 1u];
+                            float* rotated = segment == 0u ? query : key;
+                            rotated[feature] = x * c - y * s;
+                            rotated[feature + 1u] = x * s + y * c;
+                        }
+                    }
+                    float q_norm = 1.0e-6f;
+                    float k_norm = 1.0e-6f;
+                    for (uint32_t feature = 0; feature < Dh; ++feature) {
+                        q_norm += query[feature] * query[feature];
+                        k_norm += key[feature] * key[feature];
+                    }
+                    q_norm = std::sqrt(q_norm);
+                    k_norm = std::sqrt(k_norm);
+                    uint32_t gate = projection_start + 3u * D + head;
+                    float decay = 1.0f /
+                        (1.0f + std::exp(projection[gate] + decay_bias));
+                    float write = 1.0f /
+                        (1.0f + std::exp(-projection[gate + H]));
+                    for (float& value : state) value *= decay;
+                    float correction[Dh] = {};
+                    for (uint32_t value_feature = 0; value_feature < Dh; ++value_feature) {
+                        float predicted = 0.0f;
+                        for (uint32_t key_feature = 0; key_feature < Dh; ++key_feature) {
+                            predicted += key[key_feature] / k_norm *
+                                state[key_feature * Dh + value_feature];
+                        }
+                        correction[value_feature] = write *
+                            (projection[projection_start + 2u * D +
+                                        head * Dh + value_feature] - predicted);
+                    }
+                    for (uint32_t key_feature = 0; key_feature < Dh; ++key_feature) {
+                        float normalized_key = key[key_feature] / k_norm;
+                        for (uint32_t value_feature = 0; value_feature < Dh; ++value_feature) {
+                            uint32_t state_index = key_feature * Dh + value_feature;
+                            state[state_index] +=
+                                normalized_key * correction[value_feature];
+                            if (history_values) {
+                                uint32_t history_index =
+                                    ((((row * H + head) * Dh + key_feature) * Dh) +
+                                     value_feature);
+                                (*history_values)[history_index] = state[state_index];
+                            }
+                        }
+                    }
+                    for (uint32_t value_feature = 0; value_feature < Dh; ++value_feature) {
+                        float result = 0.0f;
+                        for (uint32_t key_feature = 0; key_feature < Dh; ++key_feature) {
+                            result += query[key_feature] / q_norm *
+                                state[key_feature * Dh + value_feature];
+                        }
+                        output_values[vector_start + value_feature] = result;
+                    }
+                }
+            }
+        }
+    };
+
+    std::vector<float> expected_output;
+    std::vector<float> expected_history;
+    cpu_forward(projection_values, expected_output, &expected_history);
+    auto cpu_loss = [&] {
+        std::vector<float> out;
+        cpu_forward(projection_values, out, nullptr);
+        float loss = 0.0f;
+        for (uint32_t i = 0; i < out.size(); ++i) {
+            loss += out[i] * grad_output_values[i];
+        }
+        return loss;
+    };
+    std::vector<float> expected_gradient(projection_values.size());
+    for (uint32_t i = 0; i < projection_values.size(); ++i) {
+        constexpr float epsilon = 1.0e-3f;
+        float original = projection_values[i];
+        projection_values[i] = original + epsilon;
+        float high = cpu_loss();
+        projection_values[i] = original - epsilon;
+        float low = cpu_loss();
+        projection_values[i] = original;
+        expected_gradient[i] = (high - low) / (2.0f * epsilon);
+    }
+
+    Tensor projection({B, N, P});
+    Tensor output({B, N, D});
+    Tensor history({B, N, H, Dh, Dh});
+    Tensor grad_output({B, N, D});
+    Tensor grad_projection({B, N, P});
+    upload_tensor_from_f32(projection, projection_values);
+    upload_tensor_from_f32(grad_output, grad_output_values);
+    grad_projection.fill(0.0f);
+    evk::ai::gated_delta_projected(
+        projection, output, history, D, H, rope_base, decay_bias);
+    evk::ai::gated_delta_projected_backward(
+        projection, history, grad_output, grad_projection,
+        D, H, rope_base, decay_bias);
+    output.cpu_download(false);
+    history.cpu_download(false);
+    grad_projection.cpu_download(false);
+    evk::ai::SubmitCmd(true);
+
+    bool forward_ok = true;
+    bool history_ok = true;
+    bool backward_ok = true;
+    for (uint32_t i = 0; i < expected_output.size(); ++i) {
+        forward_ok &= approx_eq(float(output.cpu()[i]), expected_output[i], 3e-2f);
+    }
+    for (uint32_t i = 0; i < expected_history.size(); ++i) {
+        history_ok &= approx_eq(float(history.cpu()[i]), expected_history[i], 3e-2f);
+    }
+    for (uint32_t i = 0; i < expected_gradient.size(); ++i) {
+        backward_ok &= approx_eq(
+            float(grad_projection.cpu()[i]), expected_gradient[i], 5e-2f);
+    }
+    TEST(forward_ok);
+    TEST(history_ok);
+    TEST(backward_ok);
+
+    Tensor step_projection({B, 1u, P});
+    Tensor positions({B, 1u});
+    Tensor step_output({B, 1u, D});
+    Tensor state({B, H, Dh, Dh});
+    state.fill(0.0f);
+    bool recurrent_ok = true;
+    for (uint32_t position = 0; position < N; ++position) {
+        std::copy_n(projection.cpu() + position * P, P, step_projection.cpu());
+        positions.cpu()[0].value = uint16_t(position);
+        step_projection.cpu_upload();
+        positions.cpu_upload();
+        evk::ai::gated_delta_projected_step(
+            step_projection, positions, state, step_output,
+            H, rope_base, decay_bias);
+        step_output.cpu_download();
+        for (uint32_t feature = 0; feature < D; ++feature) {
+            recurrent_ok &= approx_eq(
+                float(step_output.cpu()[feature]),
+                float(output.cpu()[position * D + feature]), 4e-2f);
+        }
+    }
+    TEST(recurrent_ok);
+}
+
+void test_gated_delta_fp16_recurrent_drift() {
+    printf("test_gated_delta_fp16_recurrent_drift()\n");
+
+    constexpr uint32_t B = 1u;
+    constexpr uint32_t N = 160u;
+    constexpr uint32_t D = 8u;
+    constexpr uint32_t H = 1u;
+    constexpr uint32_t Dh = D / H;
+    constexpr uint32_t P = 3u * D + 2u * H;
+    Tensor projection({B, N, P});
+    for (uint32_t position = 0; position < N; ++position) {
+        uint32_t start = position * P;
+        for (uint32_t feature = 0; feature < D; ++feature) {
+            uint32_t index = position * D + feature;
+            projection.cpu()[start + feature] =
+                float16_t(1.2f * std::sin(float(index) * 0.173f));
+            projection.cpu()[start + D + feature] =
+                float16_t(1.2f * std::cos(float(index) * 0.117f));
+            projection.cpu()[start + 2u * D + feature] =
+                float16_t(0.8f * std::sin(float(index) * 0.071f + 0.3f));
+        }
+        projection.cpu()[start + 3u * D] =
+            float16_t(0.3f * std::sin(float(position) * 0.13f));
+        projection.cpu()[start + 3u * D + H] =
+            float16_t(0.4f * std::cos(float(position) * 0.19f));
+    }
+    projection.cpu_upload();
+
+    Tensor full_output({B, N, D});
+    Tensor state_history({B, N, H, Dh, Dh});
+    evk::ai::gated_delta_projected(
+        projection, full_output, state_history, D, H);
+    full_output.cpu_download();
+
+    Tensor step_projection({B, 1u, P});
+    Tensor positions({B, 1u});
+    Tensor step_output({B, 1u, D});
+    Tensor state({B, H, Dh, Dh});
+    state.fill(0.0f);
+    float max_error = 0.0f;
+    double squared_error = 0.0;
+    for (uint32_t position = 0; position < N; ++position) {
+        std::copy_n(projection.cpu() + position * P, P, step_projection.cpu());
+        positions.cpu()[0].value = uint16_t(position);
+        step_projection.cpu_upload();
+        positions.cpu_upload();
+        evk::ai::gated_delta_projected_step(
+            step_projection, positions, state, step_output, H);
+        step_output.cpu_download();
+        for (uint32_t feature = 0; feature < D; ++feature) {
+            float error = std::abs(float(step_output.cpu()[feature]) -
+                                   float(full_output.cpu()[position * D + feature]));
+            max_error = std::max(max_error, error);
+            squared_error += double(error) * double(error);
+        }
+    }
+    float rmse = float(std::sqrt(squared_error / double(N * D)));
+    printf("  gated delta fp16 drift at %u tokens: max=%f rmse=%f\n",
+           N, max_error, rmse);
+    TEST(max_error < 2.0e-2f && rmse < 3.0e-3f);
+}
+
 void test_rope_and_backward() {
     printf("test_rope_and_backward()\n");
 
@@ -1326,6 +1628,7 @@ void test_rope_and_backward() {
 
     Tensor input({B, N, D});
     Tensor output({B, N, D});
+    Tensor recovered({B, N, D});
     Tensor grad_out({B, N, D});
     Tensor grad_input({B, N, D});
 
@@ -1354,6 +1657,12 @@ void test_rope_and_backward() {
             TEST(approx_eq(float(output.cpu()[base_idx + 0u]), x0 * c - x1 * s, 3e-2f));
             TEST(approx_eq(float(output.cpu()[base_idx + 1u]), x0 * s + x1 * c, 3e-2f));
         }
+    }
+
+    evk::ai::rope(output, recovered, B, N, D, base, -1.0f);
+    recovered.cpu_download();
+    for (uint32_t i = 0; i < B * N * D; ++i) {
+        TEST(approx_eq(float(recovered.cpu()[i]), host_input[i], 4e-2f));
     }
 
     float host_grad[B * N * D] = {
@@ -1706,6 +2015,7 @@ void run_ai_kernel_tests() {
     test_add();
     test_matmul();
     test_matmul_broadcast();
+    test_matmul_weight_backward_cpu_reference();
     test_mse_loss();
     test_cross_entropy_loss();
     test_sgd();
@@ -1717,6 +2027,8 @@ void run_ai_kernel_tests() {
     test_scale_zero();
     test_embed_and_backward();
     test_position_add_and_backward();
+    test_gated_delta_forward_backward_and_recurrent();
+    test_gated_delta_fp16_recurrent_drift();
     test_rope_and_backward();
     test_sum_batch();
     test_rms_norm_and_backward();

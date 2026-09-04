@@ -14,6 +14,8 @@ CONSTANT(7) uint TRANSPOSE_B = 0;
 CONSTANT(8) uint STRIDE_A = 0; // elements per batch for A (0 => broadcast)
 CONSTANT(9) uint STRIDE_B = 0; // elements per batch for B (0 => broadcast)
 CONSTANT(10) uint STRIDE_C = 0; // elements per batch for C
+CONSTANT(11) uint FUSE_RESIDUAL = 0;
+CONSTANT(12) uint FUSE_GELU = 0;
 
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_shader_16bit_storage : enable
@@ -28,6 +30,8 @@ PUSH(
     BufferFp16 inputA;
     BufferFp16 inputB;
     BufferFp16 inputC;
+    BufferFp16 residualInput;
+    BufferFp16 geluOutput;
 )
 
 #define TILE_K 16
@@ -114,6 +118,14 @@ void main() {
             uint gj = TILE_N * tileID.x + SUB_TILE * j;
 
             if (ACC_C == 0u) {
+                if (FUSE_RESIDUAL != 0u) {
+                    coopmat<float16_t, gl_ScopeSubgroup, SUB_TILE, SUB_TILE,
+                            gl_MatrixUseAccumulator> residual;
+                    coopMatLoad(residual, residualInput.x,
+                                baseC + coordToOffset(gi, gj, N, false), N,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    result[i][j] = result[i][j] + residual;
+                }
                 if (STRIDE_C != 0u) {
                     coopMatStore(result[i][j], inputC.x, baseC + coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
                 }
@@ -136,6 +148,22 @@ void main() {
                     coopMatStore(result[i][j], inputC.x, coordToOffset(gi, gj, N, false), N, gl_CooperativeMatrixLayoutRowMajor);
                 }
             }
+        }
+    }
+
+    if (FUSE_GELU != 0u) {
+        barrier();
+        uint tileElements = TILE_M * TILE_N;
+        for (uint index = gl_LocalInvocationID.x; index < tileElements; index += 32u) {
+            uint localRow = index / TILE_N;
+            uint localColumn = index % TILE_N;
+            uint globalRow = TILE_M * tileID.y + localRow;
+            uint globalColumn = TILE_N * tileID.x + localColumn;
+            uint outputIndex = baseC + globalRow * N + globalColumn;
+            float x = float(inputC.x[outputIndex]);
+            float x3 = x * x * x;
+            float u = 0.7978845608028654 * (x + 0.044715 * x3);
+            geluOutput.x[outputIndex] = float16_t(0.5 * x * (1.0 + tanh(u)));
         }
     }
 }

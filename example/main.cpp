@@ -7,7 +7,7 @@
 #include "tests.h"
 #include "bench.h"
 
-void main_llm();
+void main_llm(int argc, char** argv);
 void oidn_demo(const char* weights_path);
 void evk_tests();
 
@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
 
     // Run LLM demo if requested
     if (do_llm) {
-        main_llm();
+        main_llm(argc, argv);
     }
 
     if (do_oidn) {

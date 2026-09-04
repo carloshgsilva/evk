@@ -13,6 +13,8 @@ PUSH(
     uint seqLen;
     uint embedDim;
     float rotaryBase;
+    float positionScale;
+    float positionOffset;
 )
 
 COMPUTE(256, 1, 1)
@@ -32,7 +34,7 @@ void main() {
     float g1 = float(gradOutBuffer.x[baseIdx + 1u]);
 
     float invFreq = pow(rotaryBase, -2.0f * float(pair) / float(embedDim));
-    float angle = float(t) * invFreq;
+    float angle = (positionOffset + positionScale * float(t)) * invFreq;
     float c = cos(angle);
     float s = sin(angle);
 

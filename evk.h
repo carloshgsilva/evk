@@ -401,6 +401,7 @@ namespace evk {
         // Memory barriers
         void barrier(Image& image, ImageLayout oldLayout, ImageLayout newLayout, uint32_t mip = 0, uint32_t mipCount = 1, uint32_t layer = 0, uint32_t layerCount = 1);
         void barrier();
+        void computeBarrier();
 
         // Buffer commands
         void fill(Buffer dst, uint32_t data, uint64_t size, uint64_t offset = 0);

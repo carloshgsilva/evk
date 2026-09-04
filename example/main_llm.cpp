@@ -8,15 +8,15 @@
 #include <cmath>
 #include <algorithm>
 #include <cassert>
+#include <memory>
+#include <string>
 
 #include <evk_ai.h>
 
 namespace {
-constexpr uint32_t kCubeTriangleCount = 12;
-constexpr uint32_t kTetrahedronTriangleCount = 12;
-constexpr uint32_t kTrianglesPerMesh = kCubeTriangleCount;
+constexpr uint32_t kTrianglesPerMesh = 12;
 constexpr uint32_t kCoordsPerTriangle = 9;
-constexpr uint32_t kMeshFeatureDim = 10; // 9 coords + exist
+constexpr uint32_t kMeshFeatureDim = kCoordsPerTriangle;
 
 constexpr uint16_t kPadToken = 0; // also ignore token for CE
 constexpr uint16_t kBosToken = 1;
@@ -28,13 +28,12 @@ constexpr uint32_t kConditionCoordTokens = kConditionTriangles * kCoordsPerTrian
 
 constexpr uint32_t kCoordTokenCount = kTrianglesPerMesh * kCoordsPerTriangle; // 108
 constexpr uint32_t kSeqActiveLen = 1 + kCoordTokenCount + 1; // BOS + coords + EOS = 110
-constexpr uint32_t kSeqLen = 160; // tile-aligned (matmul requires multiples of 16)
+constexpr uint32_t kSeqLen = 112; // Smallest tile-aligned length covering 110 active tokens.
 constexpr uint32_t kVocabSize = 144; // tile-aligned, uses ids [0..130]
 
 // Covers the full transformed cube support: +/-0.45 translation plus sqrt(3)/2 rotation extent.
 constexpr float kCoordMin = -1.32f;
 constexpr float kCoordMax = 1.32f;
-constexpr float kExistScale = 1.0f;
 constexpr float kPi = 3.14159265358979323846f;
 
 struct Vec3 {
@@ -46,6 +45,9 @@ struct Vec3 {
 struct Mat3 {
     float m[9];
 };
+
+using Triangle = std::array<float, kCoordsPerTriangle>;
+using Mesh = std::vector<Triangle>;
 
 Vec3 add(const Vec3& a, const Vec3& b) {
     return {a.x + b.x, a.y + b.y, a.z + b.z};
@@ -102,7 +104,7 @@ Mat3 random_rotation(std::mt19937& rng) {
     return rotation_from_euler(ax, ay, az);
 }
 
-std::vector<std::array<float, 9>> make_cube_triangles() {
+Mesh make_cube_triangles() {
     Vec3 v0{-0.5f, -0.5f, -0.5f};
     Vec3 v1{ 0.5f, -0.5f, -0.5f};
     Vec3 v2{ 0.5f,  0.5f, -0.5f};
@@ -113,7 +115,7 @@ std::vector<std::array<float, 9>> make_cube_triangles() {
     Vec3 v7{-0.5f,  0.5f,  0.5f};
 
     auto tri = [](const Vec3& a, const Vec3& b, const Vec3& c) {
-        return std::array<float, 9>{a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z};
+        return Triangle{a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z};
     };
 
     return {
@@ -138,7 +140,7 @@ std::vector<std::array<float, 9>> make_cube_triangles() {
     };
 }
 
-std::vector<std::array<float, 9>> make_tetrahedron_triangles() {
+Mesh make_tetrahedron_triangles() {
     constexpr float s = 0.5f;
     Vec3 v0{ s,  s,  s};
     Vec3 v1{-s, -s,  s};
@@ -146,22 +148,22 @@ std::vector<std::array<float, 9>> make_tetrahedron_triangles() {
     Vec3 v3{ s, -s, -s};
 
     auto tri = [](const Vec3& a, const Vec3& b, const Vec3& c) {
-        return std::array<float, 9>{a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z};
+        return Triangle{a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z};
     };
 
     auto subdivide_face = [&](const Vec3& a, const Vec3& b, const Vec3& c) {
         Vec3 center = triangle_centroid(a, b, c);
-        return std::array<std::array<float, 9>, 3>{
+        return std::array<Triangle, 3>{
             tri(a, b, center),
             tri(b, c, center),
             tri(c, a, center),
         };
     };
 
-    std::vector<std::array<float, 9>> tris;
-    tris.reserve(kTetrahedronTriangleCount);
+    Mesh tris;
+    tris.reserve(kTrianglesPerMesh);
 
-    auto append_face = [&](const std::array<std::array<float, 9>, 3>& face_tris) {
+    auto append_face = [&](const std::array<Triangle, 3>& face_tris) {
         tris.insert(tris.end(), face_tris.begin(), face_tris.end());
     };
 
@@ -174,28 +176,22 @@ std::vector<std::array<float, 9>> make_tetrahedron_triangles() {
     return tris;
 }
 
-void apply_transform(std::array<float, 9>& tri, const Mat3& r, float s, const Vec3& t) {
+void apply_transform(Triangle& tri, const Mat3& r, const Vec3& t) {
     for (int i = 0; i < 3; ++i) {
         Vec3 v{tri[i * 3 + 0], tri[i * 3 + 1], tri[i * 3 + 2]};
-        v = mul(r, v);
-        v = scale(v, s);
-        v = add(v, t);
+        v = add(mul(r, v), t);
         tri[i * 3 + 0] = v.x;
         tri[i * 3 + 1] = v.y;
         tri[i * 3 + 2] = v.z;
     }
 }
 
-struct MeshBatch {
-    std::vector<float> target; // [B, T, 10], 9 coords + exist
-};
-
-void generate_batch(const std::vector<std::vector<std::array<float, 9>>>& base_shapes,
+void generate_batch(const std::vector<Mesh>& base_shapes,
                     uint32_t batch_size,
                     std::mt19937& rng,
-                    MeshBatch& batch) {
+                    std::vector<float>& target) {
     assert(!base_shapes.empty());
-    batch.target.assign(batch_size * kTrianglesPerMesh * kMeshFeatureDim, 0.0f);
+    target.assign(batch_size * kTrianglesPerMesh * kMeshFeatureDim, 0.0f);
     std::uniform_int_distribution<size_t> shape_dist(0, base_shapes.size() - 1);
 
     for (uint32_t b = 0; b < batch_size; ++b) {
@@ -209,17 +205,16 @@ void generate_batch(const std::vector<std::vector<std::array<float, 9>>>& base_s
         };
 
         for (auto& tri : tris) {
-            apply_transform(tri, rot, 1.0f, translate);
+            apply_transform(tri, rot, translate);
         }
 
         for (uint32_t t = 0; t < kTrianglesPerMesh; ++t) {
             const auto& tri = tris[t];
             uint32_t base_idx = (b * kTrianglesPerMesh + t) * kMeshFeatureDim;
 
-            for (uint32_t i = 0; i < 9; ++i) {
-                batch.target[base_idx + i] = tri[i];
+            for (uint32_t i = 0; i < kCoordsPerTriangle; ++i) {
+                target[base_idx + i] = tri[i];
             }
-            batch.target[base_idx + 9] = kExistScale;
         }
     }
 }
@@ -298,17 +293,9 @@ void queue_tensor_download(Tensor& t) {
     cmd.copy(t.buffer, t.cpu_buffer, t.shape.count() * sizeof(float16_t));
 }
 
-float read_scalar_tensor_from_cpu_buffer(Tensor& t) {
-    assert(t.shape.count() == 1);
-    return float(t.cpu()[0]);
-}
-
-struct ParamSnapshot {
-    std::vector<std::vector<float16_t>> values;
-};
+using ParamSnapshot = std::vector<std::vector<float16_t>>;
 
 struct ValSeed {
-    MeshBatch batch;
     std::vector<uint16_t> input_tokens;
     std::vector<uint16_t> target_tokens;
     std::vector<float> first_target_mesh;
@@ -320,8 +307,7 @@ struct EvalMetrics {
 };
 
 ParamSnapshot capture_params(Graph& graph) {
-    ParamSnapshot snapshot;
-    snapshot.values.resize(graph.params.size());
+    ParamSnapshot snapshot(graph.params.size());
 
     for (Tensor* param : graph.params) {
         param->cpu_download(false);
@@ -331,18 +317,18 @@ ParamSnapshot capture_params(Graph& graph) {
     for (size_t i = 0; i < graph.params.size(); ++i) {
         Tensor& param = *graph.params[i];
         float16_t* src = param.cpu();
-        snapshot.values[i].assign(src, src + param.shape.count());
+        snapshot[i].assign(src, src + param.shape.count());
     }
 
     return snapshot;
 }
 
 void restore_params(Graph& graph, const ParamSnapshot& snapshot) {
-    assert(snapshot.values.size() == graph.params.size());
+    assert(snapshot.size() == graph.params.size());
 
     for (size_t i = 0; i < graph.params.size(); ++i) {
         Tensor& param = *graph.params[i];
-        const auto& src = snapshot.values[i];
+        const auto& src = snapshot[i];
         assert(src.size() == param.shape.count());
 
         float16_t* dst = param.cpu();
@@ -386,9 +372,6 @@ void decode_generated_mesh(const std::vector<uint16_t>& generated_inputs,
         mesh_features_out[dst] = dequantize_coord_from_token(in[1 + i]);
     }
 
-    for (uint32_t tri = 0; tri < kTrianglesPerMesh; ++tri) {
-        mesh_features_out[tri * kMeshFeatureDim + 9] = kExistScale;
-    }
 }
 
 void copy_condition_prefix(const std::vector<float>& condition_mesh,
@@ -396,12 +379,9 @@ void copy_condition_prefix(const std::vector<float>& condition_mesh,
     assert(condition_mesh.size() >= kTrianglesPerMesh * kMeshFeatureDim);
     assert(mesh_features_io.size() >= kTrianglesPerMesh * kMeshFeatureDim);
 
-    for (uint32_t tri = 0; tri < kConditionTriangles; ++tri) {
-        uint32_t base_idx = tri * kMeshFeatureDim;
-        for (uint32_t i = 0; i < kMeshFeatureDim; ++i) {
-            mesh_features_io[base_idx + i] = condition_mesh[base_idx + i];
-        }
-    }
+    std::copy_n(condition_mesh.begin(),
+                kConditionTriangles * kMeshFeatureDim,
+                mesh_features_io.begin());
 }
 
 float completion_mse(const std::vector<float>& pred_mesh,
@@ -410,43 +390,26 @@ float completion_mse(const std::vector<float>& pred_mesh,
     assert(target_mesh.size() >= kTrianglesPerMesh * kMeshFeatureDim);
 
     double sum_sq = 0.0;
-    uint32_t count = 0;
-
     for (uint32_t tri = kConditionTriangles; tri < kTrianglesPerMesh; ++tri) {
         uint32_t base_idx = tri * kMeshFeatureDim;
         for (uint32_t coord = 0; coord < kCoordsPerTriangle; ++coord) {
             double diff = double(pred_mesh[base_idx + coord] - target_mesh[base_idx + coord]);
             sum_sq += diff * diff;
-            count++;
         }
     }
 
-    if (count == 0) {
-        return 0.0f;
-    }
-    return float(sum_sq / double(count));
+    constexpr uint32_t completion_coordinate_count =
+        (kTrianglesPerMesh - kConditionTriangles) * kCoordsPerTriangle;
+    return float(sum_sq / double(completion_coordinate_count));
 }
 
-void append_obj(const std::filesystem::path& path,
+void append_obj(std::ostream& out,
                 const std::vector<float>& features,
-                uint32_t tri_count,
                 uint32_t& vertex_index,
-                float x_offset = 0.0f,
-                float y_offset = 0.0f,
-                float exist_threshold = 0.5f) {
-    std::filesystem::create_directories(path.parent_path());
-    std::ofstream out(path, std::ios::app);
-    if (!out.is_open()) {
-        return;
-    }
-
-    for (uint32_t t = 0; t < tri_count; ++t) {
+                float x_offset,
+                float y_offset) {
+    for (uint32_t t = 0; t < kTrianglesPerMesh; ++t) {
         uint32_t base_idx = t * kMeshFeatureDim;
-        float exist = features[base_idx + 9] / kExistScale;
-        if (exist < exist_threshold) {
-            continue;
-        }
-
         float x0 = features[base_idx + 0] + x_offset;
         float y0 = features[base_idx + 1] + y_offset;
         float z0 = features[base_idx + 2];
@@ -465,35 +428,77 @@ void append_obj(const std::filesystem::path& path,
     }
 }
 
-struct CausalAttentionBlock {
+enum class AttentionMode {
+    Softmax,
+    GatedDelta,
+};
+
+struct GatedDeltaStepModel;
+
+struct SequenceBlock {
+    Tensor* w_projection = nullptr;
     Tensor* w_q = nullptr;
     Tensor* w_k = nullptr;
     Tensor* w_v = nullptr;
     Tensor* w_o = nullptr;
     Tensor* w1 = nullptr;
     Tensor* w2 = nullptr;
-
     uint32_t model_dim = 0;
     uint32_t hidden_dim = 0;
+    uint32_t head_count = 1;
     float rope_base = 10000.0f;
+    AttentionMode attention_mode = AttentionMode::Softmax;
 
-    void init(Graph& graph, uint32_t model_dim_, uint32_t hidden_dim_, float rope_base_) {
+    void init(Graph& graph,
+              uint32_t model_dim_,
+              uint32_t hidden_dim_,
+              float rope_base_,
+              AttentionMode attention_mode_,
+              uint32_t head_count_) {
         model_dim = model_dim_;
         hidden_dim = hidden_dim_;
         rope_base = rope_base_;
+        attention_mode = attention_mode_;
+        head_count = head_count_;
 
-        w_q = &graph.tensor({model_dim, model_dim}, true);
-        w_k = &graph.tensor({model_dim, model_dim}, true);
-        w_v = &graph.tensor({model_dim, model_dim}, true);
+        if (attention_mode == AttentionMode::GatedDelta) {
+            w_projection = &graph.tensor(
+                {model_dim, 3u * model_dim + 2u * head_count}, true);
+        } else {
+            w_q = &graph.tensor({model_dim, model_dim}, true);
+            w_k = &graph.tensor({model_dim, model_dim}, true);
+            w_v = &graph.tensor({model_dim, model_dim}, true);
+        }
         w_o = &graph.tensor({model_dim, model_dim}, true);
         w1 = &graph.tensor({model_dim, hidden_dim}, true);
         w2 = &graph.tensor({hidden_dim, model_dim}, true);
     }
 
     void init_weights(float weight_stddev, float residual_proj_stddev) {
-        w_q->random_init(weight_stddev);
-        w_k->random_init(weight_stddev);
-        w_v->random_init(weight_stddev);
+        if (w_projection) {
+            float16_t* data = w_projection->cpu();
+            uint32_t stride = w_projection->shape[1];
+            std::fill(data, data + w_projection->shape.count(), float16_t(0.0f));
+            for (uint32_t segment = 0u; segment < 3u; ++segment) {
+                for (uint32_t i = 0u; i < model_dim * model_dim; ++i) {
+                    // Preserve Tensor::random_init's exact sampling sequence so
+                    // packing Q/K/V does not change a seeded training run.
+                    float u1 = float(rand() + 1) / float(RAND_MAX + 1);
+                    float u2 = float(rand()) / float(RAND_MAX);
+                    float z = sqrtf(-2.0f * logf(u1)) *
+                              cosf(2.0f * 3.14159265f * u2);
+                    uint32_t row = i / model_dim;
+                    uint32_t column = i % model_dim;
+                    data[row * stride + segment * model_dim + column] =
+                        float16_t(z * weight_stddev);
+                }
+            }
+            w_projection->cpu_upload();
+        } else {
+            w_q->random_init(weight_stddev);
+            w_k->random_init(weight_stddev);
+            w_v->random_init(weight_stddev);
+        }
         w_o->random_init(residual_proj_stddev);
         w1->random_init(weight_stddev);
         w2->random_init(residual_proj_stddev);
@@ -501,33 +506,39 @@ struct CausalAttentionBlock {
 
     Tensor& forward(Graph& graph, Tensor& input) {
         Tensor& norm_in = graph.rms_norm(input);
-        Tensor& q = graph.matmul(norm_in, *w_q);
-        Tensor& k = graph.matmul(norm_in, *w_k);
-        Tensor& v = graph.matmul(norm_in, *w_v);
-        Tensor& q_rope = graph.rope(q, rope_base);
-        Tensor& k_rope = graph.rope(k, rope_base);
-
-        Tensor& attn = graph.causal_attention(q_rope, k_rope, v);
-        Tensor& attn_proj = graph.matmul(attn, *w_o);
-        Tensor& res1 = graph.residual(input, attn_proj);
+        Tensor* attn = nullptr;
+        if (attention_mode == AttentionMode::GatedDelta) {
+            Tensor& projection = graph.matmul(norm_in, *w_projection);
+            Tensor& delta = graph.gated_delta_projected(
+                projection, model_dim, head_count, rope_base, -4.0f, 16u);
+            attn = &graph.rms_norm(delta);
+        } else {
+            Tensor& q = graph.matmul(norm_in, *w_q);
+            Tensor& k = graph.matmul(norm_in, *w_k);
+            Tensor& v = graph.matmul(norm_in, *w_v);
+            Tensor& q_rope = graph.rope(q, rope_base);
+            Tensor& k_rope = graph.rope(k, rope_base);
+            attn = &graph.causal_attention(q_rope, k_rope, v);
+        }
+        Tensor& res1 = graph.matmul_residual(*attn, *w_o, input);
 
         Tensor& norm_ffn = graph.rms_norm(res1);
-        Tensor& hidden = graph.matmul(norm_ffn, *w1);
-        Tensor& hidden_relu = graph.gelu(hidden);
-        Tensor& hidden_proj = graph.matmul(hidden_relu, *w2);
-        Tensor& out = graph.residual(res1, hidden_proj);
+        Tensor& hidden = graph.matmul_gelu(norm_ffn, *w1);
+        Tensor& out = graph.matmul_residual(hidden, *w2, res1);
         return out;
     }
 };
 
-struct MeshTokenModel {
+struct TokenModel {
     uint32_t batch_size;
     uint32_t seq_len;
     uint32_t vocab_size;
     uint32_t model_dim;
     uint32_t hidden_dim;
     uint32_t num_layers;
+    uint32_t head_count;
     float rope_base;
+    AttentionMode attention_mode;
 
     Graph graph;
 
@@ -540,24 +551,31 @@ struct MeshTokenModel {
     Tensor* logits = nullptr;        // [B, S, V]
     Tensor* loss = nullptr;          // scalar
 
-    std::vector<CausalAttentionBlock> blocks;
+    std::vector<SequenceBlock> blocks;
+    std::unique_ptr<GatedDeltaStepModel> gated_delta_decoder;
 
-    MeshTokenModel(uint32_t batch_size_,
+    TokenModel(uint32_t batch_size_,
                    uint32_t seq_len_,
                    uint32_t vocab_size_,
                    uint32_t model_dim_,
                    uint32_t hidden_dim_,
                    uint32_t num_layers_,
-                   float rope_base_)
+                   float rope_base_,
+                   AttentionMode attention_mode_,
+                   uint32_t head_count_)
         : batch_size(batch_size_),
           seq_len(seq_len_),
           vocab_size(vocab_size_),
           model_dim(model_dim_),
           hidden_dim(hidden_dim_),
           num_layers(num_layers_),
-          rope_base(rope_base_) {
+          head_count(head_count_),
+          rope_base(rope_base_),
+          attention_mode(attention_mode_) {
         build_graph();
     }
+
+    ~TokenModel();
 
     void build_graph() {
         input_tokens = &graph.tensor({batch_size, seq_len});
@@ -568,7 +586,12 @@ struct MeshTokenModel {
         blocks.resize(num_layers);
         Tensor* x = &x_emb;
         for (uint32_t i = 0; i < num_layers; ++i) {
-            blocks[i].init(graph, model_dim, hidden_dim, rope_base);
+            blocks[i].init(graph,
+                           model_dim,
+                           hidden_dim,
+                           rope_base,
+                           attention_mode,
+                           head_count);
             x = &blocks[i].forward(graph, *x);
         }
 
@@ -593,10 +616,135 @@ struct MeshTokenModel {
     }
 };
 
-void sample_autoregressive(MeshTokenModel& model,
+struct GatedDeltaStepModel {
+    static constexpr uint32_t kTileRows = 16u;
+
+    Graph graph;
+    Tensor* input_tokens = nullptr;
+    Tensor* input_positions = nullptr;
+    Tensor* logits = nullptr;
+    Tensor* sampled_token_ids = nullptr;
+    std::vector<Tensor*> states;
+
+    explicit GatedDeltaStepModel(TokenModel& source) {
+        assert(source.attention_mode == AttentionMode::GatedDelta);
+        assert(source.batch_size <= kTileRows);
+        input_tokens = &graph.tensor({1u, kTileRows});
+        input_positions = &graph.tensor({1u, kTileRows});
+        Tensor* x = &graph.embed(*source.token_emb, *input_tokens);
+        uint32_t head_dim = source.model_dim / source.head_count;
+        states.reserve(source.num_layers);
+        for (uint32_t i = 0; i < source.num_layers; ++i) {
+            SequenceBlock& block = source.blocks[i];
+            Tensor& state = graph.tensor(
+                {source.batch_size, source.head_count, head_dim, head_dim});
+            states.push_back(&state);
+            Tensor& projection = graph.matmul(
+                graph.rms_norm(*x), *block.w_projection);
+            Tensor& mixed = graph.gated_delta_projected_step(
+                projection, *input_positions, state,
+                source.model_dim, source.head_count);
+            Tensor& residual = graph.matmul_residual(
+                graph.rms_norm(mixed), *block.w_o, *x);
+            Tensor& hidden = graph.matmul_gelu(
+                graph.rms_norm(residual), *block.w1);
+            x = &graph.matmul_residual(hidden, *block.w2, residual);
+        }
+        logits = &graph.matmul(
+            graph.rms_norm(*x), *source.w_out, 16, 16);
+        sampled_token_ids = &graph.tensor({source.batch_size});
+    }
+
+    void reset_state() {
+        for (Tensor* state : states) {
+            evk::ai::zero(*state, false);
+        }
+        evk::ai::GetCmd().computeBarrier();
+    }
+};
+
+TokenModel::~TokenModel() = default;
+
+void sample_gated_delta_autoregressive(
+    TokenModel& model,
+    const std::vector<float>& condition_meshes,
+    std::vector<uint16_t>& generated_inputs) {
+    const uint32_t batch_size = model.batch_size;
+    seed_condition_prefix_tokens(condition_meshes, batch_size, generated_inputs);
+
+    if (!model.gated_delta_decoder) {
+        model.gated_delta_decoder = std::make_unique<GatedDeltaStepModel>(model);
+    }
+    GatedDeltaStepModel& step_model = *model.gated_delta_decoder;
+    step_model.reset_state();
+    Tensor prefix_tokens({kConditionCoordTokens + 1u,
+                          GatedDeltaStepModel::kTileRows});
+    Tensor position_rows({kCoordTokenCount, GatedDeltaStepModel::kTileRows});
+    Tensor generated_rows({kSeqLen, GatedDeltaStepModel::kTileRows});
+    for (uint32_t position = 0u; position <= kConditionCoordTokens; ++position) {
+        for (uint32_t batch = 0u; batch < batch_size; ++batch) {
+            prefix_tokens.cpu()[position * GatedDeltaStepModel::kTileRows + batch].value =
+                generated_inputs[batch * kSeqLen + position];
+        }
+    }
+    for (uint32_t position = 0u; position < kCoordTokenCount; ++position) {
+        for (uint32_t batch = 0u; batch < batch_size; ++batch) {
+            position_rows.cpu()[position * GatedDeltaStepModel::kTileRows + batch].value =
+                uint16_t(position);
+        }
+    }
+    prefix_tokens.cpu_upload(false);
+    position_rows.cpu_upload(false);
+
+    constexpr uint64_t row_bytes =
+        GatedDeltaStepModel::kTileRows * sizeof(float16_t);
+    for (uint32_t position = 0u; position < kCoordTokenCount; ++position) {
+        evk::ai::GetCmd().copy(position_rows.buffer,
+                               step_model.input_positions->buffer,
+                               row_bytes,
+                               uint64_t(position) * row_bytes);
+        if (position <= kConditionCoordTokens) {
+            evk::ai::GetCmd().copy(prefix_tokens.buffer,
+                                   step_model.input_tokens->buffer,
+                                   row_bytes,
+                                   uint64_t(position) * row_bytes);
+        }
+        step_model.graph.eval(false, false, false);
+
+        if (position >= kConditionCoordTokens) {
+            evk::ai::greedy_sample_rows(*step_model.logits,
+                                        *step_model.sampled_token_ids,
+                                        kCoordTokenBase,
+                                        uint16_t(kCoordBins));
+            evk::ai::GetCmd().copy(step_model.sampled_token_ids->buffer,
+                                   generated_rows.buffer,
+                                   batch_size * sizeof(float16_t),
+                                   0u,
+                                   uint64_t(position + 1u) * row_bytes);
+            evk::ai::GetCmd().copy(step_model.sampled_token_ids->buffer,
+                                   step_model.input_tokens->buffer,
+                                   batch_size * sizeof(float16_t));
+        }
+    }
+    generated_rows.cpu_download();
+    for (uint32_t position = kConditionCoordTokens + 1u;
+         position <= kCoordTokenCount; ++position) {
+        for (uint32_t batch = 0u; batch < batch_size; ++batch) {
+            generated_inputs[batch * kSeqLen + position] =
+                generated_rows.cpu()[position * GatedDeltaStepModel::kTileRows + batch].value;
+        }
+    }
+}
+
+void sample_autoregressive(TokenModel& model,
                            const std::vector<float>& condition_meshes,
                            std::vector<uint16_t>& generated_inputs,
                            std::vector<uint16_t>& scratch_targets) {
+    if (model.attention_mode == AttentionMode::GatedDelta) {
+        sample_gated_delta_autoregressive(model, condition_meshes, generated_inputs);
+        return;
+    }
+
     const uint32_t batch_size = model.batch_size;
     scratch_targets.assign(batch_size * kSeqLen, kPadToken);
 
@@ -621,13 +769,9 @@ void sample_autoregressive(MeshTokenModel& model,
             generated_inputs[b * kSeqLen + (pos + 1)] = sampled_ptr[b].value;
         }
     }
-
-    for (uint32_t b = 0; b < batch_size; ++b) {
-        generated_inputs[b * kSeqLen + (kSeqActiveLen - 1)] = kEosToken;
-    }
 }
 
-EvalMetrics evaluate_model(MeshTokenModel& model,
+EvalMetrics evaluate_model(TokenModel& model,
                            const std::vector<ValSeed>& val,
                            const std::vector<float>& sample_condition_meshes,
                            std::vector<uint16_t>& sampled_tokens,
@@ -640,7 +784,7 @@ EvalMetrics evaluate_model(MeshTokenModel& model,
         model.graph.eval(false, false, false);
         queue_tensor_download(*model.loss);
         evk::ai::SubmitCmd(true);
-        metrics.val_ce += read_scalar_tensor_from_cpu_buffer(*model.loss);
+        metrics.val_ce += float(model.loss->cpu()[0]);
     }
     metrics.val_ce /= float(val.size());
 
@@ -650,7 +794,6 @@ EvalMetrics evaluate_model(MeshTokenModel& model,
     metrics.val_completion_mse = 0.0f;
     for (size_t s = 0; s < val.size(); ++s) {
         decode_generated_mesh(sampled_tokens, uint32_t(s), pred_mesh);
-        copy_condition_prefix(val[s].first_target_mesh, pred_mesh);
         metrics.val_completion_mse += completion_mse(pred_mesh, val[s].first_target_mesh);
     }
     metrics.val_completion_mse /= float(val.size());
@@ -658,144 +801,368 @@ EvalMetrics evaluate_model(MeshTokenModel& model,
     return metrics;
 }
 
-} // namespace
+struct ExperimentResult {
+    std::string name;
+    uint64_t parameters = 0;
+    uint32_t best_step = 0;
+    EvalMetrics best;
+    double train_seconds = 0.0;
+    double train_update_seconds = 0.0;
+    double validation_seconds = 0.0;
+    uint32_t validation_runs = 0;
+    double decode_ms = 0.0;
+    uint64_t inference_state_bytes = 0;
+    bool inference_state_grows_with_sequence = false;
+};
 
-void main_llm() {
-    printf("=== main_llm: causal autoregressive mesh completion (cube+tetrahedron, 2-triangle prefix, CE, BOS/EOS, 128 bins) ===\n");
+uint64_t parameter_count(const Graph& graph) {
+    uint64_t count = 0;
+    for (const Tensor* parameter : graph.params) {
+        count += parameter->shape.count();
+    }
+    return count;
+}
 
-    auto start = std::chrono::high_resolution_clock::now();
+ExperimentResult train_experiment(
+    TokenModel& model,
+    const char* name,
+    uint32_t train_steps,
+    uint32_t log_interval,
+    float learning_rate,
+    const std::vector<Mesh>& base_shapes,
+    const std::vector<ValSeed>& val,
+    const std::vector<float>& sample_condition_meshes) {
+    ExperimentResult result;
+    result.name = name;
+    result.parameters = parameter_count(model.graph);
+    printf("\n[%s] parameters %llu\n",
+           name,
+           static_cast<unsigned long long>(result.parameters));
 
-    constexpr uint32_t kBatchSize = 16;
-    constexpr uint32_t kModelDim = 256;
-    constexpr uint32_t kHiddenDim = 512;
-    constexpr uint32_t kLayers = 8;
-    constexpr uint32_t kTrainSteps = 10000;
-    constexpr uint32_t kLogInterval = 500;
-    constexpr float kLearningRate = 1.0e-4f;
-    constexpr float kRopeBase = 10000.0f;
-    constexpr uint32_t kValSeeds = 5;
-
-    MeshTokenModel model(kBatchSize, kSeqLen, kVocabSize, kModelDim, kHiddenDim, kLayers, kRopeBase);
-    model.init_weights(42);
+    std::filesystem::path evolution_path =
+        std::filesystem::path("output") / (std::string(name) + "_mesh_val_evolution.obj");
+    std::filesystem::path curve_path =
+        std::filesystem::path("output") / (std::string(name) + "_training_curve.csv");
+    std::ofstream evolution_obj(evolution_path);
+    std::ofstream curve_csv(curve_path);
+    curve_csv.precision(9);
+    curve_csv << "step,train_ce,val_ce,completion_mse,"
+                 "cumulative_update_ms,cumulative_validation_ms\n";
+    uint32_t evolution_vertex_index = 1;
+    uint32_t evolution_snapshot_count = 0;
+    constexpr float mesh_spacing = 2.0f;
+    constexpr float row_spacing = mesh_spacing * 2.0f;
+    for (uint32_t seed = 0; seed < val.size(); ++seed) {
+        append_obj(evolution_obj,
+                   val[seed].first_target_mesh,
+                   evolution_vertex_index,
+                   0.0f,
+                   -float(seed) * row_spacing);
+    }
+    evolution_obj.flush();
 
     std::mt19937 train_rng(1337);
-    std::vector<std::vector<std::array<float, 9>>> base_shapes;
-    base_shapes.push_back(make_cube_triangles());
-    base_shapes.push_back(make_tetrahedron_triangles());
-    std::vector<ValSeed> val(kValSeeds);
-
-    for (uint32_t s = 0; s < kValSeeds; ++s) {
-        std::mt19937 rng_val(9001 + s);
-        generate_batch(base_shapes, kBatchSize, rng_val, val[s].batch);
-        build_token_batch(val[s].batch.target, kBatchSize, val[s].input_tokens, val[s].target_tokens);
-        val[s].first_target_mesh.assign(
-            val[s].batch.target.begin(),
-            val[s].batch.target.begin() + (kTrianglesPerMesh * kMeshFeatureDim));
-    }
-
-    std::filesystem::path evo_path("output/mesh_val_evolution.obj");
-    uint32_t evo_vertex_index = 1;
-    uint32_t evo_snapshot_count = 0;
-    const float mesh_spacing = 2.0f;
-    const float row_spacing = mesh_spacing * 2.0f;
-
-    if (std::filesystem::exists(evo_path)) {
-        std::filesystem::remove(evo_path);
-    }
-    for (uint32_t s = 0; s < kValSeeds; ++s) {
-        float y_offset = -float(s) * row_spacing;
-        append_obj(evo_path,
-                   val[s].first_target_mesh,
-                   kTrianglesPerMesh,
-                   evo_vertex_index,
-                   0.0f,
-                   y_offset,
-                   -1.0e9f);
-    }
-
     std::vector<uint16_t> train_input_tokens;
     std::vector<uint16_t> train_target_tokens;
     std::vector<uint16_t> sampled_tokens;
     std::vector<uint16_t> scratch_targets;
-    std::vector<float> sample_condition_meshes(kBatchSize * kTrianglesPerMesh * kMeshFeatureDim, 0.0f);
+    std::vector<float> train_meshes;
     ParamSnapshot best_params;
-    bool has_best_params = false;
-    float best_val_completion_loss = INFINITY;
-    uint32_t best_step = 0;
-    float best_val_loss = INFINITY;
+    auto train_start = std::chrono::high_resolution_clock::now();
 
-    for (uint32_t b = 0; b < kBatchSize; ++b) {
-        const auto& src = val[b % kValSeeds].first_target_mesh;
-        float* dst = sample_condition_meshes.data() + b * kTrianglesPerMesh * kMeshFeatureDim;
-        std::copy(src.begin(), src.end(), dst);
-    }
-
-    for (uint32_t step = 1; step <= kTrainSteps; ++step) {
-        bool should_log = (step == 1 || step % kLogInterval == 0 || step == kTrainSteps);
-
-        MeshBatch batch;
-        generate_batch(base_shapes, kBatchSize, train_rng, batch);
-        build_token_batch(batch.target, kBatchSize, train_input_tokens, train_target_tokens);
+    for (uint32_t step = 1; step <= train_steps; ++step) {
+        auto update_start = std::chrono::high_resolution_clock::now();
+        bool should_log = step == 1 || step % log_interval == 0 || step == train_steps;
+        generate_batch(base_shapes, model.batch_size, train_rng, train_meshes);
+        build_token_batch(train_meshes,
+                          model.batch_size,
+                          train_input_tokens,
+                          train_target_tokens);
         upload_token_tensor(*model.input_tokens, train_input_tokens, false);
         upload_token_tensor(*model.target_tokens, train_target_tokens, false);
-
         model.graph.eval(true, false, false);
-        model.graph.step_adam(kLearningRate, 0.9f, 0.98f, 1e-4f);
-
+        model.graph.step_adam(learning_rate, 0.9f, 0.98f, 1e-4f);
         if (should_log) {
             queue_tensor_download(*model.loss);
         }
-
         evk::ai::SubmitCmd(should_log);
-
+        auto update_end = std::chrono::high_resolution_clock::now();
+        result.train_update_seconds +=
+            std::chrono::duration<double>(update_end - update_start).count();
         if (!should_log) {
             continue;
         }
 
-        float train_loss = read_scalar_tensor_from_cpu_buffer(*model.loss);
-        EvalMetrics metrics = evaluate_model(model, val, sample_condition_meshes, sampled_tokens, scratch_targets);
-
-        if (!has_best_params || metrics.val_completion_mse < best_val_completion_loss) {
+        float train_ce = float(model.loss->cpu()[0]);
+        auto validation_start = std::chrono::high_resolution_clock::now();
+        EvalMetrics metrics = evaluate_model(model,
+                                             val,
+                                             sample_condition_meshes,
+                                             sampled_tokens,
+                                             scratch_targets);
+        auto validation_end = std::chrono::high_resolution_clock::now();
+        result.validation_seconds +=
+            std::chrono::duration<double>(validation_end - validation_start).count();
+        ++result.validation_runs;
+        curve_csv << step << ","
+                  << train_ce << ","
+                  << metrics.val_ce << ","
+                  << metrics.val_completion_mse << ","
+                  << result.train_update_seconds * 1000.0 << ","
+                  << result.validation_seconds * 1000.0 << "\n";
+        curve_csv.flush();
+        if (best_params.empty() ||
+            metrics.val_completion_mse < result.best.val_completion_mse) {
             best_params = capture_params(model.graph);
-            has_best_params = true;
-            best_step = step;
-            best_val_loss = metrics.val_ce;
-            best_val_completion_loss = metrics.val_completion_mse;
+            result.best_step = step;
+            result.best = metrics;
         }
 
-        std::vector<float> pred_mesh;
-        for (uint32_t s = 0; s < kValSeeds; ++s) {
-            decode_generated_mesh(sampled_tokens, s, pred_mesh);
-            copy_condition_prefix(val[s].first_target_mesh, pred_mesh);
-            float y_offset = -float(s) * row_spacing;
-            append_obj(evo_path,
-                       pred_mesh,
-                       kTrianglesPerMesh,
-                       evo_vertex_index,
-                       mesh_spacing * float(evo_snapshot_count + 1),
-                       y_offset,
-                       -1.0e9f);
+        std::vector<float> predicted_mesh;
+        for (uint32_t seed = 0; seed < val.size(); ++seed) {
+            decode_generated_mesh(sampled_tokens, seed, predicted_mesh);
+            copy_condition_prefix(val[seed].first_target_mesh, predicted_mesh);
+            append_obj(evolution_obj,
+                       predicted_mesh,
+                       evolution_vertex_index,
+                       mesh_spacing * float(evolution_snapshot_count + 1),
+                       -float(seed) * row_spacing);
         }
-        evo_snapshot_count++;
+        evolution_obj.flush();
+        ++evolution_snapshot_count;
 
-        printf("step %4u | train_ce %.6f | val_ce %.6f | val_completion_mse %.6f\n",
-               step, train_loss, metrics.val_ce, metrics.val_completion_mse);
+        printf("[%s] step %5u | train_ce %.6f | val_ce %.6f | val_completion_mse %.6f\n",
+               name,
+               step,
+               train_ce,
+               metrics.val_ce,
+               metrics.val_completion_mse);
         fflush(stdout);
     }
 
-    if (has_best_params) {
-        restore_params(model.graph, best_params);
-        sample_autoregressive(model, sample_condition_meshes, sampled_tokens, scratch_targets);
-        printf("restored_best | step %4u | val_ce %.6f | val_completion_mse %.6f\n",
-               best_step, best_val_loss, best_val_completion_loss);
-        fflush(stdout);
+    auto train_end = std::chrono::high_resolution_clock::now();
+    result.train_seconds = std::chrono::duration<double>(train_end - train_start).count();
+    restore_params(model.graph, best_params);
+
+    auto decode_start = std::chrono::high_resolution_clock::now();
+    sample_autoregressive(model,
+                          sample_condition_meshes,
+                          sampled_tokens,
+                          scratch_targets);
+    auto decode_end = std::chrono::high_resolution_clock::now();
+    result.decode_ms =
+        std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
+
+    double update_ms =
+        result.train_update_seconds * 1000.0 / double(train_steps);
+    printf("[%s] train_update_ms: %.3f ms/update\n",
+           name,
+           update_ms);
+    printf("[%s] validation_ms: %.3f ms\n",
+           name,
+           result.validation_seconds * 1000.0);
+    printf("[%s] validation_mean_ms: %.3f ms (%u runs)\n",
+           name,
+           result.validation_seconds * 1000.0 / double(result.validation_runs),
+           result.validation_runs);
+    printf("[%s] decode_ms: %.3f ms\n", name, result.decode_ms);
+
+    printf("[%s] restored_best | step %5u | val_ce %.6f | val_completion_mse %.6f | decode_ms %.3f\n",
+           name,
+           result.best_step,
+           result.best.val_ce,
+           result.best.val_completion_mse,
+           result.decode_ms);
+    fflush(stdout);
+    return result;
+}
+
+uint32_t parse_uint_arg(int argc, char** argv, const char* flag, uint32_t fallback) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == flag) {
+            try {
+                return uint32_t(std::stoul(argv[i + 1]));
+            } catch (...) {
+                return fallback;
+            }
+        }
+    }
+    return fallback;
+}
+
+std::string parse_model_arg(int argc, char** argv) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "--llm-model") {
+            return argv[i + 1];
+        }
+    }
+    return "compare";
+}
+
+} // namespace
+
+void main_llm(int argc, char** argv) {
+    constexpr uint32_t kBatchSize = 16;
+    constexpr uint32_t kModelDim = 256;
+    constexpr uint32_t kLayerCount = 8;
+    constexpr uint32_t kAttentionHiddenDim = 512;
+    constexpr uint32_t kGatedDeltaHeads = 64;
+    constexpr uint32_t kGatedDeltaHiddenDim = 448;
+    constexpr float kGatedDeltaLearningRate = 2.0e-4f;
+    constexpr float kAttentionLearningRate = 1.0e-4f;
+    constexpr float kRopeBase = 10000.0f;
+    constexpr uint32_t kValSeeds = 5;
+    constexpr uint32_t kGatedDeltaHeadDim =
+        kModelDim / kGatedDeltaHeads;
+    constexpr uint64_t kGatedDeltaStateBytes =
+        uint64_t(kLayerCount) * kGatedDeltaHeads * kGatedDeltaHeadDim *
+        kGatedDeltaHeadDim * sizeof(float16_t);
+    uint32_t train_steps = (std::max)(1u, parse_uint_arg(argc, argv, "--llm-steps", 20000));
+    uint32_t log_interval =
+        (std::max)(1u, parse_uint_arg(argc, argv, "--llm-log-interval", 500));
+    std::string selected_model = parse_model_arg(argc, argv);
+    bool run_attention = selected_model == "attention" ||
+                         selected_model == "compare" ||
+                         selected_model == "all";
+    bool run_gated_delta = selected_model == "gated-delta" ||
+                           selected_model == "compare" ||
+                           selected_model == "all";
+    if (!run_attention && !run_gated_delta) {
+        printf("[llm] unknown --llm-model '%s'; expected attention, "
+               "gated-delta, compare, or all\n",
+               selected_model.c_str());
+        return;
     }
 
-    if (sampled_tokens.empty()) {
-        sample_autoregressive(model, sample_condition_meshes, sampled_tokens, scratch_targets);
+    printf("=== main_llm: softmax attention and Gated DeltaNet ===\n");
+    printf("config | model %s | steps %u | batch %u | dim %u | sequence %u\n",
+           selected_model.c_str(),
+           train_steps,
+           kBatchSize,
+           kModelDim,
+           kSeqActiveLen);
+
+    const std::vector<Mesh> base_shapes{
+        make_cube_triangles(),
+        make_tetrahedron_triangles(),
+    };
+
+    std::vector<ValSeed> val(kValSeeds);
+    for (uint32_t seed = 0; seed < kValSeeds; ++seed) {
+        std::mt19937 validation_rng(9001 + seed);
+        std::vector<float> mesh_target;
+        generate_batch(base_shapes, kBatchSize, validation_rng, mesh_target);
+        build_token_batch(mesh_target,
+                          kBatchSize,
+                          val[seed].input_tokens,
+                          val[seed].target_tokens);
+        val[seed].first_target_mesh.assign(
+            mesh_target.begin(),
+            mesh_target.begin() + kTrianglesPerMesh * kMeshFeatureDim);
     }
 
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration = end - start;
-    printf("main_llm() took %.4f seconds\n", duration.count());
+    std::vector<float> sample_condition_meshes(
+        kBatchSize * kTrianglesPerMesh * kMeshFeatureDim,
+        0.0f);
+    for (uint32_t batch = 0; batch < kBatchSize; ++batch) {
+        const auto& source = val[batch % kValSeeds].first_target_mesh;
+        float* destination =
+            sample_condition_meshes.data() + batch * kTrianglesPerMesh * kMeshFeatureDim;
+        std::copy(source.begin(), source.end(), destination);
+    }
+
+    std::filesystem::create_directories("output");
+    std::vector<ExperimentResult> results;
+    if (run_attention) {
+        TokenModel attention(kBatchSize,
+                             kSeqLen,
+                             kVocabSize,
+                             kModelDim,
+                             kAttentionHiddenDim,
+                             kLayerCount,
+                             kRopeBase,
+                             AttentionMode::Softmax,
+                             1u);
+        attention.init_weights(42);
+        results.push_back(train_experiment(attention,
+                                           "attention",
+                                           train_steps,
+                                           log_interval,
+                                           kAttentionLearningRate,
+                                           base_shapes,
+                                           val,
+                                           sample_condition_meshes));
+        // Equivalent FP16 K/V cache at the active validation sequence length.
+        // The current reference decoder recomputes the prefix instead of storing it.
+        results.back().inference_state_bytes =
+            uint64_t(kLayerCount) * 2u * kSeqActiveLen * kModelDim *
+            uint32_t(sizeof(float16_t));
+        results.back().inference_state_grows_with_sequence = true;
+    }
+
+    if (run_gated_delta) {
+        TokenModel gated_delta(kBatchSize,
+                               kSeqLen,
+                               kVocabSize,
+                               kModelDim,
+                               kGatedDeltaHiddenDim,
+                               kLayerCount,
+                               kRopeBase,
+                               AttentionMode::GatedDelta,
+                               kGatedDeltaHeads);
+        gated_delta.init_weights(42);
+        results.push_back(train_experiment(gated_delta,
+                                           "gated_delta",
+                                           train_steps,
+                                           log_interval,
+                                           kGatedDeltaLearningRate,
+                                           base_shapes,
+                                           val,
+                                           sample_condition_meshes));
+        results.back().inference_state_bytes = kGatedDeltaStateBytes;
+    }
+    printf("\n=== comparison (lower is better) ===\n");
+    std::ofstream comparison_csv("output/llm_comparison.csv");
+    comparison_csv << "model,parameters,best_step,val_ce,completion_mse,"
+                      "train_update_ms,validation_ms,validation_runs,validation_mean_ms,"
+                      "decode_ms,total_train_seconds,"
+                      "inference_state_bytes,state_growth\n";
+    for (const ExperimentResult& result : results) {
+        double update_ms =
+            result.train_update_seconds * 1000.0 / double(train_steps);
+        double validation_mean_ms =
+            result.validation_seconds * 1000.0 / double(result.validation_runs);
+        printf("%-16s | params %llu | best_step %u | val_ce %.6f | completion_mse %.6f | update_ms %.3f | validation_mean_ms %.3f | decode_ms %.3f | state_bytes %llu (%s)\n",
+               result.name.c_str(),
+               static_cast<unsigned long long>(result.parameters),
+               result.best_step,
+               result.best.val_ce,
+               result.best.val_completion_mse,
+               update_ms,
+               validation_mean_ms,
+               result.decode_ms,
+               static_cast<unsigned long long>(result.inference_state_bytes),
+               result.inference_state_grows_with_sequence ? "linear" : "fixed");
+        comparison_csv << result.name << ","
+                       << result.parameters << ","
+                       << result.best_step << ","
+                       << result.best.val_ce << ","
+                       << result.best.val_completion_mse << ","
+                       << update_ms << ","
+                       << result.validation_seconds * 1000.0 << ","
+                       << result.validation_runs << ","
+                       << validation_mean_ms << ","
+                       << result.decode_ms << ","
+                       << result.train_seconds << ","
+                       << result.inference_state_bytes << ","
+                       << (result.inference_state_grows_with_sequence ? "linear" : "fixed")
+                       << "\n";
+    }
+    if (run_gated_delta) {
+        printf("gated delta inference state | %llu bytes per sequence across %u layers "
+               "(fixed with sequence length)\n",
+               static_cast<unsigned long long>(kGatedDeltaStateBytes),
+               kLayerCount);
+    }
+    fflush(stdout);
 }

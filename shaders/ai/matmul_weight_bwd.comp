@@ -1,0 +1,75 @@
+#include "../common/evk.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_buffer_reference : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 inputBuffer;
+    BufferFp16 gradOutputBuffer;
+    BufferFp16 gradWeightBuffer;
+    uint batchSize;
+    uint rowCount;
+    uint inputDim;
+    uint outputDim;
+)
+
+shared float16_t batchResultValues[16u * 16u];
+
+COMPUTE(32, 1, 1)
+void main() {
+    uint inputStart = gl_WorkGroupID.y * 16u;
+    uint outputStart = gl_WorkGroupID.x * 16u;
+    float accumulatedValues[8];
+    for (uint element = 0u; element < 8u; ++element) {
+        accumulatedValues[element] = 0.0;
+    }
+
+    for (uint batch = 0u; batch < batchSize; ++batch) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                gl_MatrixUseAccumulator> batchResult =
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseAccumulator>(0.0);
+        uint inputBatchStart = batch * rowCount * inputDim;
+        uint gradBatchStart = batch * rowCount * outputDim;
+        for (uint row = 0u; row < rowCount; row += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseA> inputTile;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseB> gradTile;
+            coopMatLoad(inputTile, inputBuffer.x,
+                        inputBatchStart + row * inputDim + inputStart,
+                        inputDim, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(gradTile, gradOutputBuffer.x,
+                        gradBatchStart + row * outputDim + outputStart,
+                        outputDim, gl_CooperativeMatrixLayoutRowMajor);
+            batchResult = coopMatMulAdd(inputTile, gradTile, batchResult);
+        }
+
+        // Preserve the baseline's batched matmul rounding before reducing the
+        // batches in shader-local FP32.
+        coopMatStore(batchResult, batchResultValues, 0u, 16u,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        for (uint element = 0u; element < 8u; ++element) {
+            uint index = gl_LocalInvocationID.x + element * 32u;
+            accumulatedValues[element] += float(batchResultValues[index]);
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+    }
+
+    for (uint element = 0u; element < 8u; ++element) {
+        uint index = gl_LocalInvocationID.x + element * 32u;
+        uint row = index / 16u;
+        uint column = index % 16u;
+        uint weightIndex = (inputStart + row) * outputDim + outputStart + column;
+        gradWeightBuffer.x[weightIndex] = float16_t(
+            float(gradWeightBuffer.x[weightIndex]) + accumulatedValues[element]);
+    }
+}
