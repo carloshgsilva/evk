@@ -62,7 +62,18 @@ exact recurrent transition.
 `compare` and `all` run both retained models. The default budget is 20,000
 updates.
 
-Outputs are written under `output/`:
+`--llm-gdn-heads` accepts 8, 16, 32, or 64
+(head dimensions 32, 16, 8, or 4). `--llm-gdn-hidden` sets the FFN width,
+a positive multiple of 16. Defaults remain 64 heads and FFN width 448.
+`--llm-seed` sets parameter initialization (default 42), not the data stream.
+`--llm-output` selects a separate output directory; files there are overwritten.
+For example, this tests dimension 16 at the baseline parameter count:
+
+```bat
+.\run.bat --llm --llm-model gated-delta --llm-gdn-heads 16 --llm-gdn-hidden 496 --llm-output output/gdn16
+```
+
+Outputs are written under `output/` by default:
 
 - `attention_training_curve.csv`
 - `attention_mesh_val_evolution.obj`

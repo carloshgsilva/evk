@@ -831,7 +831,8 @@ ExperimentResult train_experiment(
     float learning_rate,
     const std::vector<Mesh>& base_shapes,
     const std::vector<ValSeed>& val,
-    const std::vector<float>& sample_condition_meshes) {
+    const std::vector<float>& sample_condition_meshes,
+    const std::filesystem::path& output_dir) {
     ExperimentResult result;
     result.name = name;
     result.parameters = parameter_count(model.graph);
@@ -840,9 +841,9 @@ ExperimentResult train_experiment(
            static_cast<unsigned long long>(result.parameters));
 
     std::filesystem::path evolution_path =
-        std::filesystem::path("output") / (std::string(name) + "_mesh_val_evolution.obj");
+        output_dir / (std::string(name) + "_mesh_val_evolution.obj");
     std::filesystem::path curve_path =
-        std::filesystem::path("output") / (std::string(name) + "_training_curve.csv");
+        output_dir / (std::string(name) + "_training_curve.csv");
     std::ofstream evolution_obj(evolution_path);
     std::ofstream curve_csv(curve_path);
     curve_csv.precision(9);
@@ -990,13 +991,14 @@ uint32_t parse_uint_arg(int argc, char** argv, const char* flag, uint32_t fallba
     return fallback;
 }
 
-std::string parse_model_arg(int argc, char** argv) {
+std::string parse_string_arg(int argc, char** argv, const char* flag,
+                             const char* fallback) {
     for (int i = 1; i + 1 < argc; ++i) {
-        if (std::string(argv[i]) == "--llm-model") {
+        if (std::string(argv[i]) == flag) {
             return argv[i + 1];
         }
     }
-    return "compare";
+    return fallback;
 }
 
 } // namespace
@@ -1006,21 +1008,28 @@ void main_llm(int argc, char** argv) {
     constexpr uint32_t kModelDim = 256;
     constexpr uint32_t kLayerCount = 8;
     constexpr uint32_t kAttentionHiddenDim = 512;
-    constexpr uint32_t kGatedDeltaHeads = 64;
-    constexpr uint32_t kGatedDeltaHiddenDim = 448;
+    uint32_t gated_delta_heads = parse_uint_arg(argc, argv, "--llm-gdn-heads", 64);
+    uint32_t gated_delta_hidden = parse_uint_arg(argc, argv, "--llm-gdn-hidden", 448);
+    uint32_t parameter_seed = parse_uint_arg(argc, argv, "--llm-seed", 42);
+    if ((gated_delta_heads != 8u && gated_delta_heads != 16u &&
+         gated_delta_heads != 32u && gated_delta_heads != 64u) ||
+        gated_delta_hidden == 0u || gated_delta_hidden % 16u != 0u) {
+        printf("[llm] GDN heads must be 8, 16, 32, or 64; FFN width must be a positive multiple of 16\n");
+        return;
+    }
     constexpr float kGatedDeltaLearningRate = 2.0e-4f;
     constexpr float kAttentionLearningRate = 1.0e-4f;
     constexpr float kRopeBase = 10000.0f;
     constexpr uint32_t kValSeeds = 5;
-    constexpr uint32_t kGatedDeltaHeadDim =
-        kModelDim / kGatedDeltaHeads;
-    constexpr uint64_t kGatedDeltaStateBytes =
-        uint64_t(kLayerCount) * kGatedDeltaHeads * kGatedDeltaHeadDim *
-        kGatedDeltaHeadDim * sizeof(float16_t);
+    uint32_t head_dim = kModelDim / gated_delta_heads;
+    uint64_t gated_delta_state_bytes = uint64_t(kLayerCount) *
+        gated_delta_heads * head_dim * head_dim * sizeof(float16_t);
     uint32_t train_steps = (std::max)(1u, parse_uint_arg(argc, argv, "--llm-steps", 20000));
     uint32_t log_interval =
         (std::max)(1u, parse_uint_arg(argc, argv, "--llm-log-interval", 500));
-    std::string selected_model = parse_model_arg(argc, argv);
+    std::string selected_model = parse_string_arg(argc, argv, "--llm-model", "compare");
+    std::filesystem::path output_dir = parse_string_arg(
+        argc, argv, "--llm-output", "output");
     bool run_attention = selected_model == "attention" ||
                          selected_model == "compare" ||
                          selected_model == "all";
@@ -1071,7 +1080,7 @@ void main_llm(int argc, char** argv) {
         std::copy(source.begin(), source.end(), destination);
     }
 
-    std::filesystem::create_directories("output");
+    std::filesystem::create_directories(output_dir);
     std::vector<ExperimentResult> results;
     if (run_attention) {
         TokenModel attention(kBatchSize,
@@ -1083,7 +1092,7 @@ void main_llm(int argc, char** argv) {
                              kRopeBase,
                              AttentionMode::Softmax,
                              1u);
-        attention.init_weights(42);
+        attention.init_weights(parameter_seed);
         results.push_back(train_experiment(attention,
                                            "attention",
                                            train_steps,
@@ -1091,7 +1100,8 @@ void main_llm(int argc, char** argv) {
                                            kAttentionLearningRate,
                                            base_shapes,
                                            val,
-                                           sample_condition_meshes));
+                                           sample_condition_meshes,
+                                           output_dir));
         // Equivalent FP16 K/V cache at the active validation sequence length.
         // The current reference decoder recomputes the prefix instead of storing it.
         results.back().inference_state_bytes =
@@ -1101,16 +1111,18 @@ void main_llm(int argc, char** argv) {
     }
 
     if (run_gated_delta) {
+        printf("GDN config | heads %u | head_dim %u | FFN %u | seed %u\n",
+               gated_delta_heads, head_dim, gated_delta_hidden, parameter_seed);
         TokenModel gated_delta(kBatchSize,
                                kSeqLen,
                                kVocabSize,
                                kModelDim,
-                               kGatedDeltaHiddenDim,
+                               gated_delta_hidden,
                                kLayerCount,
                                kRopeBase,
                                AttentionMode::GatedDelta,
-                               kGatedDeltaHeads);
-        gated_delta.init_weights(42);
+                               gated_delta_heads);
+        gated_delta.init_weights(parameter_seed);
         results.push_back(train_experiment(gated_delta,
                                            "gated_delta",
                                            train_steps,
@@ -1118,11 +1130,12 @@ void main_llm(int argc, char** argv) {
                                            kGatedDeltaLearningRate,
                                            base_shapes,
                                            val,
-                                           sample_condition_meshes));
-        results.back().inference_state_bytes = kGatedDeltaStateBytes;
+                                           sample_condition_meshes,
+                                           output_dir));
+        results.back().inference_state_bytes = gated_delta_state_bytes;
     }
     printf("\n=== comparison (lower is better) ===\n");
-    std::ofstream comparison_csv("output/llm_comparison.csv");
+    std::ofstream comparison_csv(output_dir / "llm_comparison.csv");
     comparison_csv << "model,parameters,best_step,val_ce,completion_mse,"
                       "train_update_ms,validation_ms,validation_runs,validation_mean_ms,"
                       "decode_ms,total_train_seconds,"
@@ -1161,7 +1174,7 @@ void main_llm(int argc, char** argv) {
     if (run_gated_delta) {
         printf("gated delta inference state | %llu bytes per sequence across %u layers "
                "(fixed with sequence length)\n",
-               static_cast<unsigned long long>(kGatedDeltaStateBytes),
+               static_cast<unsigned long long>(gated_delta_state_bytes),
                kLayerCount);
     }
     fflush(stdout);

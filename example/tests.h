@@ -1371,13 +1371,13 @@ void test_position_add_and_backward() {
     }
 }
 
+template<uint32_t Dh = 2u>
 void test_gated_delta_forward_backward_and_recurrent() {
-    printf("test_gated_delta_forward_backward_and_recurrent()\n");
+    printf("test_gated_delta_forward_backward_and_recurrent(head_dim=%u)\n", Dh);
     constexpr uint32_t B = 1u;
     constexpr uint32_t N = 3u;
-    constexpr uint32_t D = 4u;
+    constexpr uint32_t D = 2u * Dh;
     constexpr uint32_t H = 2u;
-    constexpr uint32_t Dh = D / H;
     constexpr uint32_t P = 3u * D + 2u * H;
     constexpr float decay_bias = -4.0f;
     constexpr float rope_base = 10000.0f;
@@ -1556,12 +1556,12 @@ void test_gated_delta_forward_backward_and_recurrent() {
     TEST(recurrent_ok);
 }
 
+template<uint32_t D = 8u>
 void test_gated_delta_fp16_recurrent_drift() {
-    printf("test_gated_delta_fp16_recurrent_drift()\n");
+    printf("test_gated_delta_fp16_recurrent_drift(head_dim=%u)\n", D);
 
     constexpr uint32_t B = 1u;
     constexpr uint32_t N = 160u;
-    constexpr uint32_t D = 8u;
     constexpr uint32_t H = 1u;
     constexpr uint32_t Dh = D / H;
     constexpr uint32_t P = 3u * D + 2u * H;
@@ -2028,7 +2028,14 @@ void run_ai_kernel_tests() {
     test_embed_and_backward();
     test_position_add_and_backward();
     test_gated_delta_forward_backward_and_recurrent();
+    test_gated_delta_forward_backward_and_recurrent<4>();
+    test_gated_delta_forward_backward_and_recurrent<8>();
+    test_gated_delta_forward_backward_and_recurrent<16>();
+    test_gated_delta_forward_backward_and_recurrent<32>();
     test_gated_delta_fp16_recurrent_drift();
+    test_gated_delta_fp16_recurrent_drift<4>();
+    test_gated_delta_fp16_recurrent_drift<16>();
+    test_gated_delta_fp16_recurrent_drift<32>();
     test_rope_and_backward();
     test_sum_batch();
     test_rms_norm_and_backward();
