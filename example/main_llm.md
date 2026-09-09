@@ -44,10 +44,9 @@ Q and K are L2-normalized and receive RoPE before the state update. Across all
 eight layers, recurrent state occupies 16 KiB of FP16 storage per sequence and
 does not grow with context length.
 
-Training keeps exact full-sequence forward states and uses 16-token parallel
-backward chunks. FP16 chunk summaries carry the dominant decayed
-`q ⊗ output-gradient` term across chunk boundaries. Decode uses the unchanged
-exact recurrent transition.
+Training uses an exact reverse state-gradient scan to supply FP16 boundaries
+for parallel 16-token backward chunks, including the key-dependent delta
+correction. Decode uses the same recurrence, with FP16 state storage.
 
 ## Running
 
@@ -80,16 +79,3 @@ Outputs are written under `output/` by default:
 - `gated_delta_training_curve.csv`
 - `gated_delta_mesh_val_evolution.obj`
 - `llm_comparison.csv`
-
-## Latest Gated DeltaNet qualification
-
-The retained 20,000-step run used eight layers and 4,268,032 parameters:
-
-| update time | final validation CE | selected mesh MSE | validation/pass | decode | state |
-|---:|---:|---:|---:|---:|---:|
-| 7.316 ms | 0.293604 | 0.003192 | 62.976 ms | 51.191 ms | 16 KiB fixed |
-
-The original 16-head Gated DeltaNet required 13.541 ms per update. The optimized
-configuration is 46.0% faster while keeping validation CE close to the original
-0.280176 result. Mesh MSE varies slightly between FP16 runs; the preceding
-qualification reached 0.002376.

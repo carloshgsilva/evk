@@ -70,7 +70,6 @@ namespace evk::ai {
         evk::Pipeline gated_delta_projected_step;
         evk::Pipeline gated_delta_projected;
         evk::Pipeline gated_delta_projected_bwd_boundaries;
-        evk::Pipeline gated_delta_projected_bwd_boundary_scan;
         evk::Pipeline gated_delta_projected_bwd;
         evk::Pipeline rope;
         evk::Pipeline rope_bwd;
@@ -275,8 +274,6 @@ namespace evk::ai {
             create_named_compute_pipeline("gated_delta_projected");
         pipelines->gated_delta_projected_bwd_boundaries =
             create_named_compute_pipeline("gated_delta_projected_bwd_boundaries");
-        pipelines->gated_delta_projected_bwd_boundary_scan =
-            create_named_compute_pipeline("gated_delta_projected_bwd_boundary_scan");
         pipelines->gated_delta_projected_bwd =
             create_named_compute_pipeline("gated_delta_projected_bwd");
         pipelines->rope = create_named_compute_pipeline("rope");
@@ -1318,16 +1315,6 @@ namespace evk::ai {
                 grad_state_boundaries->buffer.GetReference(), batch_size,
                 sequence_length, model_dim, head_count, rope_base, decay_bias,
                 chunk_size,
-            });
-            cmd.dispatch(batch_size * chunk_count,
-                         (head_count + heads_per_group - 1u) / heads_per_group,
-                         1u);
-            cmd.computeBarrier();
-            cmd.bind(pipelines->gated_delta_projected_bwd_boundary_scan);
-            cmd.push(evk::Constant{
-                projection.buffer.GetReference(),
-                grad_state_boundaries->buffer.GetReference(), batch_size,
-                sequence_length, model_dim, head_count, decay_bias, chunk_size,
             });
             cmd.dispatch(batch_size,
                          (head_count + heads_per_group - 1u) / heads_per_group,

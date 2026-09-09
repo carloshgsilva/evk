@@ -1371,11 +1371,9 @@ void test_position_add_and_backward() {
     }
 }
 
-template<uint32_t Dh = 2u>
+template<uint32_t Dh = 2u, uint32_t N = 3u, uint32_t B = 1u>
 void test_gated_delta_forward_backward_and_recurrent() {
-    printf("test_gated_delta_forward_backward_and_recurrent(head_dim=%u)\n", Dh);
-    constexpr uint32_t B = 1u;
-    constexpr uint32_t N = 3u;
+    printf("test_gated_delta_forward_backward_and_recurrent(head_dim=%u, tokens=%u, batch=%u)\n", Dh, N, B);
     constexpr uint32_t D = 2u * Dh;
     constexpr uint32_t H = 2u;
     constexpr uint32_t P = 3u * D + 2u * H;
@@ -1389,6 +1387,16 @@ void test_gated_delta_forward_backward_and_recurrent() {
     }
     for (uint32_t i = 0; i < grad_output_values.size(); ++i) {
         grad_output_values[i] = float(float16_t(0.05f * float(int(i % 7u) - 3)));
+    }
+    // Exercise almost-complete writes and retention changes across boundaries.
+    if (N > 3u) {
+        for (uint32_t row = 0; row < B * N; ++row) {
+            for (uint32_t head = 0; head < H; ++head) {
+                uint32_t gate = row * P + 3u * D + head;
+                projection_values[gate] = row % 5u == 0u ? 4.0f : 0.0f;
+                projection_values[gate + H] = (row + head) % 3u == 0u ? -6.0f : 6.0f;
+            }
+        }
     }
 
     auto cpu_forward = [&](const std::vector<float>& projection,
@@ -1526,11 +1534,36 @@ void test_gated_delta_forward_backward_and_recurrent() {
     }
     for (uint32_t i = 0; i < expected_gradient.size(); ++i) {
         backward_ok &= approx_eq(
-            float(grad_projection.cpu()[i]), expected_gradient[i], 5e-2f);
+            float(grad_projection.cpu()[i]), expected_gradient[i],
+            2e-3f + 2e-2f * std::abs(expected_gradient[i]));
     }
     TEST(forward_ok);
     TEST(history_ok);
     TEST(backward_ok);
+
+    Tensor chunk_gradient({B, N, P});
+    for (uint32_t chunk_size : {1u, 2u, 16u}) {
+        if (chunk_size >= N) continue;
+        uint32_t chunks = (N + chunk_size - 1u) / chunk_size;
+        Tensor boundaries({B, chunks, H, Dh, Dh});
+        evk::ai::gated_delta_projected_backward(
+            projection, history, grad_output, chunk_gradient,
+            D, H, rope_base, decay_bias, chunk_size, &boundaries);
+        chunk_gradient.cpu_download();
+        bool chunk_ok = true;
+        float max_error = 0.0f;
+        for (uint32_t i = 0; i < expected_gradient.size(); ++i) {
+            float reference = float(grad_projection.cpu()[i]);
+            float actual = float(chunk_gradient.cpu()[i]);
+            max_error = (std::max)(max_error, std::abs(actual - reference));
+            chunk_ok &= approx_eq(actual, reference,
+                                  5e-4f + 5e-3f * std::abs(reference));
+            chunk_ok &= approx_eq(actual, expected_gradient[i],
+                                  2e-3f + 2e-2f * std::abs(expected_gradient[i]));
+        }
+        printf("  chunk %u max gradient error vs unchunked: %.7f\n", chunk_size, max_error);
+        TEST(chunk_ok);
+    }
 
     Tensor step_projection({B, 1u, P});
     Tensor positions({B, 1u});
@@ -1539,18 +1572,23 @@ void test_gated_delta_forward_backward_and_recurrent() {
     state.fill(0.0f);
     bool recurrent_ok = true;
     for (uint32_t position = 0; position < N; ++position) {
-        std::copy_n(projection.cpu() + position * P, P, step_projection.cpu());
-        positions.cpu()[0].value = uint16_t(position);
+        for (uint32_t batch = 0; batch < B; ++batch) {
+            std::copy_n(projection.cpu() + (batch * N + position) * P,
+                        P, step_projection.cpu() + batch * P);
+            positions.cpu()[batch].value = uint16_t(position);
+        }
         step_projection.cpu_upload();
         positions.cpu_upload();
         evk::ai::gated_delta_projected_step(
             step_projection, positions, state, step_output,
             H, rope_base, decay_bias);
         step_output.cpu_download();
-        for (uint32_t feature = 0; feature < D; ++feature) {
-            recurrent_ok &= approx_eq(
-                float(step_output.cpu()[feature]),
-                float(output.cpu()[position * D + feature]), 4e-2f);
+        for (uint32_t batch = 0; batch < B; ++batch) {
+            for (uint32_t feature = 0; feature < D; ++feature) {
+                recurrent_ok &= approx_eq(
+                    float(step_output.cpu()[batch * D + feature]),
+                    float(output.cpu()[(batch * N + position) * D + feature]), 4e-2f);
+            }
         }
     }
     TEST(recurrent_ok);
@@ -2032,6 +2070,9 @@ void run_ai_kernel_tests() {
     test_gated_delta_forward_backward_and_recurrent<8>();
     test_gated_delta_forward_backward_and_recurrent<16>();
     test_gated_delta_forward_backward_and_recurrent<32>();
+    test_gated_delta_forward_backward_and_recurrent<4, 35, 2>();
+    test_gated_delta_forward_backward_and_recurrent<16, 35>();
+    test_gated_delta_forward_backward_and_recurrent<32, 19>();
     test_gated_delta_fp16_recurrent_drift();
     test_gated_delta_fp16_recurrent_drift<4>();
     test_gated_delta_fp16_recurrent_drift<16>();
