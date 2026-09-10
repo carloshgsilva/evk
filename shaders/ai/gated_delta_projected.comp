@@ -7,6 +7,7 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 
 layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+layout(buffer_reference, buffer_reference_align = 4) buffer BufferFp16x2 { f16vec2 x[]; };
 
 PUSH(
     BufferFp16 projectionBuffer;
@@ -21,88 +22,133 @@ PUSH(
 )
 
 CONSTANT(0) uint headDim = 4u;
+CONSTANT(1) bool isPrepared = false;
+const uint valueLanes = (headDim + 1u) / 2u;
+const uint keyGroups = headDim < 32u / valueLanes ? headDim : 32u / valueLanes;
+const uint keysPerLane = headDim / keyGroups;
+const uint headsPerGroup = 32u / (valueLanes * keyGroups);
+const uint tileRows = 128u;
+const uint headStride = 3u * headDim + 2u;
+shared float16_t projectionTile[tileRows * headsPerGroup * headStride];
 
-float headSum(float value, uint headDim) {
-    for (uint offset = headDim / 2u; offset > 0u; offset >>= 1u) {
+float headSum(float value) {
+    for (uint offset = valueLanes / 2u; offset > 0u; offset >>= 1u)
         value += subgroupShuffleXor(value, offset);
-    }
     return value;
+}
+
+vec2 keySum(vec2 value) {
+    for (uint offset = keyGroups / 2u; offset > 0u; offset >>= 1u)
+        value += vec2(subgroupShuffleXor(value.x, offset * valueLanes),
+                      subgroupShuffleXor(value.y, offset * valueLanes));
+    return value;
+}
+
+float keyComponent(vec2 value, uint base, uint key) {
+    float x = subgroupShuffle(value.x, base + key / 2u);
+    float y = subgroupShuffle(value.y, base + key / 2u);
+    return (key & 1u) == 0u ? x : y;
 }
 
 COMPUTE(32, 1, 1)
 void main() {
     uint batch = gl_WorkGroupID.x;
     uint lane = gl_LocalInvocationID.x;
-    uint headsPerGroup = 32u / headDim;
-    uint localHead = lane / headDim;
-    uint feature = lane % headDim;
+    uint localHead = lane / (valueLanes * keyGroups);
+    uint keyGroup = (lane / valueLanes) % keyGroups;
+    uint feature = 2u * (lane % valueLanes);
     uint head = gl_WorkGroupID.y * headsPerGroup + localHead;
-    uint localBase = localHead * headDim;
-    bool isActive = batch < batchSize && head < headCount;
-    uint projectionStride = 3u * modelDim + 2u * headCount;
+    uint localBase = localHead * valueLanes * keyGroups;
     uint globalFeature = head * headDim + feature;
+    uint projectionStride = 3u * modelDim + 2u * headCount;
+    bool isActive = batch < batchSize && head < headCount;
 
-    // Each lane owns a value column; only the temporary accumulator is FP32.
-    float state[headDim];
-    for (uint k = 0u; k < headDim; ++k) state[k] = 0.0;
+    // Each lane owns adjacent value pairs; only temporary accumulators are FP32.
+    vec2 state[keysPerLane];
+    for (uint i = 0u; i < keysPerLane; ++i)
+        state[i] = vec2(0.0);
 
     for (uint position = 0u; position < sequenceLength; ++position) {
+        if (position % tileRows == 0u) {
+            barrier();
+            for (uint index = lane; index < tileRows * headsPerGroup * headStride; index += 32u) {
+                uint tileHead =
+                    gl_WorkGroupID.y * headsPerGroup + (index / headStride) % headsPerGroup;
+                uint token = position + index / (headsPerGroup * headStride);
+                uint component = index % headStride;
+                uint offset =
+                    component < 3u * headDim
+                        ? (component / headDim) * modelDim + tileHead * headDim +
+                              component % headDim
+                        : 3u * modelDim + (component - 3u * headDim) * headCount + tileHead;
+                projectionTile[index] =
+                    token < sequenceLength && tileHead < headCount
+                        ? projectionBuffer
+                              .x[(batch * sequenceLength + token) * projectionStride + offset]
+                        : float16_t(0.0);
+            }
+            barrier();
+        }
+        uint tile = ((position % tileRows) * headsPerGroup + localHead) * headStride;
         uint row = batch * sequenceLength + position;
         uint projectionStart = row * projectionStride;
-        uint vectorStart = row * modelDim + head * headDim;
-        uint gateIndex = projectionStart + 3u * modelDim + head;
-        uint pair = globalFeature / 2u;
-        float angle = float(position) * pow(ropeBase, -2.0 * float(pair) / float(modelDim));
-        float c = cos(angle);
-        float s = sin(angle);
-        float rawQuery = isActive
-            ? float(projectionBuffer.x[projectionStart + globalFeature]) : 0.0;
-        float rawKey = isActive
-            ? float(projectionBuffer.x[projectionStart + modelDim + globalFeature]) : 0.0;
-        float pairedQuery = subgroupShuffleXor(rawQuery, 1u);
-        float pairedKey = subgroupShuffleXor(rawKey, 1u);
-        float rotatedQuery = (feature & 1u) == 0u
-            ? rawQuery * c - pairedQuery * s
-            : pairedQuery * s + rawQuery * c;
-        float rotatedKey = (feature & 1u) == 0u
-            ? rawKey * c - pairedKey * s
-            : pairedKey * s + rawKey * c;
-        rotatedQuery = float(float16_t(rotatedQuery));
-        rotatedKey = float(float16_t(rotatedKey));
-        float decayValue = isActive
-            ? 1.0 / (1.0 + exp(float(projectionBuffer.x[gateIndex]) + decayBias))
-            : 0.0;
-        float writeValue = isActive
-            ? 1.0 / (1.0 + exp(-float(projectionBuffer.x[gateIndex + headCount])))
-            : 0.0;
-        float normalizedQuery = rotatedQuery *
-            inversesqrt(headSum(rotatedQuery * rotatedQuery, headDim) + 1.0e-6);
-        float normalizedKey = rotatedKey *
-            inversesqrt(headSum(rotatedKey * rotatedKey, headDim) + 1.0e-6);
-
-        float correctionValue = 0.0;
-        if (isActive) {
-            float predicted = 0.0;
-            for (uint keyFeature = 0u; keyFeature < headDim; ++keyFeature) {
-                predicted += subgroupShuffle(normalizedKey, localBase + keyFeature) *
-                    state[keyFeature] * decayValue;
+        vec2 q = vec2(float(projectionTile[tile + feature]),
+                      headDim > 1u ? float(projectionTile[tile + feature + 1u]) : 0.0);
+        vec2 k = vec2(float(projectionTile[tile + headDim + feature]),
+                      headDim > 1u ? float(projectionTile[tile + headDim + feature + 1u]) : 0.0);
+        float decay = float(projectionTile[tile + 3u * headDim]);
+        float write = float(projectionTile[tile + 3u * headDim + 1u]);
+        if (!isPrepared) {
+            float angle =
+                float(position) * pow(ropeBase, -2.0 * float(globalFeature / 2u) / float(modelDim));
+            float c = cos(angle), s = sin(angle);
+            if (headDim == 1u) {
+                q = vec2(float(float16_t(q.x * c - subgroupShuffleXor(q.x, 1u) * s)), 0.0);
+                k = vec2(float(float16_t(k.x * c - subgroupShuffleXor(k.x, 1u) * s)), 0.0);
+            } else {
+                q = vec2(f16vec2(q.x * c - q.y * s, q.x * s + q.y * c));
+                k = vec2(f16vec2(k.x * c - k.y * s, k.x * s + k.y * c));
             }
-            correctionValue = writeValue *
-                (float(projectionBuffer.x[projectionStart + 2u * modelDim + globalFeature]) -
-                 predicted);
+            q *= inversesqrt(headSum(dot(q, q)) + 1.0e-6);
+            k *= inversesqrt(headSum(dot(k, k)) + 1.0e-6);
+            decay = 1.0 / (1.0 + exp(decay + decayBias));
+            write = 1.0 / (1.0 + exp(-write));
         }
-
         if (isActive) {
-            for (uint k = 0u; k < headDim; ++k) {
-                state[k] = state[k] * decayValue +
-                    subgroupShuffle(normalizedKey, localBase + k) * correctionValue;
-                uint historyIndex = ((row * headCount + head) * headDim + k) * headDim + feature;
-                stateHistoryBuffer.x[historyIndex] = float16_t(state[k]);
+            vec2 predicted = vec2(0.0);
+            for (uint i = 0u; i < keysPerLane; ++i) {
+                uint key = keyGroup * keysPerLane + i;
+                predicted += keyComponent(k, localBase, key) * state[i] * decay;
             }
-            float result = 0.0;
-            for (uint k = 0u; k < headDim; ++k)
-                result += subgroupShuffle(normalizedQuery, localBase + k) * state[k];
-            outputBuffer.x[vectorStart + feature] = float16_t(result);
+            predicted = keySum(predicted);
+            vec2 value = vec2(
+                float(projectionTile[tile + 2u * headDim + feature]),
+                headDim > 1u ? float(projectionTile[tile + 2u * headDim + feature + 1u]) : 0.0);
+            vec2 error = value - predicted;
+            vec2 correction = write * error;
+            if (isPrepared && keyGroup == 0u)
+                BufferFp16x2(projectionBuffer)
+                    .x[(projectionStart + 2u * modelDim + globalFeature) / 2u] = f16vec2(error);
+
+            vec2 result = vec2(0.0);
+            for (uint i = 0u; i < keysPerLane; ++i) {
+                uint key = keyGroup * keysPerLane + i;
+                state[i] = state[i] * decay + keyComponent(k, localBase, key) * correction;
+                uint index = ((row * headCount + head) * headDim + key) * headDim + feature;
+                if (headDim > 1u)
+                    BufferFp16x2(stateHistoryBuffer).x[index / 2u] = f16vec2(state[i]);
+                else
+                    stateHistoryBuffer.x[index] = float16_t(state[i].x);
+                result += keyComponent(q, localBase, key) * state[i];
+            }
+            result = keySum(result);
+            if (keyGroup == 0u) {
+                uint index = row * modelDim + globalFeature;
+                if (headDim > 1u)
+                    BufferFp16x2(outputBuffer).x[index / 2u] = f16vec2(result);
+                else
+                    outputBuffer.x[index] = float16_t(result.x);
+            }
         }
     }
 }

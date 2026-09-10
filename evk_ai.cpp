@@ -69,9 +69,10 @@ namespace evk::ai {
         evk::Pipeline position_add;
         evk::Pipeline position_add_bwd;
         evk::Pipeline gated_delta_projected_step;
-        evk::Pipeline gated_delta_projected[6];
-        evk::Pipeline gated_delta_projected_bwd_boundaries[6];
-        evk::Pipeline gated_delta_projected_bwd[6];
+        evk::Pipeline gated_delta_prepare;
+        evk::Pipeline gated_delta_projected[2][6];
+        evk::Pipeline gated_delta_projected_bwd_boundaries[2][6];
+        evk::Pipeline gated_delta_projected_bwd[2][6];
         evk::Pipeline rope;
         evk::Pipeline rope_bwd;
         evk::Pipeline causal_mask;
@@ -271,6 +272,7 @@ namespace evk::ai {
         pipelines->position_add_bwd = create_named_compute_pipeline("position_add_bwd");
         pipelines->gated_delta_projected_step =
             create_named_compute_pipeline("gated_delta_projected_step");
+        pipelines->gated_delta_prepare = create_named_compute_pipeline("gated_delta_prepare");
         pipelines->rope = create_named_compute_pipeline("rope");
         pipelines->rope_bwd = create_named_compute_pipeline("rope_bwd");
         pipelines->causal_mask = create_named_compute_pipeline("causal_mask");
@@ -1254,15 +1256,19 @@ namespace evk::ai {
         cmd.computeBarrier();
     }
 
-    static evk::Pipeline& head_pipeline(evk::Pipeline (&variants)[6],
-                                        const char* name, uint32_t head_dim) {
+    static uint32_t head_key_groups(uint32_t head_dim) {
+        return (std::min)(head_dim, 32u / head_dim);
+    }
+
+    static evk::Pipeline& head_pipeline(evk::Pipeline (&variants)[2][6],
+                                       const char* name, uint32_t head_dim, bool prepared) {
         assert(head_dim > 0u && head_dim <= 32u && std::has_single_bit(head_dim));
-        auto& pipeline = variants[std::countr_zero(head_dim)];
+        auto& pipeline = variants[prepared][std::countr_zero(head_dim)];
         if (!pipeline) {
             pipeline = evk::CreatePipeline({
                 .name = name,
                 .CS = detail::load_embedded_shader(name),
-                .constants = evk::Constant{head_dim},
+                .constants = evk::Constant{head_dim, uint32_t(prepared)},
             });
         }
         return pipeline;
@@ -1271,7 +1277,7 @@ namespace evk::ai {
     void gated_delta_projected(Tensor& projection, Tensor& output,
                                Tensor& state_history, uint32_t model_dim,
                                uint32_t head_count, float rope_base,
-                               float decay_bias) {
+                               float decay_bias, Tensor* prepared_projection) {
         uint32_t batch_size = projection.shape[0];
         uint32_t sequence_length = projection.shape[1];
         assert(head_count > 0u && model_dim % head_count == 0u);
@@ -1283,14 +1289,30 @@ namespace evk::ai {
         assert(state_history.shape.count() ==
                batch_size * sequence_length * head_count * head_dim * head_dim);
         auto& cmd = evk::ai::GetCmd();
+        if (prepared_projection) {
+            assert(head_dim >= 2u);
+            assert(prepared_projection->shape.count() == projection.shape.count());
+            assert(prepared_projection->buffer.GetReference() != projection.buffer.GetReference());
+            cmd.bind(pipelines->gated_delta_prepare);
+            cmd.push(evk::Constant{
+                projection.buffer.GetReference(), prepared_projection->buffer.GetReference(),
+                batch_size * sequence_length, sequence_length, model_dim,
+                head_count, rope_base, decay_bias,
+            });
+            cmd.dispatch((batch_size * sequence_length * (model_dim / 2u) + 127u) / 128u, 1u, 1u);
+            cmd.computeBarrier();
+        }
         cmd.bind(head_pipeline(pipelines->gated_delta_projected,
-                               "gated_delta_projected", head_dim));
+                               "gated_delta_projected", head_dim, prepared_projection != nullptr));
         cmd.push(evk::Constant{
-            projection.buffer.GetReference(), output.buffer.GetReference(),
+            (prepared_projection ? prepared_projection->buffer : projection.buffer).GetReference(),
+            output.buffer.GetReference(),
             state_history.buffer.GetReference(), batch_size, sequence_length,
             model_dim, head_count, rope_base, decay_bias,
         });
-        uint32_t heads_per_group = 32u / head_dim;
+        uint32_t value_lanes = (head_dim + 1u) / 2u;
+        uint32_t key_groups = (std::min)(head_dim, 32u / value_lanes);
+        uint32_t heads_per_group = 32u / (value_lanes * key_groups);
         cmd.dispatch(batch_size,
                      (head_count + heads_per_group - 1u) / heads_per_group, 1u);
         cmd.computeBarrier();
@@ -1300,7 +1322,7 @@ namespace evk::ai {
         Tensor& projection, Tensor& state_history, Tensor& grad_output,
         Tensor& grad_projection, uint32_t model_dim, uint32_t head_count,
         float rope_base, float decay_bias, uint32_t backward_chunk_size,
-        Tensor* grad_state_boundaries) {
+        Tensor* grad_state_boundaries, Tensor* prepared_projection) {
         uint32_t batch_size = projection.shape[0];
         uint32_t sequence_length = projection.shape[1];
         assert(sequence_length > 0u && head_count > 0u &&
@@ -1314,15 +1336,16 @@ namespace evk::ai {
             : (std::min)(backward_chunk_size, sequence_length);
         uint32_t chunk_count =
             (sequence_length + chunk_size - 1u) / chunk_size;
-        uint32_t heads_per_group = 32u / head_dim;
+        uint32_t heads_per_group = 32u / (head_dim * head_key_groups(head_dim));
         if (chunk_count > 1u) {
             assert(grad_state_boundaries &&
                    grad_state_boundaries->shape.count() ==
                        batch_size * chunk_count * head_count * head_dim * head_dim);
             cmd.bind(head_pipeline(pipelines->gated_delta_projected_bwd_boundaries,
-                                   "gated_delta_projected_bwd_boundaries", head_dim));
+                                   "gated_delta_projected_bwd_boundaries", head_dim, prepared_projection != nullptr));
             cmd.push(evk::Constant{
-                projection.buffer.GetReference(), grad_output.buffer.GetReference(),
+                (prepared_projection ? prepared_projection->buffer : projection.buffer).GetReference(),
+                grad_output.buffer.GetReference(),
                 grad_state_boundaries->buffer.GetReference(), batch_size,
                 sequence_length, model_dim, head_count, rope_base, decay_bias,
                 chunk_size,
@@ -1333,8 +1356,9 @@ namespace evk::ai {
             cmd.computeBarrier();
         }
         cmd.bind(head_pipeline(pipelines->gated_delta_projected_bwd,
-                               "gated_delta_projected_bwd", head_dim));
+                               "gated_delta_projected_bwd", head_dim, prepared_projection != nullptr));
         cmd.push(evk::Constant{
+            (prepared_projection ? prepared_projection->buffer : projection.buffer).GetReference(),
             projection.buffer.GetReference(), state_history.buffer.GetReference(),
             grad_output.buffer.GetReference(), grad_projection.buffer.GetReference(),
             (grad_state_boundaries ? grad_state_boundaries->buffer
@@ -1342,8 +1366,9 @@ namespace evk::ai {
             batch_size, sequence_length, model_dim, head_count,
             rope_base, decay_bias, chunk_size,
         });
+        uint32_t gradient_heads_per_group = 32u / head_dim;
         cmd.dispatch(batch_size * chunk_count,
-                     (head_count + heads_per_group - 1u) / heads_per_group, 1u);
+                     (head_count + gradient_heads_per_group - 1u) / gradient_heads_per_group, 1u);
         cmd.computeBarrier();
     }
 

@@ -1505,93 +1505,112 @@ void test_gated_delta_forward_backward_and_recurrent() {
         expected_gradient[i] = (high - low) / (2.0f * epsilon);
     }
 
-    Tensor projection({B, N, P});
-    Tensor output({B, N, D});
-    Tensor history({B, N, H, Dh, Dh});
-    Tensor grad_output({B, N, D});
-    Tensor grad_projection({B, N, P});
-    upload_tensor_from_f32(projection, projection_values);
-    upload_tensor_from_f32(grad_output, grad_output_values);
-    grad_projection.fill(0.0f);
-    evk::ai::gated_delta_projected(
-        projection, output, history, D, H, rope_base, decay_bias);
-    evk::ai::gated_delta_projected_backward(
-        projection, history, grad_output, grad_projection,
-        D, H, rope_base, decay_bias);
-    output.cpu_download(false);
-    history.cpu_download(false);
-    grad_projection.cpu_download(false);
-    evk::ai::SubmitCmd(true);
-
-    bool forward_ok = true;
-    bool history_ok = true;
-    bool backward_ok = true;
-    for (uint32_t i = 0; i < expected_output.size(); ++i) {
-        forward_ok &= approx_eq(float(output.cpu()[i]), expected_output[i], 3e-2f);
-    }
-    for (uint32_t i = 0; i < expected_history.size(); ++i) {
-        history_ok &= approx_eq(float(history.cpu()[i]), expected_history[i], 3e-2f);
-    }
-    for (uint32_t i = 0; i < expected_gradient.size(); ++i) {
-        backward_ok &= approx_eq(
-            float(grad_projection.cpu()[i]), expected_gradient[i],
-            2e-3f + 2e-2f * std::abs(expected_gradient[i]));
-    }
-    TEST(forward_ok);
-    TEST(history_ok);
-    TEST(backward_ok);
-
-    Tensor chunk_gradient({B, N, P});
-    for (uint32_t chunk_size : {1u, 2u, 16u}) {
-        if (chunk_size >= N) continue;
-        uint32_t chunks = (N + chunk_size - 1u) / chunk_size;
-        Tensor boundaries({B, chunks, H, Dh, Dh});
+    for (bool prepared : {false, true}) {
+        Tensor projection({B, N, P});
+        Tensor prepared_projection({B, N, P});
+        Tensor* prepared_buffer = prepared ? &prepared_projection : nullptr;
+        Tensor output({B, N, D});
+        Tensor history({B, N, H, Dh, Dh});
+        Tensor grad_output({B, N, D});
+        Tensor grad_projection({B, N, P});
+        upload_tensor_from_f32(projection, projection_values);
+        upload_tensor_from_f32(grad_output, grad_output_values);
+        grad_projection.fill(0.0f);
+        evk::ai::gated_delta_projected(
+            projection, output, history, D, H, rope_base, decay_bias, prepared_buffer);
         evk::ai::gated_delta_projected_backward(
-            projection, history, grad_output, chunk_gradient,
-            D, H, rope_base, decay_bias, chunk_size, &boundaries);
-        chunk_gradient.cpu_download();
-        bool chunk_ok = true;
-        float max_error = 0.0f;
-        for (uint32_t i = 0; i < expected_gradient.size(); ++i) {
-            float reference = float(grad_projection.cpu()[i]);
-            float actual = float(chunk_gradient.cpu()[i]);
-            max_error = (std::max)(max_error, std::abs(actual - reference));
-            chunk_ok &= approx_eq(actual, reference,
-                                  5e-4f + 5e-3f * std::abs(reference));
-            chunk_ok &= approx_eq(actual, expected_gradient[i],
-                                  2e-3f + 2e-2f * std::abs(expected_gradient[i]));
-        }
-        printf("  chunk %u max gradient error vs unchunked: %.7f\n", chunk_size, max_error);
-        TEST(chunk_ok);
-    }
+            projection, history, grad_output, grad_projection,
+            D, H, rope_base, decay_bias, 0u, nullptr, prepared_buffer);
+        output.cpu_download(false);
+        history.cpu_download(false);
+        grad_projection.cpu_download(false);
+        evk::ai::SubmitCmd(true);
 
-    Tensor step_projection({B, 1u, P});
-    Tensor positions({B, 1u});
-    Tensor step_output({B, 1u, D});
-    Tensor state({B, H, Dh, Dh});
-    state.fill(0.0f);
-    bool recurrent_ok = true;
-    for (uint32_t position = 0; position < N; ++position) {
-        for (uint32_t batch = 0; batch < B; ++batch) {
-            std::copy_n(projection.cpu() + (batch * N + position) * P,
-                        P, step_projection.cpu() + batch * P);
-            positions.cpu()[batch].value = uint16_t(position);
+        bool forward_ok = true;
+        bool history_ok = true;
+        bool backward_ok = true;
+        for (uint32_t i = 0; i < expected_output.size(); ++i) {
+            forward_ok &= approx_eq(float(output.cpu()[i]), expected_output[i], 3e-2f);
         }
-        step_projection.cpu_upload();
-        positions.cpu_upload();
-        evk::ai::gated_delta_projected_step(
-            step_projection, positions, state, step_output,
-            H, rope_base, decay_bias);
-        step_output.cpu_download();
-        for (uint32_t batch = 0; batch < B; ++batch) {
-            for (uint32_t feature = 0; feature < D; ++feature) {
-                recurrent_ok &= approx_eq(
-                    float(step_output.cpu()[batch * D + feature]),
-                    float(output.cpu()[(batch * N + position) * D + feature]), 4e-2f);
+        for (uint32_t i = 0; i < expected_history.size(); ++i) {
+            history_ok &= approx_eq(float(history.cpu()[i]), expected_history[i], 3e-2f);
+        }
+        for (uint32_t i = 0; i < expected_gradient.size(); ++i) {
+            backward_ok &= approx_eq(
+                float(grad_projection.cpu()[i]), expected_gradient[i],
+                2e-3f + 2e-2f * std::abs(expected_gradient[i]));
+        }
+        TEST(forward_ok);
+        TEST(history_ok);
+        TEST(backward_ok);
+
+        Tensor chunk_gradient({B, N, P});
+        for (uint32_t chunk_size : {1u, 2u, 16u}) {
+            if (chunk_size >= N) continue;
+            uint32_t chunks = (N + chunk_size - 1u) / chunk_size;
+            Tensor boundaries({B, chunks, H, Dh, Dh});
+            evk::ai::gated_delta_projected_backward(
+                projection, history, grad_output, chunk_gradient,
+                D, H, rope_base, decay_bias, chunk_size, &boundaries, prepared_buffer);
+            chunk_gradient.cpu_download();
+            bool chunk_ok = true;
+            float max_error = 0.0f;
+            for (uint32_t i = 0; i < expected_gradient.size(); ++i) {
+                float reference = float(grad_projection.cpu()[i]);
+                float actual = float(chunk_gradient.cpu()[i]);
+                max_error = (std::max)(max_error, std::abs(actual - reference));
+                chunk_ok &= approx_eq(actual, reference,
+                                      5e-4f + 5e-3f * std::abs(reference));
+                chunk_ok &= approx_eq(actual, expected_gradient[i],
+                                      2e-3f + 2e-2f * std::abs(expected_gradient[i]));
+            }
+            printf("  chunk %u max gradient error vs unchunked: %.7f\n", chunk_size, max_error);
+            TEST(chunk_ok);
+            if (prepared) {
+                Graph graph;
+                Tensor& graph_projection = graph.tensor({B, N, P});
+                upload_tensor_from_f32(graph_projection, projection_values);
+                Tensor& graph_output = graph.gated_delta_projected(
+                    graph_projection, D, H, rope_base, decay_bias, chunk_size);
+                graph.eval();
+                upload_tensor_from_f32(graph_output.grad(), grad_output_values);
+                graph_output.backward_fn();
+                graph_projection.grad().cpu_download();
+                bool graph_ok = true;
+                for (uint32_t i = 0; i < expected_gradient.size(); ++i)
+                    graph_ok &= graph_projection.grad().cpu()[i].value == chunk_gradient.cpu()[i].value;
+                TEST(graph_ok);
             }
         }
+
+        Tensor step_projection({B, 1u, P});
+        Tensor positions({B, 1u});
+        Tensor step_output({B, 1u, D});
+        Tensor state({B, H, Dh, Dh});
+        state.fill(0.0f);
+        bool recurrent_ok = true;
+        for (uint32_t position = 0; position < N; ++position) {
+            for (uint32_t batch = 0; batch < B; ++batch) {
+                std::copy_n(projection.cpu() + (batch * N + position) * P,
+                            P, step_projection.cpu() + batch * P);
+                positions.cpu()[batch].value = uint16_t(position);
+            }
+            step_projection.cpu_upload();
+            positions.cpu_upload();
+            evk::ai::gated_delta_projected_step(
+                step_projection, positions, state, step_output,
+                H, rope_base, decay_bias);
+            step_output.cpu_download();
+            for (uint32_t batch = 0; batch < B; ++batch) {
+                for (uint32_t feature = 0; feature < D; ++feature) {
+                    recurrent_ok &= approx_eq(
+                        float(step_output.cpu()[batch * D + feature]),
+                        float(output.cpu()[(batch * N + position) * D + feature]), 4e-2f);
+                }
+            }
+        }
+        TEST(recurrent_ok);
     }
-    TEST(recurrent_ok);
 }
 
 template<uint32_t D = 8u>

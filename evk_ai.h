@@ -614,16 +614,21 @@ namespace evk::ai {
                                     uint32_t head_count,
                                     float rope_base = 10000.0f,
                                     float decay_bias = -4.0f);
+    // Optional FP16 cache, shaped like projection, for heads of dimension >= 2.
+    // Forward stores normalized Q/K, prediction errors and gates; backward
+    // must receive the same cache. The projection itself remains unchanged.
     void gated_delta_projected(Tensor& projection, Tensor& output,
                                Tensor& state_history, uint32_t model_dim,
                                uint32_t head_count, float rope_base = 10000.0f,
-                               float decay_bias = -4.0f);
+                               float decay_bias = -4.0f,
+                               Tensor* prepared_projection = nullptr);
     void gated_delta_projected_backward(
         Tensor& projection, Tensor& state_history, Tensor& grad_output,
         Tensor& grad_projection, uint32_t model_dim, uint32_t head_count,
         float rope_base = 10000.0f, float decay_bias = -4.0f,
         uint32_t backward_chunk_size = 0u,
-        Tensor* grad_state_boundaries = nullptr);
+        Tensor* grad_state_boundaries = nullptr,
+        Tensor* prepared_projection = nullptr);
 
     // Rotary position encoding over the last dimension.
     // input, out: (B, N, D), D must be even.
@@ -1042,6 +1047,11 @@ struct Graph {
         nodes.push_back(std::make_unique<Tensor>(Shape(
             {batch_size, sequence_length, head_count, head_dim, head_dim})));
         Tensor& state_history = *nodes.back();
+        Tensor* prepared_projection = nullptr;
+        if (head_dim >= 2u) {
+            nodes.push_back(std::make_unique<Tensor>(projection.shape));
+            prepared_projection = nodes.back().get();
+        }
         Tensor* grad_state_boundaries = nullptr;
         if (backward_chunk_size > 0u && backward_chunk_size < sequence_length) {
             uint32_t chunk_count =
@@ -1052,18 +1062,18 @@ struct Graph {
             grad_state_boundaries = nodes.back().get();
         }
         out.forward_fn = [&projection, &out, &state_history, model_dim,
-                          head_count, rope_base, decay_bias]() {
+                          head_count, rope_base, decay_bias, prepared_projection]() {
             evk::ai::gated_delta_projected(
                 projection, out, state_history, model_dim, head_count,
-                rope_base, decay_bias);
+                rope_base, decay_bias, prepared_projection);
         };
         out.backward_fn = [&projection, &out, &state_history, model_dim,
                            head_count, rope_base, decay_bias,
-                           backward_chunk_size, grad_state_boundaries]() {
+                           backward_chunk_size, grad_state_boundaries, prepared_projection]() {
             evk::ai::gated_delta_projected_backward(
                 projection, state_history, out.grad(), projection.grad(),
                 model_dim, head_count, rope_base, decay_bias,
-                backward_chunk_size, grad_state_boundaries);
+                backward_chunk_size, grad_state_boundaries, prepared_projection);
         };
         return out;
     }

@@ -5,11 +5,14 @@
 #extension GL_EXT_buffer_reference : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_control_flow_attributes : enable
 
 layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+layout(buffer_reference, buffer_reference_align = 8) buffer BufferFp16x4 { f16vec4 x[]; };
 
 PUSH(
     BufferFp16 projectionBuffer;
+    BufferFp16 rawProjectionBuffer;
     BufferFp16 stateHistoryBuffer;
     BufferFp16 gradOutputBuffer;
     BufferFp16 gradProjectionBuffer;
@@ -24,18 +27,10 @@ PUSH(
 )
 
 CONSTANT(0) uint headDim = 4u;
+CONSTANT(1) bool isPrepared = false;
 
-uint historyIndex(uint row, uint head, uint headDim,
-                  uint keyFeature, uint valueFeature) {
+uint historyIndex(uint row, uint head, uint headDim, uint keyFeature, uint valueFeature) {
     return ((((row * headCount + head) * headDim + keyFeature) * headDim) + valueFeature);
-}
-
-float previousState(uint batch, uint position, uint head, uint headDim,
-                    uint keyFeature, uint valueFeature) {
-    if (position == 0u) return 0.0;
-    uint row = batch * sequenceLength + position - 1u;
-    return float(stateHistoryBuffer.x[
-        historyIndex(row, head, headDim, keyFeature, valueFeature)]);
 }
 
 float headSum(float value, uint headDim) {
@@ -60,121 +55,216 @@ void main() {
     uint projectionStride = 3u * modelDim + 2u * headCount;
     bool isActive = batch < batchSize && head < headCount;
 
-    // One value column per lane. History and chunk boundaries remain FP16.
+    // One key row per lane; saved history and prefetched values remain FP16.
     float gradient[headDim];
-    for (uint k = 0u; k < headDim; ++k) {
+    for (uint i = 0u; i < headDim; ++i) {
+        uint k = i;
         uint index = ((batch * chunkCount + chunk) * headCount + head) * headDim * headDim +
-                     k * headDim + feature;
-        gradient[k] = isActive && chunkCount > 1u
-            ? float(gradStateBoundaryBuffer.x[index]) : 0.0;
+                     feature * headDim + k;
+        gradient[i] = isActive && chunkCount > 1u ? float(gradStateBoundaryBuffer.x[index]) : 0.0;
     }
 
     uint chunkBegin = chunk * chunkSize;
     uint chunkEnd = min(sequenceLength, chunkBegin + chunkSize);
-    for (uint reversePosition = chunkEnd; reversePosition > chunkBegin; --reversePosition) {
-        uint position = reversePosition - 1u;
-        uint row = batch * sequenceLength + position;
-        uint projectionStart = row * projectionStride;
-        uint vectorStart = row * modelDim + head * headDim;
-        uint gateIndex = projectionStart + 3u * modelDim + head;
-        uint pair = globalFeature / 2u;
-        float angle = float(position) * pow(ropeBase, -2.0 * float(pair) / float(modelDim));
-        float c = cos(angle);
-        float s = sin(angle);
-        float rawQuery = isActive
-            ? float(projectionBuffer.x[projectionStart + globalFeature]) : 0.0;
-        float rawKey = isActive
-            ? float(projectionBuffer.x[projectionStart + modelDim + globalFeature]) : 0.0;
-        float pairedQuery = subgroupShuffleXor(rawQuery, 1u);
-        float pairedKey = subgroupShuffleXor(rawKey, 1u);
-        float rotatedQuery = (feature & 1u) == 0u
-            ? rawQuery * c - pairedQuery * s
-            : pairedQuery * s + rawQuery * c;
-        float rotatedKey = (feature & 1u) == 0u
-            ? rawKey * c - pairedKey * s
-            : pairedKey * s + rawKey * c;
-        rotatedQuery = float(float16_t(rotatedQuery));
-        rotatedKey = float(float16_t(rotatedKey));
-        float inverseQueryNorm = inversesqrt(
-            headSum(rotatedQuery * rotatedQuery, headDim) + 1.0e-6);
-        float inverseKeyNorm = inversesqrt(
-            headSum(rotatedKey * rotatedKey, headDim) + 1.0e-6);
-        float normalizedQuery = rotatedQuery * inverseQueryNorm;
-        float normalizedKey = rotatedKey * inverseKeyNorm;
-        float decayValue = isActive
-            ? 1.0 / (1.0 + exp(float(projectionBuffer.x[gateIndex]) + decayBias))
-            : 0.0;
-        float writeValue = isActive
-            ? 1.0 / (1.0 + exp(-float(projectionBuffer.x[gateIndex + headCount])))
-            : 0.0;
-        float outputGradient = isActive
-            ? float(gradOutputBuffer.x[vectorStart + feature]) : 0.0;
+    for (uint reversePosition = chunkEnd; reversePosition > chunkBegin;) {
+        uint count = min(2u, reversePosition - chunkBegin);
+        float16_t inputs[20];
+        float16_t histories[3u * headDim];
+        [[unroll]] for (uint step = 0u; step < 2u; ++step) {
+            uint inputRow = batch * sequenceLength + reversePosition - 1u - step;
+            uint inputStart = inputRow * projectionStride;
+            uint inputGate = inputStart + 3u * modelDim + head;
+            bool loadValue = isActive && step < count;
+            inputs[step * 10u] =
+                loadValue ? projectionBuffer.x[inputStart + globalFeature] : float16_t(0.0);
+            inputs[step * 10u + 1u] =
+                loadValue ? projectionBuffer.x[inputStart + modelDim + globalFeature]
+                          : float16_t(0.0);
+            inputs[step * 10u + 2u] =
+                loadValue ? projectionBuffer.x[inputStart + 2u * modelDim + globalFeature]
+                          : float16_t(0.0);
+            inputs[step * 10u + 3u] = loadValue ? projectionBuffer.x[inputGate] : float16_t(0.0);
+            inputs[step * 10u + 4u] =
+                loadValue ? projectionBuffer.x[inputGate + headCount] : float16_t(0.0);
+            inputs[step * 10u + 5u] = loadValue
+                                          ? gradOutputBuffer.x[inputRow * modelDim + globalFeature]
+                                          : float16_t(0.0);
+            if (isPrepared) {
+                inputs[step * 10u + 6u] =
+                    loadValue ? rawProjectionBuffer.x[inputStart + globalFeature] : float16_t(0.0);
+                inputs[step * 10u + 7u] =
+                    loadValue ? rawProjectionBuffer.x[inputStart + modelDim + globalFeature]
+                              : float16_t(0.0);
+                inputs[step * 10u + 8u] =
+                    loadValue ? rawProjectionBuffer.x[inputGate] : float16_t(0.0);
+                inputs[step * 10u + 9u] =
+                    loadValue ? rawProjectionBuffer.x[inputGate + headCount] : float16_t(0.0);
+            }
+        }
+        [[unroll]] for (uint step = 0u; step < 3u; ++step) {
+            uint rowIndex = batch * sequenceLength + reversePosition - 1u - step;
+            bool loadHistory =
+                isActive && step <= count && reversePosition > step && (!isPrepared || step > 0u);
+            if (headDim >= 4u) {
+                [[unroll]] for (uint i = 0u; i < headDim; i += 4u) {
+                    uint value = i;
+                    uint index = historyIndex(rowIndex, head, headDim, feature, value);
+                    f16vec4 packed =
+                        loadHistory ? BufferFp16x4(stateHistoryBuffer).x[index / 4u] : f16vec4(0.0);
+                    histories[step * headDim + i] = packed.x;
+                    histories[step * headDim + i + 1u] = packed.y;
+                    histories[step * headDim + i + 2u] = packed.z;
+                    histories[step * headDim + i + 3u] = packed.w;
+                }
+            } else {
+                [[unroll]] for (uint i = 0u; i < headDim; ++i) {
+                    uint value = i;
+                    histories[step * headDim + i] =
+                        loadHistory ? stateHistoryBuffer
+                                          .x[historyIndex(rowIndex, head, headDim, feature, value)]
+                                    : float16_t(0.0);
+                }
+            }
+        }
+        [[unroll]] for (uint step = 0u; step < 2u; ++step) {
+            if (step < count) {
+                uint position = reversePosition - 1u - step;
+                uint row = batch * sequenceLength + position;
+                uint projectionStart = row * projectionStride;
+                uint vectorStart = row * modelDim + head * headDim;
+                uint gateIndex = projectionStart + 3u * modelDim + head;
+                uint pair = globalFeature / 2u;
+                float angle = float(position) * pow(ropeBase, -2.0 * float(pair) / float(modelDim));
+                float c = cos(angle);
+                float s = sin(angle);
+                float rawQuery = isActive ? float(inputs[step * 10u]) : 0.0;
+                float rawKey = isActive ? float(inputs[step * 10u + 1u]) : 0.0;
+                float normalizedQuery, normalizedKey, decayValue, writeValue, inverseQueryNorm,
+                    inverseKeyNorm;
+                float gradientQuery, gradientKey, derivativeDecay, derivativeWrite;
+                if (isPrepared) {
+                    normalizedQuery = rawQuery;
+                    normalizedKey = rawKey;
+                    decayValue = isActive ? float(inputs[step * 10u + 3u]) : 0.0;
+                    writeValue = isActive ? float(inputs[step * 10u + 4u]) : 0.0;
+                    float q = float(inputs[step * 10u + 6u]);
+                    float k = float(inputs[step * 10u + 7u]);
+                    float pairedQ = subgroupShuffleXor(q, 1u), pairedK = subgroupShuffleXor(k, 1u);
+                    q = float(float16_t((feature & 1u) == 0u ? q * c - pairedQ * s
+                                                             : pairedQ * s + q * c));
+                    k = float(float16_t((feature & 1u) == 0u ? k * c - pairedK * s
+                                                             : pairedK * s + k * c));
+                    inverseQueryNorm = inversesqrt(headSum(q * q, headDim) + 1.0e-6);
+                    inverseKeyNorm = inversesqrt(headSum(k * k, headDim) + 1.0e-6);
+                    gradientQuery = q * inverseQueryNorm;
+                    gradientKey = k * inverseKeyNorm;
+                    derivativeDecay = 1.0 / (1.0 + exp(float(inputs[step * 10u + 8u]) + decayBias));
+                    derivativeWrite = 1.0 / (1.0 + exp(-float(inputs[step * 10u + 9u])));
+                } else {
+                    float pairedQuery = subgroupShuffleXor(rawQuery, 1u);
+                    float pairedKey = subgroupShuffleXor(rawKey, 1u);
+                    float rotatedQuery = (feature & 1u) == 0u ? rawQuery * c - pairedQuery * s
+                                                              : pairedQuery * s + rawQuery * c;
+                    float rotatedKey = (feature & 1u) == 0u ? rawKey * c - pairedKey * s
+                                                            : pairedKey * s + rawKey * c;
+                    rotatedQuery = float(float16_t(rotatedQuery));
+                    rotatedKey = float(float16_t(rotatedKey));
+                    inverseQueryNorm =
+                        inversesqrt(headSum(rotatedQuery * rotatedQuery, headDim) + 1.0e-6);
+                    inverseKeyNorm =
+                        inversesqrt(headSum(rotatedKey * rotatedKey, headDim) + 1.0e-6);
+                    normalizedQuery = rotatedQuery * inverseQueryNorm;
+                    normalizedKey = rotatedKey * inverseKeyNorm;
+                    decayValue = isActive
+                                     ? 1.0 / (1.0 + exp(float(inputs[step * 10u + 3u]) + decayBias))
+                                     : 0.0;
+                    writeValue =
+                        isActive ? 1.0 / (1.0 + exp(-float(inputs[step * 10u + 4u]))) : 0.0;
+                    gradientQuery = normalizedQuery;
+                    gradientKey = normalizedKey;
+                    derivativeDecay = decayValue;
+                    derivativeWrite = writeValue;
+                }
 
-        float queryGradient = 0.0;
-        float predicted = 0.0;
-        float readGradientValue = 0.0;
-        float previous[headDim];
-        for (uint k = 0u; k < headDim; ++k) {
-            float current = isActive ? float(stateHistoryBuffer.x[
-                historyIndex(row, head, headDim, k, feature)]) : 0.0;
-            float dq = headSum(current * outputGradient, headDim);
-            if (feature == k) queryGradient = dq;
-            float headKey = subgroupShuffle(normalizedKey, localBase + k);
-            gradient[k] += subgroupShuffle(normalizedQuery, localBase + k) * outputGradient;
-            previous[k] = isActive
-                ? previousState(batch, position, head, headDim, k, feature) : 0.0;
-            predicted += headKey * decayValue * previous[k];
-            readGradientValue += gradient[k] * headKey;
-        }
-        float errorValue = isActive ? float(projectionBuffer.x[
-            projectionStart + 2u * modelDim + globalFeature]) - predicted : 0.0;
-        float updateGradient = writeValue * readGradientValue;
-        if (isActive) {
-            gradProjectionBuffer.x[projectionStart + 2u * modelDim + globalFeature] =
-                float16_t(updateGradient);
-        }
+                float outputGradient = isActive ? float(inputs[step * 10u + 5u]) : 0.0;
 
-        float keyGradient = 0.0;
-        float rowReduction = 0.0;
-        for (uint k = 0u; k < headDim; ++k) {
-            float dk = headSum(writeValue * gradient[k] * errorValue -
-                               decayValue * previous[k] * updateGradient, headDim);
-            if (feature == k) keyGradient = dk;
-            gradient[k] -= subgroupShuffle(normalizedKey, localBase + k) * updateGradient;
-            rowReduction += gradient[k] * previous[k];
-            gradient[k] *= decayValue;
-        }
+                float savedValue = isActive ? float(inputs[step * 10u + 2u]) : 0.0;
+                float queryGradient = 0.0;
+                float predicted = 0.0;
+                float readGradientValue = 0.0;
+                float previous[headDim];
+                for (uint i = 0u; i < headDim; ++i) {
+                    uint v = i;
+                    float dy = subgroupShuffle(outputGradient, localBase + v);
+                    previous[i] = isActive ? float(histories[(step + 1u) * headDim + i]) : 0.0;
+                    float current = isPrepared
+                                        ? decayValue * previous[i] +
+                                              normalizedKey * writeValue *
+                                                  subgroupShuffle(savedValue, localBase + v)
+                                        : (isActive ? float(histories[step * headDim + i]) : 0.0);
+                    queryGradient += current * dy;
+                    gradient[i] += normalizedQuery * dy;
+                    float read = headSum(normalizedKey * gradient[i], headDim);
+                    if (feature == v)
+                        readGradientValue = read;
+                    if (!isPrepared) {
+                        float prediction =
+                            headSum(normalizedKey * decayValue * previous[i], headDim);
+                        if (feature == v)
+                            predicted = prediction;
+                    }
+                }
+                float errorValue = isPrepared ? savedValue : savedValue - predicted;
+                float updateGradient = writeValue * readGradientValue;
+                if (isActive)
+                    gradProjectionBuffer.x[projectionStart + 2u * modelDim + globalFeature] =
+                        float16_t(updateGradient);
 
-        float gradWrite = headSum(readGradientValue * errorValue, headDim);
-        float gradDecay = headSum(rowReduction, headDim);
-        float queryGradDot = headSum(queryGradient * normalizedQuery, headDim);
-        float keyGradDot = headSum(keyGradient * normalizedKey, headDim);
-        if (isActive && feature == 0u) {
-            gradProjectionBuffer.x[gateIndex] = float16_t(
-                gradDecay * (-decayValue * (1.0 - decayValue)));
-            gradProjectionBuffer.x[gateIndex + headCount] = float16_t(
-                gradWrite * writeValue * (1.0 - writeValue));
-        }
+                float keyGradient = 0.0;
+                float rowReduction = 0.0;
+                for (uint i = 0u; i < headDim; ++i) {
+                    uint v = i;
+                    float update = subgroupShuffle(updateGradient, localBase + v);
+                    keyGradient +=
+                        writeValue * gradient[i] * subgroupShuffle(errorValue, localBase + v) -
+                        decayValue * previous[i] * update;
+                    gradient[i] -= normalizedKey * update;
+                    rowReduction += gradient[i] * previous[i];
+                    gradient[i] *= decayValue;
+                }
+                float gradWrite = headSum(readGradientValue * errorValue, headDim);
+                float gradDecay = headSum(rowReduction, headDim);
+                float queryGradDot = headSum(queryGradient * gradientQuery, headDim);
+                float keyGradDot = headSum(keyGradient * gradientKey, headDim);
+                if (isActive && feature == 0u) {
+                    gradProjectionBuffer.x[gateIndex] =
+                        float16_t(gradDecay * (-derivativeDecay * (1.0 - derivativeDecay)));
+                    gradProjectionBuffer.x[gateIndex + headCount] =
+                        float16_t(gradWrite * derivativeWrite * (1.0 - derivativeWrite));
+                }
 
-        float rotatedQueryGradient = inverseQueryNorm *
-            (queryGradient - normalizedQuery * queryGradDot);
-        float rotatedKeyGradient = inverseKeyNorm *
-            (keyGradient - normalizedKey * keyGradDot);
-        rotatedQueryGradient = float(float16_t(rotatedQueryGradient));
-        rotatedKeyGradient = float(float16_t(rotatedKeyGradient));
-        float pairedQueryGradient = subgroupShuffleXor(rotatedQueryGradient, 1u);
-        float pairedKeyGradient = subgroupShuffleXor(rotatedKeyGradient, 1u);
-        if (isActive) {
-            float rawQueryGradient = (feature & 1u) == 0u
-                ? rotatedQueryGradient * c + pairedQueryGradient * s
-                : -pairedQueryGradient * s + rotatedQueryGradient * c;
-            float rawKeyGradient = (feature & 1u) == 0u
-                ? rotatedKeyGradient * c + pairedKeyGradient * s
-                : -pairedKeyGradient * s + rotatedKeyGradient * c;
-            gradProjectionBuffer.x[projectionStart + globalFeature] =
-                float16_t(rawQueryGradient);
-            gradProjectionBuffer.x[projectionStart + modelDim + globalFeature] =
-                float16_t(rawKeyGradient);
+                float rotatedQueryGradient =
+                    inverseQueryNorm * (queryGradient - gradientQuery * queryGradDot);
+                float rotatedKeyGradient =
+                    inverseKeyNorm * (keyGradient - gradientKey * keyGradDot);
+                rotatedQueryGradient = float(float16_t(rotatedQueryGradient));
+                rotatedKeyGradient = float(float16_t(rotatedKeyGradient));
+                float pairedQueryGradient = subgroupShuffleXor(rotatedQueryGradient, 1u);
+                float pairedKeyGradient = subgroupShuffleXor(rotatedKeyGradient, 1u);
+                if (isActive) {
+                    float rawQueryGradient =
+                        (feature & 1u) == 0u ? rotatedQueryGradient * c + pairedQueryGradient * s
+                                             : -pairedQueryGradient * s + rotatedQueryGradient * c;
+                    float rawKeyGradient = (feature & 1u) == 0u
+                                               ? rotatedKeyGradient * c + pairedKeyGradient * s
+                                               : -pairedKeyGradient * s + rotatedKeyGradient * c;
+                    gradProjectionBuffer.x[projectionStart + globalFeature] =
+                        float16_t(rawQueryGradient);
+                    gradProjectionBuffer.x[projectionStart + modelDim + globalFeature] =
+                        float16_t(rawKeyGradient);
+                }
+            }
         }
+        reversePosition -= count;
     }
 }
