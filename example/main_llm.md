@@ -30,7 +30,7 @@ FP16 K/V cache grows linearly with sequence length.
 ## Gated DeltaNet
 
 The Gated DeltaNet also uses eight residual blocks and exactly 4,268,032
-trainable parameters. Each layer has 64 four-dimensional heads and a 448-wide
+trainable parameters. Each layer has 16 sixteen-dimensional heads and a 496-wide
 feed-forward path. The recurrent update is:
 
 ```text
@@ -41,7 +41,7 @@ o[t]  = q[t]^T * S[t]
 ```
 
 Q and K are L2-normalized and receive RoPE before the state update. Across all
-eight layers, recurrent state occupies 16 KiB of FP16 storage per sequence and
+eight layers, recurrent state occupies 64 KiB of FP16 storage per sequence and
 does not grow with context length.
 
 Training uses an exact reverse state-gradient scan to supply FP16 boundaries
@@ -63,7 +63,7 @@ updates.
 
 `--llm-gdn-heads` accepts 8, 16, 32, or 64
 (head dimensions 32, 16, 8, or 4). `--llm-gdn-hidden` sets the FFN width,
-a positive multiple of 16. Defaults remain 64 heads and FFN width 448.
+a positive multiple of 16. Defaults are 16 heads and FFN width 496.
 `--llm-seed` sets parameter initialization (default 42), not the data stream.
 `--llm-output` selects a separate output directory; files there are overwritten.
 For example, this tests dimension 16 at the baseline parameter count:

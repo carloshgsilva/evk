@@ -1008,8 +1008,8 @@ void main_llm(int argc, char** argv) {
     constexpr uint32_t kModelDim = 256;
     constexpr uint32_t kLayerCount = 8;
     constexpr uint32_t kAttentionHiddenDim = 512;
-    uint32_t gated_delta_heads = parse_uint_arg(argc, argv, "--llm-gdn-heads", 64);
-    uint32_t gated_delta_hidden = parse_uint_arg(argc, argv, "--llm-gdn-hidden", 448);
+    uint32_t gated_delta_heads = parse_uint_arg(argc, argv, "--llm-gdn-heads", 16);
+    uint32_t gated_delta_hidden = parse_uint_arg(argc, argv, "--llm-gdn-hidden", 496);
     uint32_t parameter_seed = parse_uint_arg(argc, argv, "--llm-seed", 42);
     if ((gated_delta_heads != 8u && gated_delta_heads != 16u &&
          gated_delta_heads != 32u && gated_delta_heads != 64u) ||
