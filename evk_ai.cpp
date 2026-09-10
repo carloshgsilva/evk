@@ -1,5 +1,6 @@
 #include "evk_ai.h"
 
+#include <bit>
 #include <stdexcept>
 #include <string_view>
 
@@ -68,9 +69,9 @@ namespace evk::ai {
         evk::Pipeline position_add;
         evk::Pipeline position_add_bwd;
         evk::Pipeline gated_delta_projected_step;
-        evk::Pipeline gated_delta_projected;
-        evk::Pipeline gated_delta_projected_bwd_boundaries;
-        evk::Pipeline gated_delta_projected_bwd;
+        evk::Pipeline gated_delta_projected[6];
+        evk::Pipeline gated_delta_projected_bwd_boundaries[6];
+        evk::Pipeline gated_delta_projected_bwd[6];
         evk::Pipeline rope;
         evk::Pipeline rope_bwd;
         evk::Pipeline causal_mask;
@@ -270,12 +271,6 @@ namespace evk::ai {
         pipelines->position_add_bwd = create_named_compute_pipeline("position_add_bwd");
         pipelines->gated_delta_projected_step =
             create_named_compute_pipeline("gated_delta_projected_step");
-        pipelines->gated_delta_projected =
-            create_named_compute_pipeline("gated_delta_projected");
-        pipelines->gated_delta_projected_bwd_boundaries =
-            create_named_compute_pipeline("gated_delta_projected_bwd_boundaries");
-        pipelines->gated_delta_projected_bwd =
-            create_named_compute_pipeline("gated_delta_projected_bwd");
         pipelines->rope = create_named_compute_pipeline("rope");
         pipelines->rope_bwd = create_named_compute_pipeline("rope_bwd");
         pipelines->causal_mask = create_named_compute_pipeline("causal_mask");
@@ -1259,6 +1254,20 @@ namespace evk::ai {
         cmd.computeBarrier();
     }
 
+    static evk::Pipeline& head_pipeline(evk::Pipeline (&variants)[6],
+                                        const char* name, uint32_t head_dim) {
+        assert(head_dim > 0u && head_dim <= 32u && std::has_single_bit(head_dim));
+        auto& pipeline = variants[std::countr_zero(head_dim)];
+        if (!pipeline) {
+            pipeline = evk::CreatePipeline({
+                .name = name,
+                .CS = detail::load_embedded_shader(name),
+                .constants = evk::Constant{head_dim},
+            });
+        }
+        return pipeline;
+    }
+
     void gated_delta_projected(Tensor& projection, Tensor& output,
                                Tensor& state_history, uint32_t model_dim,
                                uint32_t head_count, float rope_base,
@@ -1274,7 +1283,8 @@ namespace evk::ai {
         assert(state_history.shape.count() ==
                batch_size * sequence_length * head_count * head_dim * head_dim);
         auto& cmd = evk::ai::GetCmd();
-        cmd.bind(pipelines->gated_delta_projected);
+        cmd.bind(head_pipeline(pipelines->gated_delta_projected,
+                               "gated_delta_projected", head_dim));
         cmd.push(evk::Constant{
             projection.buffer.GetReference(), output.buffer.GetReference(),
             state_history.buffer.GetReference(), batch_size, sequence_length,
@@ -1309,7 +1319,8 @@ namespace evk::ai {
             assert(grad_state_boundaries &&
                    grad_state_boundaries->shape.count() ==
                        batch_size * chunk_count * head_count * head_dim * head_dim);
-            cmd.bind(pipelines->gated_delta_projected_bwd_boundaries);
+            cmd.bind(head_pipeline(pipelines->gated_delta_projected_bwd_boundaries,
+                                   "gated_delta_projected_bwd_boundaries", head_dim));
             cmd.push(evk::Constant{
                 projection.buffer.GetReference(), grad_output.buffer.GetReference(),
                 grad_state_boundaries->buffer.GetReference(), batch_size,
@@ -1321,7 +1332,8 @@ namespace evk::ai {
                          1u);
             cmd.computeBarrier();
         }
-        cmd.bind(pipelines->gated_delta_projected_bwd);
+        cmd.bind(head_pipeline(pipelines->gated_delta_projected_bwd,
+                               "gated_delta_projected_bwd", head_dim));
         cmd.push(evk::Constant{
             projection.buffer.GetReference(), state_history.buffer.GetReference(),
             grad_output.buffer.GetReference(), grad_projection.buffer.GetReference(),

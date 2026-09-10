@@ -21,7 +21,7 @@ PUSH(
     uint chunkSize;
 )
 
-const uint MAX_HEAD_DIM = 32u;
+CONSTANT(0) uint headDim = 4u;
 
 float headSum(float value, uint headDim) {
     for (uint offset = headDim / 2u; offset > 0u; offset >>= 1u) {
@@ -34,7 +34,6 @@ COMPUTE(32, 1, 1)
 void main() {
     uint batch = gl_WorkGroupID.x;
     uint lane = gl_LocalInvocationID.x;
-    uint headDim = modelDim / headCount;
     uint head = gl_WorkGroupID.y * (32u / headDim) + lane / headDim;
     uint feature = lane % headDim;
     uint localBase = (lane / headDim) * headDim;
@@ -44,7 +43,7 @@ void main() {
     bool isActive = batch < batchSize && head < headCount;
 
     // One row of the state adjoint per lane, accumulated temporarily in FP32.
-    float gradient[MAX_HEAD_DIM];
+    float gradient[headDim];
     for (uint v = 0u; v < headDim; ++v) gradient[v] = 0.0;
 
     for (uint reverseChunk = chunkCount; reverseChunk > 0u; --reverseChunk) {

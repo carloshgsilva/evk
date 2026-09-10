@@ -6,8 +6,6 @@
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 
-#define SYNC_SHARED() { subgroupMemoryBarrierShared(); subgroupBarrier(); }
-
 layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 
 PUSH(
@@ -25,14 +23,7 @@ PUSH(
     uint chunkSize;
 )
 
-const uint MAX_HEAD_DIM = 32u;
-const uint WORKGROUP_WIDTH = 32u;
-shared float gradState[WORKGROUP_WIDTH * MAX_HEAD_DIM];
-
-uint localStateIndex(uint localHead, uint headDim,
-                     uint keyFeature, uint valueFeature) {
-    return localHead * headDim * headDim + keyFeature * headDim + valueFeature;
-}
+CONSTANT(0) uint headDim = 4u;
 
 uint historyIndex(uint row, uint head, uint headDim,
                   uint keyFeature, uint valueFeature) {
@@ -60,8 +51,7 @@ void main() {
     uint batch = gl_WorkGroupID.x / chunkCount;
     uint chunk = gl_WorkGroupID.x % chunkCount;
     uint lane = gl_LocalInvocationID.x;
-    uint headDim = modelDim / headCount;
-    uint headsPerGroup = WORKGROUP_WIDTH / headDim;
+    uint headsPerGroup = 32u / headDim;
     uint localHead = lane / headDim;
     uint feature = lane % headDim;
     uint head = gl_WorkGroupID.y * headsPerGroup + localHead;
@@ -70,18 +60,14 @@ void main() {
     uint projectionStride = 3u * modelDim + 2u * headCount;
     bool isActive = batch < batchSize && head < headCount;
 
-    if (isActive) {
-        for (uint valueFeature = 0u; valueFeature < headDim; ++valueFeature) {
-            uint stateIndex = localStateIndex(
-                localHead, headDim, feature, valueFeature);
-            uint boundaryIndex =
-                ((((batch * chunkCount + chunk) * headCount + head) * headDim +
-                   feature) * headDim + valueFeature);
-            gradState[stateIndex] = chunkCount > 1u
-                ? float(gradStateBoundaryBuffer.x[boundaryIndex]) : 0.0;
-        }
+    // One value column per lane. History and chunk boundaries remain FP16.
+    float gradient[headDim];
+    for (uint k = 0u; k < headDim; ++k) {
+        uint index = ((batch * chunkCount + chunk) * headCount + head) * headDim * headDim +
+                     k * headDim + feature;
+        gradient[k] = isActive && chunkCount > 1u
+            ? float(gradStateBoundaryBuffer.x[index]) : 0.0;
     }
-    SYNC_SHARED();
 
     uint chunkBegin = chunk * chunkSize;
     uint chunkEnd = min(sequenceLength, chunkBegin + chunkSize);
@@ -125,55 +111,38 @@ void main() {
             ? float(gradOutputBuffer.x[vectorStart + feature]) : 0.0;
 
         float queryGradient = 0.0;
-        if (isActive) {
-            for (uint valueFeature = 0u; valueFeature < headDim; ++valueFeature) {
-                float currentState = float(stateHistoryBuffer.x[
-                    historyIndex(row, head, headDim, feature, valueFeature)]);
-                float headOutputGradient = subgroupShuffle(
-                    outputGradient, localBase + valueFeature);
-                queryGradient += currentState * headOutputGradient;
-                gradState[localStateIndex(localHead, headDim, feature, valueFeature)] +=
-                    normalizedQuery * headOutputGradient;
-            }
-        }
-        SYNC_SHARED();
-
-        float errorValue = 0.0;
+        float predicted = 0.0;
         float readGradientValue = 0.0;
-        if (isActive) {
-            float predicted = 0.0;
-            for (uint keyFeature = 0u; keyFeature < headDim; ++keyFeature) {
-                float headKey = subgroupShuffle(
-                    normalizedKey, localBase + keyFeature);
-                predicted += headKey * decayValue *
-                    previousState(batch, position, head, headDim, keyFeature, feature);
-                readGradientValue += gradState[
-                    localStateIndex(localHead, headDim, keyFeature, feature)] *
-                    headKey;
-            }
-            errorValue = float(projectionBuffer.x[
-                projectionStart + 2u * modelDim + globalFeature]) - predicted;
-            gradProjectionBuffer.x[projectionStart + 2u * modelDim + globalFeature] =
-                float16_t(writeValue * readGradientValue);
+        float previous[headDim];
+        for (uint k = 0u; k < headDim; ++k) {
+            float current = isActive ? float(stateHistoryBuffer.x[
+                historyIndex(row, head, headDim, k, feature)]) : 0.0;
+            float dq = headSum(current * outputGradient, headDim);
+            if (feature == k) queryGradient = dq;
+            float headKey = subgroupShuffle(normalizedKey, localBase + k);
+            gradient[k] += subgroupShuffle(normalizedQuery, localBase + k) * outputGradient;
+            previous[k] = isActive
+                ? previousState(batch, position, head, headDim, k, feature) : 0.0;
+            predicted += headKey * decayValue * previous[k];
+            readGradientValue += gradient[k] * headKey;
         }
-        SYNC_SHARED();
+        float errorValue = isActive ? float(projectionBuffer.x[
+            projectionStart + 2u * modelDim + globalFeature]) - predicted : 0.0;
+        float updateGradient = writeValue * readGradientValue;
+        if (isActive) {
+            gradProjectionBuffer.x[projectionStart + 2u * modelDim + globalFeature] =
+                float16_t(updateGradient);
+        }
 
         float keyGradient = 0.0;
         float rowReduction = 0.0;
-        if (isActive) {
-            for (uint valueFeature = 0u; valueFeature < headDim; ++valueFeature) {
-                float updateGradient = writeValue * subgroupShuffle(
-                    readGradientValue, localBase + valueFeature);
-                uint stateIndex = localStateIndex(localHead, headDim, feature, valueFeature);
-                keyGradient += writeValue * gradState[stateIndex] *
-                    subgroupShuffle(errorValue, localBase + valueFeature);
-                keyGradient -= decayValue *
-                    previousState(batch, position, head, headDim, feature, valueFeature) *
-                    updateGradient;
-                gradState[stateIndex] -= normalizedKey * updateGradient;
-                rowReduction += gradState[stateIndex] *
-                    previousState(batch, position, head, headDim, feature, valueFeature);
-            }
+        for (uint k = 0u; k < headDim; ++k) {
+            float dk = headSum(writeValue * gradient[k] * errorValue -
+                               decayValue * previous[k] * updateGradient, headDim);
+            if (feature == k) keyGradient = dk;
+            gradient[k] -= subgroupShuffle(normalizedKey, localBase + k) * updateGradient;
+            rowReduction += gradient[k] * previous[k];
+            gradient[k] *= decayValue;
         }
 
         float gradWrite = headSum(readGradientValue * errorValue, headDim);
@@ -206,10 +175,6 @@ void main() {
                 float16_t(rawQueryGradient);
             gradProjectionBuffer.x[projectionStart + modelDim + globalFeature] =
                 float16_t(rawKeyGradient);
-            for (uint valueFeature = 0u; valueFeature < headDim; ++valueFeature) {
-                gradState[localStateIndex(localHead, headDim, feature, valueFeature)] *=
-                    decayValue;
-            }
         }
     }
 }

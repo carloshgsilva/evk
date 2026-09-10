@@ -6,8 +6,6 @@
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 
-#define SYNC_SHARED() { subgroupMemoryBarrierShared(); subgroupBarrier(); }
-
 layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 
 PUSH(
@@ -22,14 +20,7 @@ PUSH(
     float decayBias;
 )
 
-const uint MAX_HEAD_DIM = 32u;
-const uint WORKGROUP_WIDTH = 32u;
-// Temporary scan accumulator. Materialized history remains FP16.
-shared float state[WORKGROUP_WIDTH * MAX_HEAD_DIM];
-
-uint stateIndex(uint localHead, uint headDim, uint keyFeature, uint valueFeature) {
-    return localHead * headDim * headDim + keyFeature * headDim + valueFeature;
-}
+CONSTANT(0) uint headDim = 4u;
 
 float headSum(float value, uint headDim) {
     for (uint offset = headDim / 2u; offset > 0u; offset >>= 1u) {
@@ -42,8 +33,7 @@ COMPUTE(32, 1, 1)
 void main() {
     uint batch = gl_WorkGroupID.x;
     uint lane = gl_LocalInvocationID.x;
-    uint headDim = modelDim / headCount;
-    uint headsPerGroup = WORKGROUP_WIDTH / headDim;
+    uint headsPerGroup = 32u / headDim;
     uint localHead = lane / headDim;
     uint feature = lane % headDim;
     uint head = gl_WorkGroupID.y * headsPerGroup + localHead;
@@ -52,12 +42,9 @@ void main() {
     uint projectionStride = 3u * modelDim + 2u * headCount;
     uint globalFeature = head * headDim + feature;
 
-    if (isActive) {
-        for (uint valueFeature = 0u; valueFeature < headDim; ++valueFeature) {
-            state[stateIndex(localHead, headDim, feature, valueFeature)] = 0.0;
-        }
-    }
-    SYNC_SHARED();
+    // Each lane owns a value column; only the temporary accumulator is FP32.
+    float state[headDim];
+    for (uint k = 0u; k < headDim; ++k) state[k] = 0.0;
 
     for (uint position = 0u; position < sequenceLength; ++position) {
         uint row = batch * sequenceLength + position;
@@ -98,7 +85,7 @@ void main() {
             float predicted = 0.0;
             for (uint keyFeature = 0u; keyFeature < headDim; ++keyFeature) {
                 predicted += subgroupShuffle(normalizedKey, localBase + keyFeature) *
-                    state[stateIndex(localHead, headDim, keyFeature, feature)] * decayValue;
+                    state[keyFeature] * decayValue;
             }
             correctionValue = writeValue *
                 (float(projectionBuffer.x[projectionStart + 2u * modelDim + globalFeature]) -
@@ -106,24 +93,15 @@ void main() {
         }
 
         if (isActive) {
-            for (uint valueFeature = 0u; valueFeature < headDim; ++valueFeature) {
-                uint localIndex = stateIndex(localHead, headDim, feature, valueFeature);
-                state[localIndex] = state[localIndex] * decayValue +
-                    normalizedKey * subgroupShuffle(
-                        correctionValue, localBase + valueFeature);
-                uint historyIndex =
-                    ((((row * headCount + head) * headDim + feature) * headDim) + valueFeature);
-                stateHistoryBuffer.x[historyIndex] = float16_t(state[localIndex]);
+            for (uint k = 0u; k < headDim; ++k) {
+                state[k] = state[k] * decayValue +
+                    subgroupShuffle(normalizedKey, localBase + k) * correctionValue;
+                uint historyIndex = ((row * headCount + head) * headDim + k) * headDim + feature;
+                stateHistoryBuffer.x[historyIndex] = float16_t(state[k]);
             }
-        }
-        SYNC_SHARED();
-
-        if (isActive) {
             float result = 0.0;
-            for (uint keyFeature = 0u; keyFeature < headDim; ++keyFeature) {
-                result += subgroupShuffle(normalizedQuery, localBase + keyFeature) *
-                    state[stateIndex(localHead, headDim, keyFeature, feature)];
-            }
+            for (uint k = 0u; k < headDim; ++k)
+                result += subgroupShuffle(normalizedQuery, localBase + k) * state[k];
             outputBuffer.x[vectorStart + feature] = float16_t(result);
         }
     }

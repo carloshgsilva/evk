@@ -2072,6 +2072,7 @@ void run_ai_kernel_tests() {
     test_gated_delta_forward_backward_and_recurrent<32>();
     test_gated_delta_forward_backward_and_recurrent<4, 35, 2>();
     test_gated_delta_forward_backward_and_recurrent<16, 35>();
+    test_gated_delta_forward_backward_and_recurrent<16, 112>();
     test_gated_delta_forward_backward_and_recurrent<32, 19>();
     test_gated_delta_fp16_recurrent_drift();
     test_gated_delta_fp16_recurrent_drift<4>();
