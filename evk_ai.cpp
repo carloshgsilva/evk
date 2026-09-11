@@ -173,6 +173,25 @@ namespace evk::ai {
         }
     };
     static std::unordered_map<uint64_t, evk::Pipeline> flash_configs;
+    static std::unordered_map<uint64_t, evk::Pipeline> causal_attention_configs;
+
+    static uint32_t causal_attention_tile_width(uint32_t d) {
+        return d % 64u == 0u ? 64u : 16u;
+    }
+
+    static evk::Pipeline& causal_attention_pipeline(uint32_t n, uint32_t d, uint32_t stage) {
+        auto& pipeline = causal_attention_configs[hash_combine(n, d, stage)];
+        if (!pipeline) {
+            const char* name = stage == 2u ? "causal_attention_bwd" : "causal_attention";
+            uint32_t variant = stage == 2u ? causal_attention_tile_width(d) : uint32_t(stage == 1u);
+            pipeline = evk::CreatePipeline({
+                .name = name,
+                .CS = detail::load_embedded_shader(name),
+                .constants = evk::Constant{n, d, variant},
+            });
+        }
+        return pipeline;
+    }
 
     static void ensure_flash_scratch(uint32_t B, uint32_t H, uint32_t N, uint32_t Dh) {
         const uint64_t TILE_M = 16u;
@@ -302,6 +321,7 @@ namespace evk::ai {
         pipelines.reset();
         matmul_configs.clear();
         flash_configs.clear();
+        causal_attention_configs.clear();
     }
 
     void matmul(Tensor& a, Tensor& b, Tensor& c, bool transpose_a, bool transpose_b,
@@ -408,6 +428,60 @@ namespace evk::ai {
             input_dim, output_dim,
         });
         cmd.dispatch(output_dim / 16u, input_dim / 16u, 1u);
+        cmd.computeBarrier();
+    }
+
+    void causal_attention(Tensor& q, Tensor& k, Tensor& v, Tensor& probabilities,
+                          Tensor& output, float scale) {
+        assert(q.shape.rank() == 3u && q.shape == k.shape &&
+               q.shape == v.shape && q.shape == output.shape);
+        uint32_t b = q.shape[0], n = q.shape[1], d = q.shape[2];
+        assert(supports_fused_causal_attention(n, d));
+        assert(probabilities.shape == Shape({b, n, n}));
+        auto& cmd = GetCmd();
+        cmd.bind(causal_attention_pipeline(n, d, 0u));
+        cmd.push(evk::Constant{
+            q.buffer.GetReference(), k.buffer.GetReference(), v.buffer.GetReference(),
+            probabilities.buffer.GetReference(), output.buffer.GetReference(), scale,
+        });
+        cmd.dispatch(1u, n / 16u, b);
+        cmd.computeBarrier();
+    }
+
+    void causal_attention_backward(Tensor& q, Tensor& k, Tensor& v, Tensor& probabilities,
+                                   Tensor& grad_output, Tensor& grad_q, Tensor& grad_k,
+                                   Tensor& grad_v, Tensor& grad_scores, float scale) {
+        assert(q.shape.rank() == 3u && q.shape == k.shape && q.shape == v.shape);
+        assert(q.shape == grad_output.shape && q.shape == grad_q.shape &&
+               q.shape == grad_k.shape && q.shape == grad_v.shape);
+        uint32_t b = q.shape[0], n = q.shape[1], d = q.shape[2];
+        assert(supports_fused_causal_attention(n, d));
+        assert(probabilities.shape == Shape({b, n, n}) &&
+               probabilities.shape == grad_scores.shape);
+        auto& cmd = GetCmd();
+        cmd.bind(causal_attention_pipeline(n, d, 1u));
+        cmd.push(evk::Constant{
+            grad_output.buffer.GetReference(), v.buffer.GetReference(), v.buffer.GetReference(),
+            probabilities.buffer.GetReference(), grad_scores.buffer.GetReference(), scale,
+        });
+        cmd.dispatch(1u, n / 16u, b);
+        cmd.computeBarrier();
+        // Independent workgroups cannot accumulate into aliased gradient buffers.
+        if (grad_q.buffer.GetReference() == grad_k.buffer.GetReference() ||
+            grad_q.buffer.GetReference() == grad_v.buffer.GetReference() ||
+            grad_k.buffer.GetReference() == grad_v.buffer.GetReference()) {
+            matmul(probabilities, grad_output, grad_v, true, false, true, 16, 16);
+            matmul(grad_scores, k, grad_q, false, false, true, 16, 16);
+            matmul(grad_scores, q, grad_k, true, false, true, 16, 16);
+            return;
+        }
+        cmd.bind(causal_attention_pipeline(n, d, 2u));
+        cmd.push(evk::Constant{
+            q.buffer.GetReference(), k.buffer.GetReference(), probabilities.buffer.GetReference(),
+            grad_output.buffer.GetReference(), grad_scores.buffer.GetReference(),
+            grad_q.buffer.GetReference(), grad_k.buffer.GetReference(), grad_v.buffer.GetReference(),
+        });
+        cmd.dispatch(d / causal_attention_tile_width(d), n / 16u, b * 3u);
         cmd.computeBarrier();
     }
 

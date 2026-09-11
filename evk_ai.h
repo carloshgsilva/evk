@@ -502,6 +502,21 @@ namespace evk::ai {
     void matmul_weight_backward(Tensor& input, Tensor& grad_output,
                                 Tensor& grad_weight);
 
+    // Bound the shared FP16 score/query tiles to 32 KiB per workgroup.
+    constexpr bool supports_fused_causal_attention(uint32_t n, uint32_t d) {
+        return n > 0u && d > 0u && n % 16u == 0u && d % 16u == 0u &&
+               uint64_t(n) + d + 16u <= 1024u;
+    }
+
+    // Fused causal attention for supported shapes. All buffers are FP16.
+    // Q/K/V/output: (B,N,D); probabilities/grad_scores workspace: (B,N,N).
+    // Backward overwrites workspace and accumulates into the Q/K/V gradients.
+    void causal_attention(Tensor& q, Tensor& k, Tensor& v, Tensor& probabilities,
+                          Tensor& output, float scale);
+    void causal_attention_backward(Tensor& q, Tensor& k, Tensor& v, Tensor& probabilities,
+                                   Tensor& grad_output, Tensor& grad_q, Tensor& grad_k,
+                                   Tensor& grad_v, Tensor& grad_scores, float scale);
+
     // Fused Flash Attention forward (Multi-Query Attention)
     // New layout without head permutation:
     // Q, O: (B, N, D)  where D = H * Dh
@@ -1227,6 +1242,16 @@ struct Graph {
         Tensor& out = *nodes.back();
         
         float attn_scale = (scale > 0.0f) ? scale : (1.0f / std::sqrt(float(D)));
+        if (evk::ai::supports_fused_causal_attention(N, D)) {
+            out.forward_fn = [&q, &k, &v, &probs, &out, attn_scale]() {
+                evk::ai::causal_attention(q, k, v, probs, out, attn_scale);
+            };
+            out.backward_fn = [&q, &k, &v, &scores, &probs, &out, attn_scale]() {
+                evk::ai::causal_attention_backward(q, k, v, probs, out.grad(),
+                    q.grad(), k.grad(), v.grad(), scores, attn_scale);
+            };
+            return out;
+        }
         
         out.forward_fn = [&q, &k, &v, &scores, &probs, &out, attn_scale, B, N, D]() {
             // scores = Q @ K^T
