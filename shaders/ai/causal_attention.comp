@@ -9,6 +9,7 @@
 CONSTANT(0) uint N = 16u;
 CONSTANT(1) uint D = 16u;
 CONSTANT(2) bool backward = false;
+CONSTANT(3) uint window = 0u;
 
 layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 PUSH(
@@ -44,7 +45,7 @@ void main() {
     for (uint col = warp * 16u; col < N; col += 256u) {
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> score =
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-        if (col <= row) {
+        if (col <= row && (window == 0u || col + 15u + window > row)) {
             for (uint feature = 0u; feature < D; feature += 16u) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> lhs;
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> rhs;
@@ -63,7 +64,7 @@ void main() {
         if (!backward) {
             for (uint col = lane; col < N; col += 32u) {
                 float raw = float(tile[r * (N + 8u) + col]);
-                if (col <= row + r && !(raw <= -65504.0))
+                if (col <= row + r && (window == 0u || col + window > row + r) && !(raw <= -65504.0))
                     maximum = max(maximum, raw * scale);
             }
             maximum = subgroupMax(maximum);
@@ -71,7 +72,7 @@ void main() {
         float sum = 0.0;
         for (uint col = lane; col < N; col += 32u) {
             float value = float(tile[r * (N + 8u) + col]);
-            if (col <= row + r && (backward || !(value <= -65504.0))) {
+            if (col <= row + r && (window == 0u || col + window > row + r) && (backward || !(value <= -65504.0))) {
                 sum += backward ? value * float(probabilities.x[scoreBase + (row + r) * N + col])
                                 : exp(value * scale - maximum);
             }
@@ -82,7 +83,7 @@ void main() {
             uint index = scoreBase + (row + r) * N + col;
             float value = 0.0;
             float raw = float(tile[r * (N + 8u) + col]);
-            if (col <= row + r && (backward || !(raw <= -65504.0))) {
+            if (col <= row + r && (window == 0u || col + window > row + r) && (backward || !(raw <= -65504.0))) {
                 value = backward ? float(probabilities.x[index]) * (raw - sum) * scale
                                  : exp(raw * scale - maximum) * invSum;
             }
@@ -101,7 +102,8 @@ void main() {
     for (uint feature = warp * 16u; feature < D; feature += 256u) {
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> result =
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-        for (uint col = 0u; col <= row; col += 16u) {
+        uint begin = window == 0u || row < window ? 0u : ((row - window + 1u) / 16u) * 16u;
+        for (uint col = begin; col <= row; col += 16u) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> p;
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> value;
             coopMatLoad(p, tile, col, N + 8u, gl_CooperativeMatrixLayoutRowMajor);

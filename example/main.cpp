@@ -68,7 +68,12 @@ int main(int argc, char** argv) {
 
     // Run LLM demo if requested
     if (do_llm) {
-        main_llm(argc, argv);
+        try {
+            main_llm(argc, argv);
+        } catch (const std::exception& error) {
+            fprintf(stderr, "[llm] Error: %s\n", error.what());
+            run_succeeded = false;
+        }
     }
 
     if (do_oidn) {

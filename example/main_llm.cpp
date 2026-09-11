@@ -431,9 +431,14 @@ void append_obj(std::ostream& out,
 enum class AttentionMode {
     Softmax,
     GatedDelta,
+    Yoco,
 };
 
+// Full-sequence projection tiling; cached single-token projections use their own defaults.
+constexpr uint8_t kYocoProjectionTileN = 64;
+
 struct GatedDeltaStepModel;
+struct AttentionStepModel;
 
 struct SequenceBlock {
     Tensor* w_projection = nullptr;
@@ -444,19 +449,17 @@ struct SequenceBlock {
     Tensor* w1 = nullptr;
     Tensor* w2 = nullptr;
     uint32_t model_dim = 0;
-    uint32_t hidden_dim = 0;
     uint32_t head_count = 1;
     float rope_base = 10000.0f;
     AttentionMode attention_mode = AttentionMode::Softmax;
 
     void init(Graph& graph,
               uint32_t model_dim_,
-              uint32_t hidden_dim_,
+              uint32_t hidden_dim,
               float rope_base_,
               AttentionMode attention_mode_,
-              uint32_t head_count_) {
+              uint32_t head_count_, bool cross_attention = false) {
         model_dim = model_dim_;
-        hidden_dim = hidden_dim_;
         rope_base = rope_base_;
         attention_mode = attention_mode_;
         head_count = head_count_;
@@ -466,11 +469,13 @@ struct SequenceBlock {
                 {model_dim, 3u * model_dim + 2u * head_count}, true);
         } else {
             w_q = &graph.tensor({model_dim, model_dim}, true);
-            w_k = &graph.tensor({model_dim, model_dim}, true);
-            w_v = &graph.tensor({model_dim, model_dim}, true);
+            if (!cross_attention) {
+                w_k = &graph.tensor({model_dim, model_dim}, true);
+                w_v = &graph.tensor({model_dim, model_dim}, true);
+            }
         }
         w_o = &graph.tensor({model_dim, model_dim}, true);
-        w1 = &graph.tensor({model_dim, hidden_dim}, true);
+        w1 = &graph.tensor({model_dim, hidden_dim * (attention_mode == AttentionMode::Yoco ? 2u : 1u)}, true);
         w2 = &graph.tensor({hidden_dim, model_dim}, true);
     }
 
@@ -496,36 +501,44 @@ struct SequenceBlock {
             w_projection->cpu_upload();
         } else {
             w_q->random_init(weight_stddev);
-            w_k->random_init(weight_stddev);
-            w_v->random_init(weight_stddev);
+            if (w_k) w_k->random_init(weight_stddev);
+            if (w_v) w_v->random_init(weight_stddev);
         }
         w_o->random_init(residual_proj_stddev);
         w1->random_init(weight_stddev);
         w2->random_init(residual_proj_stddev);
     }
 
-    Tensor& forward(Graph& graph, Tensor& input) {
-        Tensor& norm_in = graph.rms_norm(input);
+    Tensor& feed_forward(Graph& graph, Tensor& residual) {
+        if (attention_mode == AttentionMode::Yoco)
+            return graph.swiglu_ffn(residual, *w1, *w2, residual, 32, 1e-4f);
+        Tensor& norm = graph.rms_norm(residual);
+        Tensor& hidden = graph.matmul_gelu(norm, *w1);
+        return graph.matmul_residual(hidden, *w2, residual);
+    }
+
+    Tensor& forward(Graph& graph, Tensor& input, Tensor* shared_key = nullptr,
+                    Tensor* shared_value = nullptr, uint32_t window = 0) {
+        uint8_t tile_n = attention_mode == AttentionMode::Yoco ? kYocoProjectionTileN : 16;
         Tensor* attn = nullptr;
         if (attention_mode == AttentionMode::GatedDelta) {
-            Tensor& projection = graph.matmul(norm_in, *w_projection);
+            Tensor& projection = graph.matmul(graph.rms_norm(input), *w_projection);
             Tensor& delta = graph.gated_delta_projected(
                 projection, model_dim, head_count, rope_base, -4.0f, 16u);
             attn = &graph.rms_norm(delta);
+        } else if (shared_key) {
+            Tensor& q = graph.matmul_rope(input, *w_q, rope_base, 1e-4f, tile_n);
+            attn = &graph.causal_attention(q, *shared_key, *shared_value, 0.0f, window);
         } else {
-            Tensor& q = graph.matmul(norm_in, *w_q);
-            Tensor& k = graph.matmul(norm_in, *w_k);
-            Tensor& v = graph.matmul(norm_in, *w_v);
-            Tensor& q_rope = graph.rope(q, rope_base);
-            Tensor& k_rope = graph.rope(k, rope_base);
-            attn = &graph.causal_attention(q_rope, k_rope, v);
+            Tensor& norm_in = graph.rms_norm(input);
+            Tensor& q_rope = graph.matmul_rope(norm_in, *w_q, rope_base, 0.0f, tile_n);
+            Tensor& k = w_k ? graph.matmul_rope(norm_in, *w_k, rope_base, 0.0f, tile_n) : *shared_key;
+            Tensor& v = w_v ? graph.matmul(norm_in, *w_v, 16, tile_n) : *shared_value;
+            attn = &graph.causal_attention(q_rope, k, v, 0.0f, window);
         }
-        Tensor& res1 = graph.matmul_residual(*attn, *w_o, input);
+        Tensor& res1 = graph.matmul_residual(*attn, *w_o, input, 16, tile_n);
 
-        Tensor& norm_ffn = graph.rms_norm(res1);
-        Tensor& hidden = graph.matmul_gelu(norm_ffn, *w1);
-        Tensor& out = graph.matmul_residual(hidden, *w2, res1);
-        return out;
+        return feed_forward(graph, res1);
     }
 };
 
@@ -550,9 +563,13 @@ struct TokenModel {
 
     Tensor* logits = nullptr;        // [B, S, V]
     Tensor* loss = nullptr;          // scalar
+    Tensor* shared_w_k = nullptr;
+    Tensor* shared_w_v = nullptr;
+    uint32_t window = 32u;
 
     std::vector<SequenceBlock> blocks;
     std::unique_ptr<GatedDeltaStepModel> gated_delta_decoder;
+    std::unique_ptr<AttentionStepModel> attention_decoder;
 
     TokenModel(uint32_t batch_size_,
                    uint32_t seq_len_,
@@ -585,14 +602,25 @@ struct TokenModel {
         Tensor& x_emb = graph.embed(*token_emb, *input_tokens);
         blocks.resize(num_layers);
         Tensor* x = &x_emb;
+        Tensor* shared_key = nullptr;
+        Tensor* shared_value = nullptr;
         for (uint32_t i = 0; i < num_layers; ++i) {
+            bool cross = attention_mode == AttentionMode::Yoco && i >= num_layers / 2u;
+            if (cross && i == num_layers / 2u) {
+                Tensor& memory = graph.rms_norm(*x);
+                shared_w_k = &graph.tensor({model_dim, model_dim}, true);
+                shared_w_v = &graph.tensor({model_dim, model_dim}, true);
+                shared_key = &graph.matmul_rope(memory, *shared_w_k, rope_base, 0.0f, kYocoProjectionTileN);
+                shared_value = &graph.matmul(memory, *shared_w_v, 16, kYocoProjectionTileN);
+            }
             blocks[i].init(graph,
                            model_dim,
                            hidden_dim,
                            rope_base,
                            attention_mode,
-                           head_count);
-            x = &blocks[i].forward(graph, *x);
+                           head_count, cross);
+            x = &blocks[i].forward(graph, *x, shared_key, shared_value,
+                attention_mode == AttentionMode::Yoco && !cross ? window : 0u);
         }
 
         Tensor& x_norm = graph.rms_norm(*x);
@@ -613,6 +641,8 @@ struct TokenModel {
         for (auto& block : blocks) {
             block.init_weights(transformer_weight_stddev, residual_proj_stddev);
         }
+        if (shared_w_k) shared_w_k->random_init(transformer_weight_stddev);
+        if (shared_w_v) shared_w_v->random_init(transformer_weight_stddev);
     }
 };
 
@@ -663,7 +693,139 @@ struct GatedDeltaStepModel {
     }
 };
 
+// Both decoders reuse the training weights; only inference activations/caches are owned here.
+struct AttentionStepModel {
+    Graph graph;
+    Tensor* input_tokens = nullptr;
+    Tensor* logits = nullptr;
+    Tensor* sampled_token_ids = nullptr;
+    uint32_t position = 0;
+    size_t prefill_end = 0;
+    uint64_t cache_bytes = 0;
+
+    std::pair<Tensor*, Tensor*> cache(Tensor& k, Tensor& v, uint32_t capacity, float base) {
+        Tensor& kc = graph.tensor({k.shape[1], capacity, k.shape[2]});
+        Tensor& vc = graph.tensor(kc.shape);
+        kc.forward_fn = [this, &k, &v, &kc, &vc, base]() {
+            evk::ai::attention_cache_append(k, v, kc, vc, position, base);
+        };
+        cache_bytes += 2u * uint64_t(kc.shape.count()) * sizeof(float16_t);
+        return {&kc, &vc};
+    }
+
+    explicit AttentionStepModel(TokenModel& source) {
+        assert(source.batch_size == 16u && source.attention_mode != AttentionMode::GatedDelta);
+        input_tokens = &graph.tensor({1u, source.batch_size});
+        Tensor* x = &graph.embed(*source.token_emb, *input_tokens);
+        Tensor* shared_key = nullptr;
+        Tensor* shared_value = nullptr;
+        // Layer temporaries are dead before the next layer uses the same role.
+        // This decoder never runs backward; caches remain independently owned.
+        Tensor *norm_storage = nullptr, *raw_query_storage = nullptr, *query_storage = nullptr;
+        Tensor *key_storage = nullptr, *value_storage = nullptr, *mixed_storage = nullptr;
+        Tensor* residual_storage = nullptr;
+        std::vector<Tensor*> ff_storage, ff_workspace_storage;
+        auto reuse = [](Tensor& tensor, Tensor*& storage) {
+            if (!storage) storage = &tensor;
+            else {
+                assert(tensor.shape == storage->shape);
+                tensor.buffer = storage->buffer;
+            }
+        };
+        auto reuse_range = [&](auto& tensors, size_t begin, std::vector<Tensor*>& storage) {
+            if (storage.empty()) storage.resize(tensors.size() - begin, nullptr);
+            assert(storage.size() == tensors.size() - begin);
+            for (size_t j = 0; j < storage.size(); ++j) reuse(*tensors[begin + j], storage[j]);
+        };
+        for (uint32_t i = 0; i < source.num_layers; ++i) {
+            SequenceBlock& block = source.blocks[i];
+            if (source.attention_mode == AttentionMode::Yoco && i == source.num_layers / 2u) {
+                Tensor& memory = graph.rms_norm(*x);
+                Tensor& k = graph.matmul(memory, *source.shared_w_k);
+                Tensor& v = graph.matmul(memory, *source.shared_w_v);
+                auto caches = cache(k, v, source.seq_len, source.rope_base);
+                shared_key = caches.first;
+                shared_value = caches.second;
+                prefill_end = graph.nodes.size();
+            }
+            Tensor& norm = graph.rms_norm(*x);
+            reuse(norm, norm_storage);
+            Tensor& raw_query = graph.matmul(norm, *block.w_q);
+            reuse(raw_query, raw_query_storage);
+            Tensor& q = graph.tensor(raw_query.shape);
+            reuse(q, query_storage);
+            q.forward_fn = [this, &raw_query, &q, base = source.rope_base]() {
+                evk::ai::rope(raw_query, q, 1u, raw_query.shape[1], raw_query.shape[2], base, 0.0f, float(position));
+            };
+            Tensor* key = shared_key;
+            Tensor* value = shared_value;
+            if (block.w_k) {
+                Tensor& k = graph.matmul(norm, *block.w_k);
+                Tensor& v = graph.matmul(norm, *block.w_v);
+                reuse(k, key_storage);
+                reuse(v, value_storage);
+                auto caches = cache(k, v,
+                    source.attention_mode == AttentionMode::Yoco ? source.window : source.seq_len,
+                    source.rope_base);
+                key = caches.first;
+                value = caches.second;
+            }
+            Tensor& mixed = graph.tensor(q.shape);
+            reuse(mixed, mixed_storage);
+            mixed.forward_fn = [this, &q, key, value, &mixed]() {
+                evk::ai::cached_attention(q, *key, *value, mixed, position);
+            };
+            Tensor& residual = graph.matmul_residual(mixed, *block.w_o, *x);
+            reuse(residual, residual_storage);
+            size_t ff_begin = graph.nodes.size(), workspace_begin = graph.workspaces.size();
+            x = &block.feed_forward(graph, residual);
+            reuse_range(graph.nodes, ff_begin, ff_storage);
+            reuse_range(graph.workspaces, workspace_begin, ff_workspace_storage);
+        }
+        logits = &graph.matmul(graph.rms_norm(*x), *source.w_out, 16, 16);
+        sampled_token_ids = &graph.tensor({source.batch_size});
+    }
+
+    void eval(bool prefill = false) {
+        size_t end = prefill && prefill_end ? prefill_end : graph.nodes.size();
+        for (size_t i = 0; i < end; ++i)
+            if (graph.nodes[i]->forward_fn) graph.nodes[i]->forward_fn();
+    }
+};
+
 TokenModel::~TokenModel() = default;
+
+void sample_attention_autoregressive(TokenModel& model,
+    const std::vector<float>& condition_meshes, std::vector<uint16_t>& generated_inputs) {
+    seed_condition_prefix_tokens(condition_meshes, model.batch_size, generated_inputs);
+    if (!model.attention_decoder) model.attention_decoder = std::make_unique<AttentionStepModel>(model);
+    AttentionStepModel& decoder = *model.attention_decoder;
+    Tensor prefix({kConditionCoordTokens + 1u, model.batch_size});
+    Tensor generated({kCoordTokenCount, model.batch_size});
+    for (uint32_t t = 0; t <= kConditionCoordTokens; ++t)
+        for (uint32_t b = 0; b < model.batch_size; ++b)
+            prefix.cpu()[t * model.batch_size + b].value = generated_inputs[b * kSeqLen + t];
+    prefix.cpu_upload(false);
+    uint64_t row_bytes = model.batch_size * sizeof(float16_t);
+    for (uint32_t t = 0; t < kCoordTokenCount; ++t) {
+        decoder.position = t;
+        if (t <= kConditionCoordTokens)
+            evk::ai::GetCmd().copy(prefix.buffer, decoder.input_tokens->buffer,
+                row_bytes, uint64_t(t) * row_bytes);
+        decoder.eval(t < kConditionCoordTokens);
+        if (t >= kConditionCoordTokens) {
+            evk::ai::greedy_sample_rows(*decoder.logits, *decoder.sampled_token_ids,
+                kCoordTokenBase, uint16_t(kCoordBins));
+            evk::ai::GetCmd().copy(decoder.sampled_token_ids->buffer, generated.buffer,
+                row_bytes, 0u, uint64_t(t) * row_bytes);
+            evk::ai::GetCmd().copy(decoder.sampled_token_ids->buffer, decoder.input_tokens->buffer, row_bytes);
+        }
+    }
+    generated.cpu_download();
+    for (uint32_t t = kConditionCoordTokens; t < kCoordTokenCount; ++t)
+        for (uint32_t b = 0; b < model.batch_size; ++b)
+            generated_inputs[b * kSeqLen + t + 1u] = generated.cpu()[t * model.batch_size + b].value;
+}
 
 void sample_gated_delta_autoregressive(
     TokenModel& model,
@@ -738,13 +900,17 @@ void sample_gated_delta_autoregressive(
 
 void sample_autoregressive(TokenModel& model,
                            const std::vector<float>& condition_meshes,
-                           std::vector<uint16_t>& generated_inputs,
-                           std::vector<uint16_t>& scratch_targets) {
+                           std::vector<uint16_t>& generated_inputs) {
     if (model.attention_mode == AttentionMode::GatedDelta) {
         sample_gated_delta_autoregressive(model, condition_meshes, generated_inputs);
         return;
     }
+    sample_attention_autoregressive(model, condition_meshes, generated_inputs);
+}
 
+void sample_attention_reference(TokenModel& model,
+    const std::vector<float>& condition_meshes, std::vector<uint16_t>& generated_inputs,
+    std::vector<uint16_t>& scratch_targets) {
     const uint32_t batch_size = model.batch_size;
     scratch_targets.assign(batch_size * kSeqLen, kPadToken);
 
@@ -774,8 +940,7 @@ void sample_autoregressive(TokenModel& model,
 EvalMetrics evaluate_model(TokenModel& model,
                            const std::vector<ValSeed>& val,
                            const std::vector<float>& sample_condition_meshes,
-                           std::vector<uint16_t>& sampled_tokens,
-                           std::vector<uint16_t>& scratch_targets) {
+                           std::vector<uint16_t>& sampled_tokens) {
     EvalMetrics metrics;
 
     for (const auto& seed : val) {
@@ -788,7 +953,7 @@ EvalMetrics evaluate_model(TokenModel& model,
     }
     metrics.val_ce /= float(val.size());
 
-    sample_autoregressive(model, sample_condition_meshes, sampled_tokens, scratch_targets);
+    sample_autoregressive(model, sample_condition_meshes, sampled_tokens);
 
     std::vector<float> pred_mesh;
     metrics.val_completion_mse = 0.0f;
@@ -813,7 +978,152 @@ struct ExperimentResult {
     double decode_ms = 0.0;
     uint64_t inference_state_bytes = 0;
     bool inference_state_grows_with_sequence = false;
+    uint64_t training_tensor_bytes = 0;
+    uint64_t inference_tensor_bytes = 0;
+    double cached_logit_rmse = std::nan("");
+    double reference_decode_ms = std::nan("");
+    double reference_completion_mse = std::nan("");
 };
+
+uint64_t graph_tensor_bytes(const Graph& graph) {
+    uint64_t bytes = 0;
+    std::unordered_map<uint64_t, uint64_t> buffers;
+    auto count = [&](Tensor& tensor, uint64_t elements) {
+        auto& size = buffers[tensor.buffer.GetReference()];
+        size = (std::max)(size, elements * sizeof(float16_t));
+    };
+    for (const auto& tensor : graph.nodes) {
+        count(*tensor, tensor->shape.count());
+        if (tensor->grad_tensor) count(*tensor->grad_tensor, tensor->shape.count());
+    }
+    for (const auto& tensor : graph.workspaces)
+        count(*tensor, tensor->shape.count());
+    // Adam has two FP16 moment buffers per parameter; exclude CPU staging and Vulkan overhead.
+    for (const auto& [parameter, state] : graph.adam_states)
+        bytes += uint64_t(parameter->shape.count()) * 2u * sizeof(float16_t);
+    for (const auto& buffer : graph.scratch)
+        if (buffer.tensor) count(*buffer.tensor, buffer.capacity);
+    for (const auto& [buffer, size] : buffers) bytes += size;
+    return bytes;
+}
+
+double check_cached_logits(TokenModel& model, const ValSeed& val) {
+    if (model.attention_mode == AttentionMode::GatedDelta) return std::nan("");
+    upload_token_tensor(*model.input_tokens, val.input_tokens, false);
+    upload_token_tensor(*model.target_tokens, val.target_tokens, false);
+    model.graph.eval(false, false, false);
+    model.logits->cpu_download();
+    if (!model.attention_decoder) model.attention_decoder = std::make_unique<AttentionStepModel>(model);
+    auto& decoder = *model.attention_decoder;
+    double squared_error = 0.0;
+    double reference_squared = 0.0, reference_ce = 0.0, cached_ce = 0.0;
+    uint32_t predicted_rows = 0, matching_tokens = 0;
+    uint32_t worst_position = 0;
+    bool worst_supervised = false;
+    double supervised_squared_error = 0.0;
+    size_t supervised_count = 0;
+    float worst_reference = 0.0f, worst_actual = 0.0f;
+    float max_error = 0.0f;
+    size_t count = 0;
+    for (uint32_t t = 0; t < kSeqActiveLen; ++t) {
+        decoder.position = t;
+        for (uint32_t b = 0; b < model.batch_size; ++b)
+            decoder.input_tokens->cpu()[b].value = val.input_tokens[b * kSeqLen + t];
+        decoder.input_tokens->cpu_upload();
+        decoder.eval(t < kConditionCoordTokens);
+        if (t < kConditionCoordTokens) continue;
+        decoder.logits->cpu_download();
+        for (uint32_t b = 0; b < model.batch_size; ++b)
+            for (uint32_t v = 0; v < model.vocab_size; ++v) {
+                float reference = float(model.logits->cpu()[(b * kSeqLen + t) * model.vocab_size + v]);
+                float actual = float(decoder.logits->cpu()[b * model.vocab_size + v]);
+                float error = std::abs(reference - actual);
+                if (!std::isfinite(error)) throw std::runtime_error("Non-finite cached attention logits");
+                if (error > max_error) {
+                    max_error = error; worst_reference = reference; worst_actual = actual;
+                    worst_position = t;
+                    worst_supervised = val.target_tokens[b * kSeqLen + t] != kPadToken;
+                }
+                squared_error += double(error) * error;
+                if (val.target_tokens[b * kSeqLen + t] != kPadToken) {
+                    supervised_squared_error += double(error) * error;
+                    ++supervised_count;
+                }
+                reference_squared += double(reference) * reference;
+                ++count;
+            }
+        for (uint32_t b = 0; b < model.batch_size; ++b) {
+            uint16_t target = val.target_tokens[b * kSeqLen + t];
+            if (target == kPadToken) continue;
+            const float16_t* reference = model.logits->cpu() + (b * kSeqLen + t) * model.vocab_size;
+            const float16_t* actual = decoder.logits->cpu() + b * model.vocab_size;
+            auto ce = [&](const float16_t* row) {
+                float maximum = -1e30f;
+                for (uint32_t v = 0; v < model.vocab_size; ++v) maximum = (std::max)(maximum, float(row[v]));
+                double sum = 0.0;
+                for (uint32_t v = 0; v < model.vocab_size; ++v) sum += std::exp(double(float(row[v]) - maximum));
+                return std::log(sum) + maximum - float(row[target]);
+            };
+            reference_ce += ce(reference);
+            cached_ce += ce(actual);
+            uint32_t ri = 0, ai = 0;
+            for (uint32_t v = 1; v < model.vocab_size; ++v) {
+                if (float(reference[v]) > float(reference[ri])) ri = v;
+                if (float(actual[v]) > float(actual[ai])) ai = v;
+            }
+            matching_tokens += ri == ai;
+            ++predicted_rows;
+        }
+    }
+    double rmse = std::sqrt(squared_error / double(count));
+    printf("cached/full logits | max_error %.6f (%.6f vs %.6f) | rmse %.6f | relative_rms %.6f | CE %.6f vs %.6f | argmax %u/%u\n",
+        max_error, worst_reference, worst_actual, rmse, std::sqrt(squared_error / reference_squared),
+        reference_ce / predicted_rows, cached_ce / predicted_rows, matching_tokens, predicted_rows);
+    printf("cached/full supervised_rmse %.6f | worst position %u (%s target)\n",
+        std::sqrt(supervised_squared_error / double(supervised_count)), worst_position,
+        worst_supervised ? "supervised" : "ignored");
+    fflush(stdout);
+    if (rmse > 0.02 || std::abs(cached_ce - reference_ce) / predicted_rows > 0.005)
+        throw std::runtime_error("Cached/full sequence logits disagree");
+    return rmse;
+}
+
+void save_checkpoint(const TokenModel& model, const ParamSnapshot& parameters,
+                     const std::filesystem::path& path) {
+    std::ofstream file(path, std::ios::binary);
+    // Versioned header followed by FP16 parameters in graph registration order.
+    const uint32_t header[] = {0x45564b4cu, 1u, uint32_t(model.attention_mode),
+        model.model_dim, model.hidden_dim, model.num_layers, model.head_count,
+        model.vocab_size, model.window, uint32_t(parameters.size())};
+    file.write(reinterpret_cast<const char*>(header), sizeof(header));
+    for (const auto& parameter : parameters) {
+        uint32_t count = uint32_t(parameter.size());
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        file.write(reinterpret_cast<const char*>(parameter.data()), count * sizeof(float16_t));
+    }
+    if (!file) throw std::runtime_error("Failed to write model checkpoint");
+}
+
+void initialize_model(TokenModel& model, uint32_t seed, const std::string& checkpoint) {
+    if (checkpoint.empty()) { model.init_weights(seed); return; }
+    std::ifstream file(checkpoint, std::ios::binary);
+    uint32_t header[10] = {};
+    file.read(reinterpret_cast<char*>(header), sizeof(header));
+    const uint32_t expected[] = {0x45564b4cu, 1u, uint32_t(model.attention_mode),
+        model.model_dim, model.hidden_dim, model.num_layers, model.head_count,
+        model.vocab_size, model.window, uint32_t(model.graph.params.size())};
+    if (!file || !std::equal(std::begin(header), std::end(header), std::begin(expected)))
+        throw std::runtime_error("Checkpoint architecture does not match selected model");
+    for (Tensor* parameter : model.graph.params) {
+        uint32_t count = 0;
+        file.read(reinterpret_cast<char*>(&count), sizeof(count));
+        if (count != parameter->shape.count()) throw std::runtime_error("Invalid checkpoint parameter shape");
+        file.read(reinterpret_cast<char*>(parameter->cpu()), count * sizeof(float16_t));
+        if (!file) throw std::runtime_error("Truncated checkpoint");
+        parameter->cpu_upload(false);
+    }
+    evk::ai::SubmitCmd(true);
+}
 
 uint64_t parameter_count(const Graph& graph) {
     uint64_t count = 0;
@@ -899,8 +1209,10 @@ ExperimentResult train_experiment(
         EvalMetrics metrics = evaluate_model(model,
                                              val,
                                              sample_condition_meshes,
-                                             sampled_tokens,
-                                             scratch_targets);
+                                             sampled_tokens);
+        if (!std::isfinite(train_ce) || !std::isfinite(metrics.val_ce) ||
+            !std::isfinite(metrics.val_completion_mse))
+            throw std::runtime_error(std::string(name) + " produced non-finite training/validation metrics");
         auto validation_end = std::chrono::high_resolution_clock::now();
         result.validation_seconds +=
             std::chrono::duration<double>(validation_end - validation_start).count();
@@ -943,19 +1255,57 @@ ExperimentResult train_experiment(
 
     auto train_end = std::chrono::high_resolution_clock::now();
     result.train_seconds = std::chrono::duration<double>(train_end - train_start).count();
+    if (best_params.empty()) {
+        auto start = std::chrono::high_resolution_clock::now();
+        result.best = evaluate_model(model, val, sample_condition_meshes, sampled_tokens);
+        result.validation_seconds = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - start).count();
+        result.validation_runs = 1u;
+        best_params = capture_params(model.graph);
+    }
+    save_checkpoint(model, capture_params(model.graph), output_dir / (std::string(name) + "_final.bin"));
+    save_checkpoint(model, best_params, output_dir / (std::string(name) + "_best.bin"));
     restore_params(model.graph, best_params);
+    result.cached_logit_rmse = check_cached_logits(model, val.front());
+    if (model.attention_mode != AttentionMode::GatedDelta) {
+        result.reference_completion_mse = 0.0;
+        auto start = std::chrono::high_resolution_clock::now();
+        sample_attention_reference(model, sample_condition_meshes, sampled_tokens, scratch_targets);
+        result.reference_decode_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - start).count();
+        std::vector<float> mesh;
+        for (uint32_t b = 0; b < val.size(); ++b) {
+            decode_generated_mesh(sampled_tokens, b, mesh);
+            result.reference_completion_mse += completion_mse(mesh, val[b].first_target_mesh) / val.size();
+        }
+        printf("[%s] full-recompute decode_ms: %.3f ms | mesh_mse %.6f\n",
+            name, result.reference_decode_ms, result.reference_completion_mse);
+    }
+    result.training_tensor_bytes = graph_tensor_bytes(model.graph);
+    if (model.attention_decoder) {
+        result.inference_state_bytes = model.attention_decoder->cache_bytes / model.batch_size;
+        result.inference_tensor_bytes = graph_tensor_bytes(model.attention_decoder->graph) +
+            result.parameters * sizeof(float16_t);
+        result.inference_state_grows_with_sequence = true;
+    } else if (model.gated_delta_decoder) {
+        for (const Tensor* state : model.gated_delta_decoder->states)
+            result.inference_state_bytes += uint64_t(state->shape.count()) * sizeof(float16_t) / model.batch_size;
+        result.inference_tensor_bytes = graph_tensor_bytes(model.gated_delta_decoder->graph) +
+            result.parameters * sizeof(float16_t);
+    }
 
-    auto decode_start = std::chrono::high_resolution_clock::now();
-    sample_autoregressive(model,
-                          sample_condition_meshes,
-                          sampled_tokens,
-                          scratch_targets);
-    auto decode_end = std::chrono::high_resolution_clock::now();
-    result.decode_ms =
-        std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
+    std::array<double, 5> decode_times;
+    for (double& time : decode_times) {
+        auto start = std::chrono::high_resolution_clock::now();
+        sample_autoregressive(model, sample_condition_meshes, sampled_tokens);
+        time = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - start).count();
+    }
+    std::sort(decode_times.begin(), decode_times.end());
+    result.decode_ms = decode_times[decode_times.size() / 2u];
 
     double update_ms =
-        result.train_update_seconds * 1000.0 / double(train_steps);
+        result.train_update_seconds * 1000.0 / double((std::max)(1u, train_steps));
     printf("[%s] train_update_ms: %.3f ms/update\n",
            name,
            update_ms);
@@ -964,7 +1314,7 @@ ExperimentResult train_experiment(
            result.validation_seconds * 1000.0);
     printf("[%s] validation_mean_ms: %.3f ms (%u runs)\n",
            name,
-           result.validation_seconds * 1000.0 / double(result.validation_runs),
+           result.validation_seconds * 1000.0 / double((std::max)(1u, result.validation_runs)),
            result.validation_runs);
     printf("[%s] decode_ms: %.3f ms\n", name, result.decode_ms);
 
@@ -1008,6 +1358,7 @@ void main_llm(int argc, char** argv) {
     constexpr uint32_t kModelDim = 256;
     constexpr uint32_t kLayerCount = 8;
     constexpr uint32_t kAttentionHiddenDim = 512;
+    constexpr uint32_t kYocoHiddenDim = 400;
     uint32_t gated_delta_heads = parse_uint_arg(argc, argv, "--llm-gdn-heads", 16);
     uint32_t gated_delta_hidden = parse_uint_arg(argc, argv, "--llm-gdn-hidden", 496);
     uint32_t parameter_seed = parse_uint_arg(argc, argv, "--llm-seed", 42);
@@ -1024,26 +1375,25 @@ void main_llm(int argc, char** argv) {
     uint32_t head_dim = kModelDim / gated_delta_heads;
     uint64_t gated_delta_state_bytes = uint64_t(kLayerCount) *
         gated_delta_heads * head_dim * head_dim * sizeof(float16_t);
-    uint32_t train_steps = (std::max)(1u, parse_uint_arg(argc, argv, "--llm-steps", 20000));
+    uint32_t train_steps = parse_uint_arg(argc, argv, "--llm-steps", 20000);
+    std::string checkpoint = parse_string_arg(argc, argv, "--llm-checkpoint", "");
     uint32_t log_interval =
         (std::max)(1u, parse_uint_arg(argc, argv, "--llm-log-interval", 500));
     std::string selected_model = parse_string_arg(argc, argv, "--llm-model", "compare");
     std::filesystem::path output_dir = parse_string_arg(
         argc, argv, "--llm-output", "output");
-    bool run_attention = selected_model == "attention" ||
-                         selected_model == "compare" ||
-                         selected_model == "all";
-    bool run_gated_delta = selected_model == "gated-delta" ||
-                           selected_model == "compare" ||
-                           selected_model == "all";
-    if (!run_attention && !run_gated_delta) {
+    bool run_all = selected_model == "compare" || selected_model == "all";
+    bool run_attention = run_all || selected_model == "attention";
+    bool run_gated_delta = run_all || selected_model == "gated-delta";
+    bool run_yoco = run_all || selected_model == "yoco";
+    if (!run_attention && !run_gated_delta && !run_yoco) {
         printf("[llm] unknown --llm-model '%s'; expected attention, "
-               "gated-delta, compare, or all\n",
+               "gated-delta, yoco, compare, or all\n",
                selected_model.c_str());
         return;
     }
 
-    printf("=== main_llm: softmax attention and Gated DeltaNet ===\n");
+    printf("=== main_llm: softmax attention, Gated DeltaNet, and YOCO-SWA ===\n");
     printf("config | model %s | steps %u | batch %u | dim %u | sequence %u\n",
            selected_model.c_str(),
            train_steps,
@@ -1082,69 +1432,40 @@ void main_llm(int argc, char** argv) {
 
     std::filesystem::create_directories(output_dir);
     std::vector<ExperimentResult> results;
+    auto run_model = [&](const char* name, AttentionMode mode, uint32_t hidden_dim,
+                         uint32_t heads, float learning_rate) {
+        TokenModel model(kBatchSize, kSeqLen, kVocabSize, kModelDim, hidden_dim,
+                         kLayerCount, kRopeBase, mode, heads);
+        initialize_model(model, parameter_seed, checkpoint);
+        results.push_back(train_experiment(model, name, train_steps, log_interval,
+            learning_rate, base_shapes, val, sample_condition_meshes, output_dir));
+    };
     if (run_attention) {
-        TokenModel attention(kBatchSize,
-                             kSeqLen,
-                             kVocabSize,
-                             kModelDim,
-                             kAttentionHiddenDim,
-                             kLayerCount,
-                             kRopeBase,
-                             AttentionMode::Softmax,
-                             1u);
-        attention.init_weights(parameter_seed);
-        results.push_back(train_experiment(attention,
-                                           "attention",
-                                           train_steps,
-                                           log_interval,
-                                           kAttentionLearningRate,
-                                           base_shapes,
-                                           val,
-                                           sample_condition_meshes,
-                                           output_dir));
-        // Equivalent FP16 K/V cache at the active validation sequence length.
-        // The current reference decoder recomputes the prefix instead of storing it.
-        results.back().inference_state_bytes =
-            uint64_t(kLayerCount) * 2u * kSeqActiveLen * kModelDim *
-            uint32_t(sizeof(float16_t));
-        results.back().inference_state_grows_with_sequence = true;
+        run_model("attention", AttentionMode::Softmax, kAttentionHiddenDim,
+                  1u, kAttentionLearningRate);
     }
 
     if (run_gated_delta) {
         printf("GDN config | heads %u | head_dim %u | FFN %u | seed %u\n",
                gated_delta_heads, head_dim, gated_delta_hidden, parameter_seed);
-        TokenModel gated_delta(kBatchSize,
-                               kSeqLen,
-                               kVocabSize,
-                               kModelDim,
-                               gated_delta_hidden,
-                               kLayerCount,
-                               kRopeBase,
-                               AttentionMode::GatedDelta,
-                               gated_delta_heads);
-        gated_delta.init_weights(parameter_seed);
-        results.push_back(train_experiment(gated_delta,
-                                           "gated_delta",
-                                           train_steps,
-                                           log_interval,
-                                           kGatedDeltaLearningRate,
-                                           base_shapes,
-                                           val,
-                                           sample_condition_meshes,
-                                           output_dir));
-        results.back().inference_state_bytes = gated_delta_state_bytes;
+        run_model("gated_delta", AttentionMode::GatedDelta, gated_delta_hidden,
+                  gated_delta_heads, kGatedDeltaLearningRate);
+    }
+    if (run_yoco) {
+        run_model("yoco", AttentionMode::Yoco, kYocoHiddenDim, 1u, kAttentionLearningRate);
     }
     printf("\n=== comparison (lower is better) ===\n");
     std::ofstream comparison_csv(output_dir / "llm_comparison.csv");
     comparison_csv << "model,parameters,best_step,val_ce,completion_mse,"
                       "train_update_ms,validation_ms,validation_runs,validation_mean_ms,"
                       "decode_ms,total_train_seconds,"
-                      "inference_state_bytes,state_growth\n";
+                      "inference_state_bytes,state_growth,parameter_bytes,training_tensor_bytes,"
+                      "inference_tensor_bytes,cached_logit_rmse,reference_decode_ms,reference_completion_mse\n";
     for (const ExperimentResult& result : results) {
         double update_ms =
-            result.train_update_seconds * 1000.0 / double(train_steps);
+            result.train_update_seconds * 1000.0 / double((std::max)(1u, train_steps));
         double validation_mean_ms =
-            result.validation_seconds * 1000.0 / double(result.validation_runs);
+            result.validation_seconds * 1000.0 / double((std::max)(1u, result.validation_runs));
         printf("%-16s | params %llu | best_step %u | val_ce %.6f | completion_mse %.6f | update_ms %.3f | validation_mean_ms %.3f | decode_ms %.3f | state_bytes %llu (%s)\n",
                result.name.c_str(),
                static_cast<unsigned long long>(result.parameters),
@@ -1168,7 +1489,11 @@ void main_llm(int argc, char** argv) {
                        << result.decode_ms << ","
                        << result.train_seconds << ","
                        << result.inference_state_bytes << ","
-                       << (result.inference_state_grows_with_sequence ? "linear" : "fixed")
+                       << (result.inference_state_grows_with_sequence ? "linear" : "fixed") << ","
+                       << result.parameters * sizeof(float16_t) << ","
+                       << result.training_tensor_bytes << "," << result.inference_tensor_bytes << ","
+                       << result.cached_logit_rmse << "," << result.reference_decode_ms << ","
+                       << result.reference_completion_mse
                        << "\n";
     }
     if (run_gated_delta) {

@@ -1,0 +1,52 @@
+#include "../common/evk.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+CONSTANT(0) uint capacity = 112u;
+CONSTANT(1) uint width = 256u;
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+PUSH(BufferFp16 query; BufferFp16 keyCache; BufferFp16 valueCache; BufferFp16 outputBuffer;
+     uint position;)
+shared float16_t probabilities[capacity];
+COMPUTE(256, 1, 1)
+void main() {
+    uint b = gl_WorkGroupID.x;
+    uint lane = gl_SubgroupInvocationID, warp = gl_SubgroupID;
+    uint count = min(position + 1u, capacity);
+    uint begin = position + 1u - count;
+    uint start = begin % capacity;
+    for (uint t = warp; t < count; t += 8u) {
+        uint slot = start + t;
+        if (slot >= capacity) slot -= capacity;
+        uint base = (b * capacity + slot) * width;
+        float dot = 0.0;
+        for (uint f = lane; f < width; f += 32u)
+            dot += float(query.x[b * width + f]) * float(keyCache.x[base + f]);
+        dot = subgroupAdd(dot);
+        if (lane == 0u) probabilities[t] = float16_t(dot);
+    }
+    barrier();
+    if (warp == 0u) {
+        float scale = inversesqrt(float(width)), maximum = -3.402823466e+38;
+        for (uint t = lane; t < count; t += 32u)
+            maximum = max(maximum, float(probabilities[t]) * scale);
+        maximum = subgroupMax(maximum);
+        float sum = 0.0;
+        for (uint t = lane; t < count; t += 32u)
+            sum += exp(float(probabilities[t]) * scale - maximum);
+        sum = subgroupAdd(sum);
+        for (uint t = lane; t < count; t += 32u)
+            probabilities[t] = float16_t(exp(float(probabilities[t]) * scale - maximum) / sum);
+    }
+    barrier();
+    for (uint f = gl_LocalInvocationID.x; f < width; f += 256u) {
+        float value = 0.0;
+        uint slot = start;
+        for (uint t = 0u; t < count; ++t) {
+            value += float(probabilities[t]) *
+                float(valueCache.x[(b * capacity + slot) * width + f]);
+            if (++slot == capacity) slot = 0u;
+        }
+        outputBuffer.x[b * width + f] = float16_t(value);
+    }
+}

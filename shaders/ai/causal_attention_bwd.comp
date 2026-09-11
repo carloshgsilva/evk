@@ -10,6 +10,7 @@
 CONSTANT(0) uint N = 16u;
 CONSTANT(1) uint D = 16u;
 CONSTANT(2) uint tileWidth = 64u;
+CONSTANT(3) uint window = 0u;
 layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 PUSH(
     BufferFp16 q;
@@ -39,6 +40,12 @@ void main() {
         result[f] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
     uint begin = mode == 0u ? 0u : row;
     uint end = mode == 0u ? row + 16u : N;
+    if (window != 0u) {
+        if (mode == 0u)
+            begin = row < window ? 0u : ((row - window + 1u) / 16u) * 16u;
+        else
+            end = min(N, ((row + 15u + window + 15u) / 16u) * 16u);
+    }
     for (uint col = begin; col < end; col += 16u) {
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> weights;
         if (mode == 0u)

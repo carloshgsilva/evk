@@ -66,6 +66,8 @@ namespace evk::ai {
         evk::Pipeline embed;
         evk::Pipeline embed_bwd;
         evk::Pipeline greedy_sample;
+        evk::Pipeline swiglu;
+        evk::Pipeline attention_cache_append;
         evk::Pipeline position_add;
         evk::Pipeline position_add_bwd;
         evk::Pipeline gated_delta_projected_step;
@@ -174,20 +176,22 @@ namespace evk::ai {
     };
     static std::unordered_map<uint64_t, evk::Pipeline> flash_configs;
     static std::unordered_map<uint64_t, evk::Pipeline> causal_attention_configs;
+    static std::unordered_map<uint64_t, evk::Pipeline> cached_attention_configs;
 
     static uint32_t causal_attention_tile_width(uint32_t d) {
         return d % 64u == 0u ? 64u : 16u;
     }
 
-    static evk::Pipeline& causal_attention_pipeline(uint32_t n, uint32_t d, uint32_t stage) {
-        auto& pipeline = causal_attention_configs[hash_combine(n, d, stage)];
+    static evk::Pipeline& causal_attention_pipeline(uint32_t n, uint32_t d, uint32_t stage,
+                                                    uint32_t window) {
+        auto& pipeline = causal_attention_configs[hash_combine(n, d, stage, window)];
         if (!pipeline) {
             const char* name = stage == 2u ? "causal_attention_bwd" : "causal_attention";
             uint32_t variant = stage == 2u ? causal_attention_tile_width(d) : uint32_t(stage == 1u);
             pipeline = evk::CreatePipeline({
                 .name = name,
                 .CS = detail::load_embedded_shader(name),
-                .constants = evk::Constant{n, d, variant},
+                .constants = evk::Constant{n, d, variant, window},
             });
         }
         return pipeline;
@@ -287,6 +291,8 @@ namespace evk::ai {
         pipelines->embed = create_named_compute_pipeline("embed");
         pipelines->embed_bwd = create_named_compute_pipeline("embed_bwd");
         pipelines->greedy_sample = create_named_compute_pipeline("greedy_sample");
+        pipelines->swiglu = create_named_compute_pipeline("swiglu");
+        pipelines->attention_cache_append = create_named_compute_pipeline("attention_cache_append");
         pipelines->position_add = create_named_compute_pipeline("position_add");
         pipelines->position_add_bwd = create_named_compute_pipeline("position_add_bwd");
         pipelines->gated_delta_projected_step =
@@ -322,6 +328,7 @@ namespace evk::ai {
         matmul_configs.clear();
         flash_configs.clear();
         causal_attention_configs.clear();
+        cached_attention_configs.clear();
     }
 
     void matmul(Tensor& a, Tensor& b, Tensor& c, bool transpose_a, bool transpose_b,
@@ -432,14 +439,14 @@ namespace evk::ai {
     }
 
     void causal_attention(Tensor& q, Tensor& k, Tensor& v, Tensor& probabilities,
-                          Tensor& output, float scale) {
+                          Tensor& output, float scale, uint32_t window) {
         assert(q.shape.rank() == 3u && q.shape == k.shape &&
                q.shape == v.shape && q.shape == output.shape);
         uint32_t b = q.shape[0], n = q.shape[1], d = q.shape[2];
         assert(supports_fused_causal_attention(n, d));
         assert(probabilities.shape == Shape({b, n, n}));
         auto& cmd = GetCmd();
-        cmd.bind(causal_attention_pipeline(n, d, 0u));
+        cmd.bind(causal_attention_pipeline(n, d, 0u, window));
         cmd.push(evk::Constant{
             q.buffer.GetReference(), k.buffer.GetReference(), v.buffer.GetReference(),
             probabilities.buffer.GetReference(), output.buffer.GetReference(), scale,
@@ -450,7 +457,7 @@ namespace evk::ai {
 
     void causal_attention_backward(Tensor& q, Tensor& k, Tensor& v, Tensor& probabilities,
                                    Tensor& grad_output, Tensor& grad_q, Tensor& grad_k,
-                                   Tensor& grad_v, Tensor& grad_scores, float scale) {
+                                   Tensor& grad_v, Tensor& grad_scores, float scale, uint32_t window) {
         assert(q.shape.rank() == 3u && q.shape == k.shape && q.shape == v.shape);
         assert(q.shape == grad_output.shape && q.shape == grad_q.shape &&
                q.shape == grad_k.shape && q.shape == grad_v.shape);
@@ -459,7 +466,7 @@ namespace evk::ai {
         assert(probabilities.shape == Shape({b, n, n}) &&
                probabilities.shape == grad_scores.shape);
         auto& cmd = GetCmd();
-        cmd.bind(causal_attention_pipeline(n, d, 1u));
+        cmd.bind(causal_attention_pipeline(n, d, 1u, window));
         cmd.push(evk::Constant{
             grad_output.buffer.GetReference(), v.buffer.GetReference(), v.buffer.GetReference(),
             probabilities.buffer.GetReference(), grad_scores.buffer.GetReference(), scale,
@@ -475,13 +482,68 @@ namespace evk::ai {
             matmul(grad_scores, q, grad_k, true, false, true, 16, 16);
             return;
         }
-        cmd.bind(causal_attention_pipeline(n, d, 2u));
+        cmd.bind(causal_attention_pipeline(n, d, 2u, window));
         cmd.push(evk::Constant{
             q.buffer.GetReference(), k.buffer.GetReference(), probabilities.buffer.GetReference(),
             grad_output.buffer.GetReference(), grad_scores.buffer.GetReference(),
             grad_q.buffer.GetReference(), grad_k.buffer.GetReference(), grad_v.buffer.GetReference(),
         });
         cmd.dispatch(d / causal_attention_tile_width(d), n / 16u, b * 3u);
+        cmd.computeBarrier();
+    }
+
+    void attention_cache_append(Tensor& k, Tensor& v, Tensor& key_cache, Tensor& value_cache,
+                                uint32_t position, float rope_base) {
+        assert(k.shape == v.shape && key_cache.shape == value_cache.shape);
+        assert(k.shape.rank() == 3u && k.shape[0] == 1u && key_cache.shape.rank() == 3u);
+        uint32_t b = key_cache.shape[0], c = key_cache.shape[1], d = key_cache.shape[2];
+        assert(c > 0u && d % 2u == 0u && k.shape[1] >= b && k.shape[2] == d);
+        auto& cmd = GetCmd();
+        cmd.bind(pipelines->attention_cache_append);
+        cmd.push(evk::Constant{k.buffer.GetReference(), v.buffer.GetReference(),
+            key_cache.buffer.GetReference(), value_cache.buffer.GetReference(),
+            b, c, d, position, rope_base});
+        cmd.dispatch((b * d / 2u + 255u) / 256u, 1u, 1u);
+        cmd.computeBarrier();
+    }
+
+    void cached_attention(Tensor& q, Tensor& key_cache, Tensor& value_cache,
+                          Tensor& output, uint32_t position) {
+        assert(q.shape == output.shape && key_cache.shape == value_cache.shape);
+        assert(q.shape.rank() == 3u && q.shape[0] == 1u && key_cache.shape.rank() == 3u);
+        uint32_t b = key_cache.shape[0], c = key_cache.shape[1], d = key_cache.shape[2];
+        assert(c > 0u && c <= 16384u && d > 0u && q.shape[1] == b && q.shape[2] == d);
+        auto& pipeline = cached_attention_configs[hash_combine(c, d)];
+        if (!pipeline) pipeline = evk::CreatePipeline({
+            .name = "cached_attention", .CS = detail::load_embedded_shader("cached_attention"),
+            .constants = evk::Constant{c, d},
+        });
+        auto& cmd = GetCmd();
+        cmd.bind(pipeline);
+        cmd.push(evk::Constant{q.buffer.GetReference(), key_cache.buffer.GetReference(),
+            value_cache.buffer.GetReference(), output.buffer.GetReference(), position});
+        cmd.dispatch(b, 1u, 1u);
+        cmd.computeBarrier();
+    }
+
+    void swiglu(Tensor& input, Tensor& output) {
+        assert(input.shape.count() == 2u * output.shape.count());
+        assert(input.shape[-1] == 2u * output.shape[-1]);
+        auto& cmd = GetCmd();
+        cmd.bind(pipelines->swiglu);
+        cmd.push(evk::Constant{input.buffer.GetReference(), output.buffer.GetReference(),
+            input.buffer.GetReference(), output.shape[-1], output.shape.count(), 0u});
+        cmd.dispatch((output.shape.count() + 255u) / 256u, 1u, 1u);
+        cmd.computeBarrier();
+    }
+
+    void swiglu_backward(Tensor& input, Tensor& grad_output, Tensor& grad_input) {
+        assert(input.shape == grad_input.shape && input.shape.count() == 2u * grad_output.shape.count());
+        auto& cmd = GetCmd();
+        cmd.bind(pipelines->swiglu);
+        cmd.push(evk::Constant{input.buffer.GetReference(), grad_output.buffer.GetReference(),
+            grad_input.buffer.GetReference(), grad_output.shape[-1], grad_output.shape.count(), 1u});
+        cmd.dispatch((grad_output.shape.count() + 255u) / 256u, 1u, 1u);
         cmd.computeBarrier();
     }
 
@@ -1215,7 +1277,7 @@ namespace evk::ai {
         cmd.computeBarrier();
     }
 
-    void apply_causal_mask(Tensor& scores) {
+    void apply_causal_mask(Tensor& scores, uint32_t window) {
         assert(scores.shape.rank() >= 2);
         uint32_t N = scores.shape[-1];
         assert(scores.shape[-2] == N);
@@ -1229,6 +1291,7 @@ namespace evk::ai {
             scores.buffer.GetReference(),
             batch,
             N,
+            window,
         });
 
         const uint32_t WORKGROUP_SIZE = 256u;

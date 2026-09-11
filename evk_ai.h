@@ -512,10 +512,21 @@ namespace evk::ai {
     // Q/K/V/output: (B,N,D); probabilities/grad_scores workspace: (B,N,N).
     // Backward overwrites workspace and accumulates into the Q/K/V gradients.
     void causal_attention(Tensor& q, Tensor& k, Tensor& v, Tensor& probabilities,
-                          Tensor& output, float scale);
+                          Tensor& output, float scale, uint32_t window = 0);
     void causal_attention_backward(Tensor& q, Tensor& k, Tensor& v, Tensor& probabilities,
                                    Tensor& grad_output, Tensor& grad_q, Tensor& grad_k,
-                                   Tensor& grad_v, Tensor& grad_scores, float scale);
+                                   Tensor& grad_v, Tensor& grad_scores, float scale, uint32_t window = 0);
+
+    // Inference-only ring KV cache: rows (1,B,D), caches (B,capacity,D).
+    // Keys receive RoPE when appended; queries must already have RoPE applied.
+    void attention_cache_append(Tensor& k, Tensor& v, Tensor& key_cache, Tensor& value_cache,
+                                uint32_t position, float rope_base = 10000.0f);
+    void cached_attention(Tensor& q, Tensor& key_cache, Tensor& value_cache,
+                          Tensor& output, uint32_t position);
+
+    // Packed last dimension [gate,value], out = silu(gate) * value.
+    void swiglu(Tensor& input, Tensor& output);
+    void swiglu_backward(Tensor& input, Tensor& grad_output, Tensor& grad_input);
 
     // Fused Flash Attention forward (Multi-Query Attention)
     // New layout without head permutation:
@@ -612,7 +623,7 @@ namespace evk::ai {
     // Apply causal mask to attention scores (set future positions to -inf)
     // scores: (B, N, N) attention scores where scores[b, i, j] is query i attending to key j
     // For causal: j > i should be masked (set to -inf)
-    void apply_causal_mask(Tensor& scores);
+    void apply_causal_mask(Tensor& scores, uint32_t window = 0);
 
     // Position embedding addition: out = input + pos_emb (broadcast across batch)
     void position_add(Tensor& input, Tensor& pos_emb, Tensor& out,
@@ -683,17 +694,31 @@ struct Graph {
     std::vector<std::unique_ptr<Tensor>> nodes;
     std::vector<Tensor*> params;
     std::unordered_map<Tensor*, evk::ai::AdamState> adam_states;
+    // Saved operator intermediates are not differentiable graph nodes.
+    std::vector<std::unique_ptr<Tensor>> workspaces;
+
+    Tensor& workspace(Shape shape) {
+        workspaces.push_back(std::make_unique<Tensor>(shape));
+        return *workspaces.back();
+    }
 
     // Some operations need a reusable temp/scratch buffer
-    std::unique_ptr<Tensor> scratch;
+    struct Scratch {
+        std::unique_ptr<Tensor> tensor;
+        uint32_t capacity = 0;
+    };
+    std::vector<Scratch> scratch;
 
-    Tensor& get_scratch(const Shape& shape) {
-        if (!scratch || scratch->shape.count() < shape.count()) {
-            scratch = std::make_unique<Tensor>(shape);
+    Tensor& get_scratch(const Shape& shape, uint32_t slot = 0) {
+        if (scratch.size() <= slot) scratch.resize(slot + 1u);
+        auto& buffer = scratch[slot];
+        if (!buffer.tensor || buffer.capacity < shape.count()) {
+            buffer.tensor = std::make_unique<Tensor>(shape);
+            buffer.capacity = shape.count();
         } else {
-            scratch->shape = shape;
+            buffer.tensor->shape = shape;
         }
-        return *scratch;
+        return *buffer.tensor;
     }
 
     Tensor& tensor(Shape shape, bool param = false) {
@@ -951,6 +976,82 @@ struct Graph {
             evk::ai::concat_channels(a, b, output);
         };
         return output;
+    }
+
+    Tensor& swiglu(Tensor& input) {
+        Shape shape = input.shape;
+        assert(shape[-1] % 2u == 0u);
+        shape.values[shape.rank() - 1u] /= 2u;
+        Tensor& out = tensor(shape);
+        out.forward_fn = [&input, &out]() { evk::ai::swiglu(input, out); };
+        out.backward_fn = [&input, &out]() {
+            evk::ai::swiglu_backward(input, out.grad(), input.grad());
+        };
+        return out;
+    }
+
+    // Same operations as swiglu -> matmul_residual, but dHidden is temporary.
+    // Reserve scratch during construction; each callback fully consumes it.
+    Tensor& swiglu_matmul_residual(Tensor& packed, Tensor& weight, Tensor& residual) {
+        assert(packed.shape.rank() == 3u && weight.shape.rank() == 2u);
+        assert(packed.shape[2] == 2u * weight.shape[0]);
+        assert(residual.shape == Shape({packed.shape[0], packed.shape[1], weight.shape[1]}));
+        Shape hidden_shape({packed.shape[0], packed.shape[1], weight.shape[0]});
+        Tensor& hidden = workspace(hidden_shape);
+        Tensor& out = tensor(residual.shape);
+        get_scratch(hidden_shape);
+        out.forward_fn = [&packed, &weight, &residual, &hidden, &out]() {
+            evk::ai::swiglu(packed, hidden);
+            evk::ai::matmul(hidden, weight, out, false, false, false, 16, 16, &residual);
+        };
+        out.backward_fn = [this, &packed, &weight, &residual, &hidden, &out, hidden_shape]() {
+            Tensor& grad_hidden = get_scratch(hidden_shape);
+            evk::ai::add(residual.grad(), out.grad(), residual.grad());
+            evk::ai::matmul(out.grad(), weight, grad_hidden, false, true, false, 16, 16);
+            evk::ai::matmul_weight_backward(hidden, out.grad(), weight.grad());
+            evk::ai::swiglu_backward(packed, grad_hidden, packed.grad());
+        };
+        return out;
+    }
+
+    // Save activations, but share both intermediate gradients across layers.
+    Tensor& swiglu_ffn(Tensor& input, Tensor& weight_in, Tensor& weight_out,
+                       Tensor& residual, uint8_t tile_n = 16, float rms_epsilon = 0.0f) {
+        assert(rms_epsilon >= 0.0f);
+        assert(input.shape.rank() == 3u && weight_in.shape.rank() == 2u && weight_out.shape.rank() == 2u);
+        assert(weight_in.shape[1] == 2u * weight_out.shape[0]);
+        Shape packed_shape({input.shape[0], input.shape[1], weight_in.shape[1]});
+        Shape hidden_shape({input.shape[0], input.shape[1], weight_out.shape[0]});
+        assert(residual.shape == Shape({input.shape[0], input.shape[1], weight_out.shape[1]}));
+        Tensor& packed = workspace(packed_shape);
+        Tensor& hidden = workspace(hidden_shape);
+        Tensor& out = tensor(residual.shape);
+        // A positive epsilon enables input RMSNorm; zero preserves the unnormalized API.
+        Tensor& projected_input = rms_epsilon > 0.0f ? workspace(input.shape) : input;
+        get_scratch(hidden_shape);
+        get_scratch(packed_shape, 1);
+        if (rms_epsilon > 0.0f) get_scratch(input.shape);
+        out.forward_fn = [&input, &projected_input, &weight_in, &weight_out, &residual, &packed, &hidden, &out, tile_n, rms_epsilon]() {
+            if (rms_epsilon > 0.0f) evk::ai::rms_norm(input, projected_input, rms_epsilon);
+            evk::ai::matmul(projected_input, weight_in, packed, false, false, false, 16, tile_n);
+            evk::ai::swiglu(packed, hidden);
+            evk::ai::matmul(hidden, weight_out, out, false, false, false, 16, 16, &residual);
+        };
+        out.backward_fn = [this, &input, &projected_input, &weight_in, &weight_out, &residual, &packed, &hidden, &out, tile_n, rms_epsilon]() {
+            Tensor& grad_hidden = get_scratch(hidden.shape);
+            Tensor& grad_packed = get_scratch(packed.shape, 1);
+            evk::ai::zero(grad_packed);
+            evk::ai::add(residual.grad(), out.grad(), residual.grad());
+            evk::ai::matmul(out.grad(), weight_out, grad_hidden, false, true, false, 16, 16);
+            evk::ai::matmul_weight_backward(hidden, out.grad(), weight_out.grad());
+            evk::ai::swiglu_backward(packed, grad_hidden, grad_packed);
+            // dHidden is dead, so its slot can now hold the normalization gradient.
+            Tensor& grad_input = rms_epsilon > 0.0f ? get_scratch(input.shape) : input.grad();
+            evk::ai::matmul(grad_packed, weight_in, grad_input, false, true, rms_epsilon <= 0.0f, 16, tile_n);
+            evk::ai::matmul_weight_backward(projected_input, grad_packed, weight_in.grad());
+            if (rms_epsilon > 0.0f) evk::ai::rms_norm_backward(input, grad_input, input.grad(), rms_epsilon);
+        };
+        return out;
     }
 
     Tensor& gelu(Tensor& a) {
@@ -1229,36 +1330,36 @@ struct Graph {
     // Causal self-attention: Q @ K^T (scaled) -> causal_mask -> softmax -> @ V
     // q: (B, N, D), k: (B, N, D), v: (B, N, D)
     // Returns: (B, N, D) attention output
-    Tensor& causal_attention(Tensor& q, Tensor& k, Tensor& v, float scale = 0.0f) {
+    Tensor& causal_attention(Tensor& q, Tensor& k, Tensor& v, float scale = 0.0f,
+                            uint32_t window = 0) {
         assert(q.shape.rank() == 3 && k.shape.rank() == 3 && v.shape.rank() == 3);
         uint32_t B = q.shape[0], N = q.shape[1], D = q.shape[2];
-        
-        // Intermediate tensors stored in graph
-        nodes.push_back(std::make_unique<Tensor>(Shape({B, N, N}))); // scores
-        Tensor& scores = *nodes.back();
-        nodes.push_back(std::make_unique<Tensor>(Shape({B, N, N}))); // probs
-        Tensor& probs = *nodes.back();
-        nodes.push_back(std::make_unique<Tensor>(Shape({B, N, D}))); // output
-        Tensor& out = *nodes.back();
-        
         float attn_scale = (scale > 0.0f) ? scale : (1.0f / std::sqrt(float(D)));
         if (evk::ai::supports_fused_causal_attention(N, D)) {
-            out.forward_fn = [&q, &k, &v, &probs, &out, attn_scale]() {
-                evk::ai::causal_attention(q, k, v, probs, out, attn_scale);
+            Tensor& probs = workspace({B, N, N});
+            Tensor& out = tensor(q.shape);
+            get_scratch({B, N, N});
+            out.forward_fn = [&q, &k, &v, &probs, &out, attn_scale, window]() {
+                evk::ai::causal_attention(q, k, v, probs, out, attn_scale, window);
             };
-            out.backward_fn = [&q, &k, &v, &scores, &probs, &out, attn_scale]() {
+            out.backward_fn = [this, &q, &k, &v, &probs, &out, attn_scale, window, B, N]() {
+                Tensor& scores = get_scratch({B, N, N});
                 evk::ai::causal_attention_backward(q, k, v, probs, out.grad(),
-                    q.grad(), k.grad(), v.grad(), scores, attn_scale);
+                    q.grad(), k.grad(), v.grad(), scores, attn_scale, window);
             };
             return out;
         }
         
-        out.forward_fn = [&q, &k, &v, &scores, &probs, &out, attn_scale, B, N, D]() {
+        Tensor& scores = tensor({B, N, N});
+        Tensor& probs = tensor({B, N, N});
+        Tensor& out = tensor(q.shape);
+
+        out.forward_fn = [&q, &k, &v, &scores, &probs, &out, attn_scale, window]() {
             // scores = Q @ K^T
             evk::ai::matmul(q, k, scores, false, true, false, 16, 16);
 
             // Apply causal mask
-            evk::ai::apply_causal_mask(scores);
+            evk::ai::apply_causal_mask(scores, window);
             
             // Softmax with input scaling fused in float before exponentiation
             evk::ai::softmax(scores, probs, attn_scale);
@@ -1284,6 +1385,34 @@ struct Graph {
             evk::ai::matmul(scores.grad(), q, k.grad(), true, false, true, 16, 16);
         };
         
+        return out;
+    }
+
+    // The unrotated projection is not needed by either backward operation.
+    // Positive rms_epsilon enables input RMSNorm; zero leaves the input unchanged.
+    Tensor& matmul_rope(Tensor& input, Tensor& weight, float base = 10000.0f,
+                        float rms_epsilon = 0.0f, uint8_t tile_n = 16) {
+        assert(rms_epsilon >= 0.0f);
+        assert(input.shape.rank() == 3u && weight.shape.rank() == 2u);
+        Shape shape({input.shape[0], input.shape[1], weight.shape[1]});
+        Tensor& out = tensor(shape);
+        Tensor& projected_input = rms_epsilon > 0.0f ? workspace(input.shape) : input;
+        get_scratch(shape);
+        if (rms_epsilon > 0.0f) get_scratch(input.shape, 1);
+        out.forward_fn = [&input, &projected_input, &weight, &out, base, shape, rms_epsilon, tile_n]() {
+            if (rms_epsilon > 0.0f) evk::ai::rms_norm(input, projected_input, rms_epsilon);
+            evk::ai::matmul(projected_input, weight, out, false, false, false, 16, tile_n);
+            evk::ai::rope(out, out, shape[0], shape[1], shape[2], base);
+        };
+        out.backward_fn = [this, &input, &projected_input, &weight, &out, base, shape, rms_epsilon, tile_n]() {
+            Tensor& grad = get_scratch(shape);
+            evk::ai::zero(grad);
+            evk::ai::rope_backward(out.grad(), grad, shape[0], shape[1], shape[2], base);
+            Tensor& grad_input = rms_epsilon > 0.0f ? get_scratch(input.shape, 1) : input.grad();
+            evk::ai::matmul(grad, weight, grad_input, false, true, rms_epsilon <= 0.0f, 16, tile_n);
+            evk::ai::matmul_weight_backward(projected_input, grad, weight.grad());
+            if (rms_epsilon > 0.0f) evk::ai::rms_norm_backward(input, grad_input, input.grad(), rms_epsilon);
+        };
         return out;
     }
 

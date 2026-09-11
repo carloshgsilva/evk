@@ -219,12 +219,12 @@ void test_matmul_broadcast() {
     TEST(ok);
 }
 
-void test_matmul_weight_backward_cpu_reference() {
-    printf("test_matmul_weight_backward_cpu_reference()\n");
+void test_matmul_weight_backward_cpu_reference(float gradient_scale = 0.07f) {
+    printf("test_matmul_weight_backward_cpu_reference(scale=%g)\n", gradient_scale);
     constexpr uint32_t B = 16u;
     constexpr uint32_t M = 112u;
-    constexpr uint32_t K = 16u;
-    constexpr uint32_t N = 16u;
+    constexpr uint32_t K = 32u;
+    constexpr uint32_t N = 48u;
     Tensor input({B, M, K});
     Tensor grad_output({B, M, N});
     Tensor grad_weight({K, N});
@@ -234,7 +234,7 @@ void test_matmul_weight_backward_cpu_reference() {
     }
     for (uint32_t i = 0u; i < grad_output.shape.count(); ++i) {
         grad_output.cpu()[i] =
-            float16_t(0.07f * std::cos(float(i) * 0.09f));
+            float16_t(gradient_scale * std::cos(float(i) * 0.09f));
     }
     input.cpu_upload();
     grad_output.cpu_upload();
@@ -2067,7 +2067,8 @@ void test_ai_generic_fallback() {
 }
 
 template <uint32_t N, uint32_t D>
-void test_causal_attention_reference(float gradient_scale = 1.0f, float input_scale = 1.5f) {
+void test_causal_attention_reference(float gradient_scale = 1.0f, float input_scale = 1.5f,
+                                     uint32_t window = 0) {
     printf("test_causal_attention_reference(N=%u, D=%u, gradient_scale=%g)\n", N, D,
            gradient_scale);
     constexpr uint32_t B = 2u;
@@ -2077,7 +2078,7 @@ void test_causal_attention_reference(float gradient_scale = 1.0f, float input_sc
     Tensor &q = graph.tensor({B, N, D});
     Tensor &k = graph.tensor({B, N, D});
     Tensor &v = graph.tensor({B, N, D});
-    Tensor &out = graph.causal_attention(q, k, v, scale);
+    Tensor &out = graph.causal_attention(q, k, v, scale, window);
     uint32_t random = 57u;
     for (Tensor *tensor : {&q, &k, &v, &out.grad()}) {
         for (uint32_t i = 0; i < tensor->shape.count(); ++i) {
@@ -2106,6 +2107,7 @@ void test_causal_attention_reference(float gradient_scale = 1.0f, float input_sc
             std::vector<float> p(row + 1), dp(row + 1);
             float maximum = -1e30f;
             for (uint32_t col = 0; col <= row; ++col) {
+                if (window && col + window <= row) { p[col] = -1e30f; continue; }
                 float dot = 0.0f, grad_dot = 0.0f;
                 for (uint32_t f = 0; f < D; ++f) {
                     dot += float(q.cpu()[(b * N + row) * D + f]) *
@@ -2159,6 +2161,7 @@ void test_causal_attention_reference(float gradient_scale = 1.0f, float input_sc
                     std::vector<double> logits(row + 1), weighted_values(row + 1);
                     double maximum = -1e30;
                     for (uint32_t col = 0; col <= row; ++col) {
+                        if (window && col + window <= row) { logits[col] = -1e30; continue; }
                         for (uint32_t f = 0; f < D; ++f) {
                             uint32_t i = (b * N + row) * D + f, j = (b * N + col) * D + f;
                             double qv =
@@ -2199,7 +2202,7 @@ void test_causal_attention_reference(float gradient_scale = 1.0f, float input_sc
     // The old unfused path is an independent FP16 integration reference.
     Tensor scores({B, N, N}), probs({B, N, N}), reference({B, N, D});
     evk::ai::matmul(q, k, scores, false, true, false, 16, 16);
-    evk::ai::apply_causal_mask(scores);
+    evk::ai::apply_causal_mask(scores, window);
     evk::ai::softmax(scores, probs, scale);
     evk::ai::matmul(probs, v, reference, false, false, false, 16, 16);
     scores.grad().fill(0.0f);
@@ -2252,7 +2255,7 @@ void test_causal_attention_reference(float gradient_scale = 1.0f, float input_sc
         shared_grad.fill(gradient_initial);
         shared_reference.fill(gradient_initial);
         evk::ai::causal_attention_backward(q, k, v, probs, out.grad(), shared_grad, shared_grad,
-                                           shared_grad, workspace, scale);
+                                           shared_grad, workspace, scale, window);
         evk::ai::matmul(probs, out.grad(), shared_reference, true, false, true, 16, 16);
         evk::ai::matmul(scores.grad(), k, shared_reference, false, false, true, 16, 16);
         evk::ai::matmul(scores.grad(), q, shared_reference, true, false, true, 16, 16);
@@ -2312,7 +2315,294 @@ void test_causal_attention_mask_sentinel() {
     TEST(std::isnan(float(out.cpu()[0])));
 }
 
+void test_swiglu_reference() {
+    printf("test_swiglu_reference()\n");
+    Graph graph;
+    Tensor& input = graph.tensor({1, 16, 32});
+    Tensor& output = graph.swiglu(input);
+    for (uint32_t i = 0; i < input.shape.count(); ++i)
+        input.cpu()[i] = float16_t((int(i % 37u) - 18) * 0.3f);
+    input.cpu_upload();
+    input.grad().fill(0.125f);
+    output.grad().fill(0.3f);
+    output.forward_fn();
+    output.backward_fn();
+    output.cpu_download();
+    input.grad().cpu_download();
+    bool forward = true, backward = true;
+    auto silu = [](double x) { return x / (1.0 + std::exp(-x)); };
+    for (uint32_t i = 0; i < output.shape.count(); ++i) {
+        uint32_t j = (i / 16u) * 32u + i % 16u;
+        double gate = float(input.cpu()[j]), value = float(input.cpu()[j + 16u]);
+        double grad = float(output.grad().cpu()[i]);
+        double numerical_gate = grad * value * (silu(gate + 1e-4) - silu(gate - 1e-4)) / 2e-4;
+        forward &= approx_eq(float(output.cpu()[i]), float(silu(gate) * value), 0.01f);
+        backward &= approx_eq(float(input.grad().cpu()[j]), float(0.125 + numerical_gate), 0.003f);
+        backward &= approx_eq(float(input.grad().cpu()[j + 16u]), float(0.125 + grad * silu(gate)), 0.003f);
+    }
+    TEST(forward);
+    TEST(backward);
+}
+
+void test_swiglu_residual_workspace() {
+    printf("test_swiglu_residual_workspace()\n");
+    Graph graph;
+    Tensor& packed = graph.tensor({1, 16, 64});
+    Tensor& weight = graph.tensor({32, 16});
+    Tensor& residual = graph.tensor({1, 16, 16});
+    for (Tensor* input : {&packed, &weight, &residual}) {
+        for (uint32_t i = 0; i < input->shape.count(); ++i)
+            input->cpu()[i] = float16_t(std::sin(float(i)) * 0.2f);
+        input->cpu_upload();
+    }
+    Tensor& hidden = graph.swiglu(packed);
+    Tensor& reference = graph.matmul_residual(hidden, weight, residual);
+    Tensor& actual = graph.swiglu_matmul_residual(packed, weight, residual);
+    auto allocation = graph.get_scratch(hidden.shape).buffer.GetReference();
+    graph.get_scratch({1, 16, 16});
+    TEST(graph.get_scratch(hidden.shape).buffer.GetReference() == allocation);
+    hidden.forward_fn();
+    reference.forward_fn();
+    actual.forward_fn();
+    reference.cpu_download();
+    actual.cpu_download();
+    bool equivalent = true;
+    for (uint32_t i = 0; i < actual.shape.count(); ++i)
+        equivalent &= float(actual.cpu()[i]) == float(reference.cpu()[i]);
+    reference.grad().fill(0.125f);
+    actual.grad().fill(0.125f);
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        for (Tensor* input : {&packed, &weight, &residual}) input->grad().fill(0.25f);
+        hidden.grad().fill(0.0f);
+        reference.backward_fn();
+        hidden.backward_fn();
+        std::vector<float> expected;
+        for (Tensor* input : {&packed, &weight, &residual}) {
+            input->grad().cpu_download();
+            for (uint32_t i = 0; i < input->shape.count(); ++i)
+                expected.push_back(float(input->grad().cpu()[i]));
+            input->grad().fill(0.25f);
+        }
+        graph.get_scratch(hidden.shape).fill(float16_t(std::nanf("")));
+        actual.backward_fn();
+        uint32_t index = 0;
+        for (Tensor* input : {&packed, &weight, &residual}) {
+            input->grad().cpu_download();
+            for (uint32_t i = 0; i < input->shape.count(); ++i)
+                equivalent &= float(input->grad().cpu()[i]) == expected[index++];
+        }
+    }
+    TEST(equivalent);
+}
+
+void test_swiglu_ffn_workspace(bool normalize = false, float gradient_scale = 0.125f) {
+    printf("test_swiglu_ffn_workspace(normalize=%d, gradient_scale=%g)\n", normalize, gradient_scale);
+    Graph graph;
+    Tensor& input = graph.tensor({2, 16, 64});
+    Tensor& w1 = graph.tensor({64, 64});
+    Tensor& w2 = graph.tensor({32, 64});
+    Tensor& residual = normalize ? input : graph.tensor(input.shape);
+    std::vector<Tensor*> inputs{&input, &w1, &w2};
+    if (&residual != &input) inputs.push_back(&residual);
+    for (Tensor* tensor : inputs) {
+        for (uint32_t i = 0; i < tensor->shape.count(); ++i)
+            tensor->cpu()[i] = float16_t(std::sin(float(i)) * 0.2f);
+        tensor->cpu_upload();
+    }
+    Tensor& projected = normalize ? graph.rms_norm(input) : input;
+    Tensor& packed = graph.matmul(projected, w1, 16, 32);
+    Tensor& expected = graph.swiglu_matmul_residual(packed, w2, residual);
+    Tensor& actual = graph.swiglu_ffn(input, w1, w2, residual, 32, normalize ? 1e-4f : 0.0f);
+    if (normalize) projected.forward_fn();
+    packed.forward_fn();
+    expected.forward_fn();
+    actual.forward_fn();
+    expected.cpu_download();
+    actual.cpu_download();
+    bool equivalent = true;
+    for (uint32_t i = 0; i < actual.shape.count(); ++i)
+        equivalent &= actual.cpu()[i].value == expected.cpu()[i].value;
+    expected.grad().fill(gradient_scale);
+    actual.grad().fill(gradient_scale);
+    float initial_gradient = gradient_scale < 0.01f ? 0.0f : 0.25f;
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        for (Tensor* tensor : inputs) tensor->grad().fill(initial_gradient);
+        packed.grad().fill(0.0f);
+        if (normalize) projected.grad().fill(0.0f);
+        expected.backward_fn();
+        packed.backward_fn();
+        if (normalize) projected.backward_fn();
+        std::vector<uint16_t> gradients;
+        for (Tensor* tensor : inputs) {
+            tensor->grad().cpu_download();
+            for (uint32_t i = 0; i < tensor->shape.count(); ++i)
+                gradients.push_back(tensor->grad().cpu()[i].value);
+            tensor->grad().fill(initial_gradient);
+        }
+        for (auto& buffer : graph.scratch) buffer.tensor->fill(float16_t(std::nanf("")));
+        actual.backward_fn();
+        uint32_t index = 0;
+        for (Tensor* tensor : inputs) {
+            tensor->grad().cpu_download();
+            for (uint32_t i = 0; i < tensor->shape.count(); ++i)
+                equivalent &= tensor->grad().cpu()[i].value == gradients[index++];
+        }
+    }
+    TEST(equivalent);
+}
+
+void test_matmul_rope_workspace(bool normalize = false, uint8_t tile_n = 16) {
+    printf("test_matmul_rope_workspace(normalize=%d, tile_n=%u)\n", normalize, unsigned(tile_n));
+    Graph graph;
+    uint32_t width = (std::max)(64u, uint32_t(tile_n));
+    Tensor& input = graph.tensor({2, 16, width});
+    Tensor& weight = graph.tensor({width, width});
+    for (Tensor* tensor : {&input, &weight}) {
+        for (uint32_t i = 0; i < tensor->shape.count(); ++i)
+            tensor->cpu()[i] = float16_t(std::sin(float(i)) * 0.2f);
+        tensor->cpu_upload();
+    }
+    Tensor& projected = normalize ? graph.rms_norm(input) : input;
+    Tensor& raw = graph.matmul(projected, weight);
+    Tensor& expected = graph.rope(raw);
+    Tensor& actual = graph.matmul_rope(input, weight, 10000.0f, normalize ? 1e-4f : 0.0f, tile_n);
+    if (normalize) projected.forward_fn();
+    raw.forward_fn();
+    expected.forward_fn();
+    actual.forward_fn();
+    expected.cpu_download();
+    actual.cpu_download();
+    bool equivalent = true;
+    for (uint32_t i = 0; i < actual.shape.count(); ++i)
+        equivalent &= actual.cpu()[i].value == expected.cpu()[i].value;
+    expected.grad().fill(0.125f);
+    actual.grad().fill(0.125f);
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        input.grad().fill(0.25f);
+        weight.grad().fill(0.25f);
+        raw.grad().fill(0.0f);
+        if (normalize) projected.grad().fill(0.0f);
+        expected.backward_fn();
+        raw.backward_fn();
+        if (normalize) projected.backward_fn();
+        std::vector<uint16_t> gradients;
+        for (Tensor* tensor : {&input, &weight}) {
+            tensor->grad().cpu_download();
+            for (uint32_t i = 0; i < tensor->shape.count(); ++i)
+                gradients.push_back(tensor->grad().cpu()[i].value);
+            tensor->grad().fill(0.25f);
+        }
+        graph.get_scratch(actual.shape).fill(float16_t(std::nanf("")));
+        actual.backward_fn();
+        uint32_t index = 0;
+        for (Tensor* tensor : {&input, &weight}) {
+            tensor->grad().cpu_download();
+            for (uint32_t i = 0; i < tensor->shape.count(); ++i)
+                equivalent &= tensor->grad().cpu()[i].value == gradients[index++];
+        }
+    }
+    TEST(equivalent);
+}
+
+void test_shared_attention_gradients() {
+    printf("test_shared_attention_gradients()\n");
+    Graph graph;
+    Tensor& q = graph.tensor({1, 16, 16});
+    Tensor& k = graph.tensor(q.shape);
+    Tensor& v = graph.tensor(q.shape);
+    for (Tensor* input : {&q, &k, &v}) {
+        for (uint32_t i = 0; i < input->shape.count(); ++i)
+            input->cpu()[i] = float16_t(std::sin(float(i)) * 0.5f);
+        input->cpu_upload();
+    }
+    Tensor& weight = graph.tensor(q.shape).fill(0.125f);
+    Tensor& a = graph.causal_attention(q, k, v);
+    Tensor& seed = graph.tensor({1});
+    seed.backward_fn = [&]() { evk::ai::add(a.grad(), weight, a.grad()); };
+    graph.eval(true);
+    std::vector<float> single;
+    for (Tensor* input : {&q, &k, &v}) {
+        input->grad().cpu_download();
+        for (uint32_t i = 0; i < input->shape.count(); ++i)
+            single.push_back(float(input->grad().cpu()[i]));
+    }
+    seed.backward_fn = nullptr;
+    Tensor& b = graph.causal_attention(q, k, v);
+    graph.tensor({1}).backward_fn = [&]() {
+        evk::ai::add(a.grad(), weight, a.grad());
+        evk::ai::add(b.grad(), weight, b.grad());
+    };
+    graph.eval(true);
+    bool shared_gradient_sum = true;
+    uint32_t index = 0;
+    for (Tensor* input : {&q, &k, &v}) {
+        input->grad().cpu_download();
+        for (uint32_t i = 0; i < input->shape.count(); ++i)
+            shared_gradient_sum &= approx_eq(float(input->grad().cpu()[i]), 2.0f * single[index++], 5e-4f);
+    }
+    TEST(shared_gradient_sum);
+}
+
+void test_attention_cache(uint32_t window) {
+    printf("test_attention_cache(window=%u)\n", window);
+    constexpr uint32_t B = 2, N = 48, D = 64;
+    Graph graph;
+    Tensor& q = graph.tensor({B, N, D});
+    Tensor& k = graph.tensor({B, N, D});
+    Tensor& v = graph.tensor({B, N, D});
+    for (Tensor* tensor : {&q, &k, &v}) {
+        for (uint32_t i = 0; i < tensor->shape.count(); ++i)
+            tensor->cpu()[i] = float16_t(std::sin(float(i * 13u + (tensor == &k ? 5u : 0u))) * 0.6f);
+        tensor->cpu_upload();
+    }
+    Tensor& qr = graph.rope(q);
+    Tensor& kr = graph.rope(k);
+    Tensor& output = graph.causal_attention(qr, kr, v, 0.0f, window);
+    graph.eval();
+    output.cpu_download();
+    uint32_t capacity = window ? window : N;
+    Tensor kc({B, capacity, D}), vc({B, capacity, D});
+    Tensor qs({1, B, D}), ks({1, B, D}), vs({1, B, D}), rotated({1, B, D}), result({1, B, D});
+    // Poison unused slots: reading unwritten/future cache entries must fail the comparison.
+    kc.fill(float16_t(std::nanf("")));
+    vc.fill(float16_t(std::nanf("")));
+    bool equivalent = true;
+    for (uint32_t t = 0; t < N; ++t) {
+        for (uint32_t b = 0; b < B; ++b)
+            for (uint32_t d = 0; d < D; ++d) {
+                qs.cpu()[b * D + d] = q.cpu()[(b * N + t) * D + d];
+                ks.cpu()[b * D + d] = k.cpu()[(b * N + t) * D + d];
+                vs.cpu()[b * D + d] = v.cpu()[(b * N + t) * D + d];
+            }
+        qs.cpu_upload(false);
+        ks.cpu_upload(false);
+        vs.cpu_upload(false);
+        evk::ai::rope(qs, rotated, 1u, B, D, 10000.0f, 0.0f, float(t));
+        evk::ai::attention_cache_append(ks, vs, kc, vc, t);
+        evk::ai::cached_attention(rotated, kc, vc, result, t);
+        result.cpu_download();
+        for (uint32_t b = 0; b < B; ++b)
+            for (uint32_t d = 0; d < D; ++d)
+                equivalent &= approx_eq(float(result.cpu()[b * D + d]),
+                    float(output.cpu()[(b * N + t) * D + d]), 0.002f);
+    }
+    TEST(equivalent);
+}
+
 void run_ai_kernel_tests() {
+    test_swiglu_ffn_workspace();
+    test_swiglu_ffn_workspace(true);
+    test_swiglu_ffn_workspace(true, 1e-5f);
+    for (uint8_t tile_n : {16, 32, 64, 128}) {
+        test_matmul_rope_workspace(false, tile_n);
+        test_matmul_rope_workspace(true, tile_n);
+    }
+    test_swiglu_residual_workspace();
+    test_shared_attention_gradients();
+    test_swiglu_reference();
+    test_attention_cache(0u);
+    test_attention_cache(7u);
+    test_attention_cache(32u);
     test_causal_attention_mask_sentinel();
     test_causal_attention_reference<16, 16>();
     test_causal_attention_reference<32, 64>();
@@ -2322,12 +2612,16 @@ void run_ai_kernel_tests() {
     test_causal_attention_reference<128, 32>();
     test_causal_attention_reference<992, 16>();
     test_causal_attention_reference<1040, 16>();
+    test_causal_attention_reference<32, 64>(1.0f, 1.5f, 7u);
+    test_causal_attention_reference<112, 256>(1.0f, 1.5f, 32u);
+    test_causal_attention_reference<1040, 16>(1.0f, 1.5f, 32u);
     test_ai_fusion_plan();
     test_ai_generic_fallback();
     test_add();
     test_matmul();
     test_matmul_broadcast();
     test_matmul_weight_backward_cpu_reference();
+    test_matmul_weight_backward_cpu_reference(1e-5f);
     test_mse_loss();
     test_cross_entropy_loss();
     test_sgd();
