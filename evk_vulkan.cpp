@@ -1782,13 +1782,19 @@ namespace evk {
             return;
         }
         
-        cb.queries.resize(PERF_QUERY_COUNT);
-        vkGetQueryPoolResults(S.device, cb.queryPool, 0, PERF_QUERY_COUNT, 
-                              PERF_QUERY_COUNT * sizeof(uint64_t), cb.queries.data(), 
-                              sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
-        
         S.lastTimestamps.clear();
-        uint64_t start = cb.queries[0];
+        const uint32_t queryCount = uint32_t(cb.timestampNames.size()) * 2;
+        cb.queries.resize(queryCount);
+        const VkResult result = vkGetQueryPoolResults(S.device, cb.queryPool, 0, queryCount,
+                              queryCount * sizeof(uint64_t), cb.queries.data(),
+                              sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (result != VK_SUCCESS) return;
+
+        const uint64_t start = cb.queries[0];
+        if (start == 0) return;
+        for (size_t i = 0; i < cb.timestampNames.size(); ++i) {
+            if (cb.queries[i * 2] < start || cb.queries[i * 2 + 1] < cb.queries[i * 2]) return;
+        }
         for (size_t i = 0; i < cb.timestampNames.size(); i++) {
             TimestampEntry e = {};
             e.start = (cb.queries[i * 2] - start) * 1e-6 * S.timestampPeriod;
