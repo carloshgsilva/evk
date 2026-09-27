@@ -528,6 +528,14 @@ namespace evk::ai {
     void swiglu(Tensor& input, Tensor& output);
     void swiglu_backward(Tensor& input, Tensor& grad_output, Tensor& grad_input);
 
+    // Causal depthwise convolution: input/output (B,N,D), weights (K,D), lag zero first.
+    void causal_depthwise_conv(Tensor& input, Tensor& weight, Tensor& output);
+    void causal_depthwise_conv_backward(Tensor& input, Tensor& weight, Tensor& grad_output,
+                                        Tensor& grad_input, Tensor& grad_weight);
+    // Inference rows (1,B,D), ring state (B,K,D). Position zero starts a new sequence.
+    void causal_depthwise_conv_step(Tensor& input, Tensor& weight, Tensor& state,
+                                    Tensor& output, uint32_t position);
+
     // Fused Flash Attention forward (Multi-Query Attention)
     // New layout without head permutation:
     // Q, O: (B, N, D)  where D = H * Dh
@@ -976,6 +984,17 @@ struct Graph {
             evk::ai::concat_channels(a, b, output);
         };
         return output;
+    }
+
+    Tensor& causal_depthwise_conv(Tensor& input, Tensor& weight) {
+        Tensor& out = tensor(input.shape);
+        out.forward_fn = [&input, &weight, &out]() {
+            evk::ai::causal_depthwise_conv(input, weight, out);
+        };
+        out.backward_fn = [&input, &weight, &out]() {
+            evk::ai::causal_depthwise_conv_backward(input, weight, out.grad(), input.grad(), weight.grad());
+        };
+        return out;
     }
 
     Tensor& swiglu(Tensor& input) {

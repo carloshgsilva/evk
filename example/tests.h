@@ -2589,7 +2589,67 @@ void test_attention_cache(uint32_t window) {
     TEST(equivalent);
 }
 
+void test_causal_depthwise_conv(uint32_t kernel) {
+    printf("test_causal_depthwise_conv(kernel=%u)\n", kernel);
+    constexpr uint32_t B = 2, N = 9, D = 7;
+    Graph graph;
+    Tensor& x = graph.tensor({B, N, D});
+    Tensor& w = graph.tensor({kernel, D}, true);
+    Tensor dy(x.shape);
+    for (uint32_t i = 0; i < x.shape.count(); ++i) {
+        x.cpu()[i] = float16_t(std::sin(float(i)) * 0.3f);
+        dy.cpu()[i] = float16_t(std::cos(float(i)) * 0.2f);
+    }
+    for (uint32_t i = 0; i < w.shape.count(); ++i)
+        w.cpu()[i] = float16_t(std::cos(float(i * 3)) * 0.4f);
+    x.cpu_upload(); w.cpu_upload(); dy.cpu_upload();
+    Tensor& y = graph.causal_depthwise_conv(x, w);
+    std::vector<float> expected(x.shape.count(), 0.0f), dx(x.shape.count(), 0.0f), dw(w.shape.count(), 0.0f);
+    for (uint32_t b = 0; b < B; ++b)
+        for (uint32_t t = 0; t < N; ++t)
+            for (uint32_t c = 0; c < D; ++c)
+                for (uint32_t lag = 0; lag < kernel && lag <= t; ++lag) {
+                    uint32_t o = (b * N + t) * D + c, in = o - lag * D, k = lag * D + c;
+                    expected[o] += float(x.cpu()[in]) * float(w.cpu()[k]);
+                    dx[in] += float(dy.cpu()[o]) * float(w.cpu()[k]);
+                    dw[k] += float(dy.cpu()[o]) * float(x.cpu()[in]);
+                }
+    graph.eval(); y.cpu_download();
+    bool forward = true;
+    for (uint32_t i = 0; i < expected.size(); ++i)
+        forward &= approx_eq(float(y.cpu()[i]), expected[i], 3e-4f);
+    TEST(forward);
+    x.grad().fill(float16_t(0.125f)); w.grad().fill(float16_t(0.125f));
+    evk::ai::GetCmd().copy(dy.buffer, y.grad().buffer, dy.shape.count() * sizeof(float16_t));
+    y.backward_fn();
+    x.grad().cpu_download(); w.grad().cpu_download();
+    bool backward = true;
+    for (uint32_t i = 0; i < dx.size(); ++i)
+        backward &= approx_eq(float(x.grad().cpu()[i]), 0.125f + dx[i], 5e-4f);
+    for (uint32_t i = 0; i < dw.size(); ++i)
+        backward &= approx_eq(float(w.grad().cpu()[i]), 0.125f + dw[i], 5e-4f);
+    TEST(backward);
+    Tensor state({B, kernel, D}), row({1, B, D}), result(row.shape);
+    state.fill(float16_t(std::nanf("")));
+    bool recurrent = true;
+    // Reuse a dirty ring for a second independent sequence, without clearing it.
+    for (uint32_t repeat = 0; repeat < 2; ++repeat)
+        for (uint32_t t = 0; t < N; ++t) {
+            for (uint32_t b = 0; b < B; ++b)
+                for (uint32_t c = 0; c < D; ++c)
+                    row.cpu()[b * D + c] = x.cpu()[(b * N + t) * D + c];
+            row.cpu_upload(false);
+            evk::ai::causal_depthwise_conv_step(row, w, state, result, t);
+            result.cpu_download();
+            for (uint32_t b = 0; b < B; ++b)
+                for (uint32_t c = 0; c < D; ++c)
+                    recurrent &= result.cpu()[b * D + c].value == y.cpu()[(b * N + t) * D + c].value;
+        }
+    TEST(recurrent);
+}
+
 void run_ai_kernel_tests() {
+    for (uint32_t kernel : {1u, 3u, 4u, 12u}) test_causal_depthwise_conv(kernel);
     test_swiglu_ffn_workspace();
     test_swiglu_ffn_workspace(true);
     test_swiglu_ffn_workspace(true, 1e-5f);

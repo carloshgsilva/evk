@@ -67,6 +67,7 @@ namespace evk::ai {
         evk::Pipeline embed_bwd;
         evk::Pipeline greedy_sample;
         evk::Pipeline swiglu;
+        evk::Pipeline causal_depthwise_conv;
         evk::Pipeline attention_cache_append;
         evk::Pipeline position_add;
         evk::Pipeline position_add_bwd;
@@ -292,6 +293,7 @@ namespace evk::ai {
         pipelines->embed_bwd = create_named_compute_pipeline("embed_bwd");
         pipelines->greedy_sample = create_named_compute_pipeline("greedy_sample");
         pipelines->swiglu = create_named_compute_pipeline("swiglu");
+        pipelines->causal_depthwise_conv = create_named_compute_pipeline("causal_depthwise_conv");
         pipelines->attention_cache_append = create_named_compute_pipeline("attention_cache_append");
         pipelines->position_add = create_named_compute_pipeline("position_add");
         pipelines->position_add_bwd = create_named_compute_pipeline("position_add_bwd");
@@ -524,6 +526,42 @@ namespace evk::ai {
             value_cache.buffer.GetReference(), output.buffer.GetReference(), position});
         cmd.dispatch(b, 1u, 1u);
         cmd.computeBarrier();
+    }
+
+    static void dispatch_depthwise_conv(Tensor& input, Tensor& weight, Tensor& gradient,
+        Tensor& output, Tensor& state, uint32_t batches, uint32_t length,
+        uint32_t mode, uint32_t position = 0) {
+        assert(weight.shape.rank() == 2u && weight.shape[0] > 0u);
+        uint32_t channels = weight.shape[1], kernel = weight.shape[0];
+        uint32_t count = mode == 2u ? kernel * channels : batches * length * channels;
+        auto& cmd = GetCmd();
+        cmd.bind(pipelines->causal_depthwise_conv);
+        cmd.push(evk::Constant{input.buffer.GetReference(), weight.buffer.GetReference(),
+            gradient.buffer.GetReference(), output.buffer.GetReference(), state.buffer.GetReference(),
+            batches, length, channels, kernel, mode, position});
+        cmd.dispatch((count + 255u) / 256u, 1u, 1u);
+        cmd.computeBarrier();
+    }
+
+    void causal_depthwise_conv(Tensor& input, Tensor& weight, Tensor& output) {
+        assert(input.shape.rank() == 3u && input.shape == output.shape && input.shape[2] == weight.shape[1]);
+        dispatch_depthwise_conv(input, weight, input, output, input, input.shape[0], input.shape[1], 0u);
+    }
+
+    void causal_depthwise_conv_backward(Tensor& input, Tensor& weight, Tensor& grad_output,
+                                        Tensor& grad_input, Tensor& grad_weight) {
+        assert(input.shape.rank() == 3u && input.shape == grad_output.shape && input.shape == grad_input.shape);
+        assert(weight.shape == grad_weight.shape && input.shape[2] == weight.shape[1]);
+        dispatch_depthwise_conv(input, weight, grad_output, grad_input, input, input.shape[0], input.shape[1], 1u);
+        dispatch_depthwise_conv(input, weight, grad_output, grad_weight, input, input.shape[0], input.shape[1], 2u);
+    }
+
+    void causal_depthwise_conv_step(Tensor& input, Tensor& weight, Tensor& state,
+                                    Tensor& output, uint32_t position) {
+        assert(input.shape.rank() == 3u && input.shape[0] == 1u && input.shape == output.shape);
+        assert(state.shape == Shape({input.shape[1], weight.shape[0], input.shape[2]}));
+        assert(input.shape[2] == weight.shape[1]);
+        dispatch_depthwise_conv(input, weight, input, output, state, input.shape[1], 1u, 3u, position);
     }
 
     void swiglu(Tensor& input, Tensor& output) {
