@@ -10,15 +10,29 @@ endif()
 # Option to control whether the example application is built
 option(EVK_BUILD_EXAMPLE "Build the evk example application" OFF)
 
-# Vulkan
-find_package(Vulkan REQUIRED)
-
-# evk
-add_library(evk "${CMAKE_CURRENT_SOURCE_DIR}/evk_vulkan.cpp")
+set(EVK_BACKEND "Vulkan" CACHE STRING "Graphics backend: Vulkan or Metal")
+set_property(CACHE EVK_BACKEND PROPERTY STRINGS Vulkan Metal)
+if(EVK_BACKEND STREQUAL "Metal")
+  if(NOT APPLE)
+    message(FATAL_ERROR "The native Metal backend requires macOS")
+  endif()
+  enable_language(OBJCXX)
+  add_library(evk evk_metal.mm)
+  set_target_properties(evk PROPERTIES OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED YES)
+  target_compile_options(evk PRIVATE -fobjc-arc)
+  target_compile_definitions(evk PUBLIC EVK_METAL=1)
+  target_link_libraries(evk PUBLIC "-framework Metal" "-framework Foundation" "-framework QuartzCore" "-framework AppKit")
+  find_program(Vulkan_GLSLC_EXECUTABLE glslc HINTS "$ENV{VULKAN_SDK}/bin" REQUIRED)
+elseif(EVK_BACKEND STREQUAL "Vulkan")
+  find_package(Vulkan REQUIRED)
+  add_library(evk evk_vulkan.cpp)
+  target_link_libraries(evk PUBLIC Vulkan::Vulkan)
+  target_compile_definitions(evk PUBLIC EVK_VULKAN=1)
+else()
+  message(FATAL_ERROR "Unknown EVK_BACKEND: ${EVK_BACKEND}")
+endif()
 target_include_directories(evk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(evk PRIVATE cxx_std_20)
-target_link_libraries(evk PUBLIC Vulkan::Vulkan)
-target_compile_definitions(evk PUBLIC "EVK_VULKAN=1")
 add_library(evk::evk ALIAS evk)
 
 option(EVK_BUILD_METAL_SHADER_TOOL "Build the offline SPIR-V to Metal shader translator" OFF)
@@ -60,6 +74,9 @@ target_link_libraries(evk_oidn PUBLIC evk_ai)
 add_library(evk::oidn ALIAS evk_oidn)
 
 if(EVK_BUILD_EXAMPLE)
+  if(EVK_BACKEND STREQUAL "Metal")
+    message(FATAL_ERROR "The Vulkan-specific evk example has not been ported to Metal")
+  endif()
   add_executable(evk_example
       "${CMAKE_CURRENT_SOURCE_DIR}/example/main.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/example/main_llm.cpp"

@@ -1,0 +1,919 @@
+#import <AppKit/AppKit.h>
+#import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <type_traits>
+#include <vector>
+
+#include "evk.h"
+#include "evk_metal_shader.h"
+
+namespace evk {
+namespace {
+constexpr uint32_t COMMAND_COUNT = 4;
+constexpr uint32_t SAMPLE_COUNT = 1024;
+constexpr uint32_t TIMESTAMP_COUNT = 128;
+constexpr uint64_t STAGING_BYTES = 64'000'000;
+
+void Require(bool condition, const char* format, ...) {
+    if (condition) return;
+    va_list args;
+    va_start(args, format);
+    std::fprintf(stderr, "[evk] Metal: ");
+    std::vfprintf(stderr, format, args);
+    std::fprintf(stderr, "\n");
+    va_end(args);
+    std::abort();
+}
+
+template<class T> bool Has(T flags, T flag) { return (uint32_t(flags) & uint32_t(flag)) != 0; }
+bool Depth(Format format) { return format == Format::D32Sfloat || format == Format::D24UnormS8Uint; }
+bool UInt(Format format) { return format == Format::R8Uint || format == Format::R16Uint || format == Format::R32Uint || format == Format::RGBA32Uint; }
+
+MTLPixelFormat PixelFormat(Format format) {
+    switch (format) {
+        case Format::R8Uint: return MTLPixelFormatR8Uint;
+        case Format::R16Uint: return MTLPixelFormatR16Uint;
+        case Format::R32Uint: return MTLPixelFormatR32Uint;
+        case Format::BGRA8Unorm: return MTLPixelFormatBGRA8Unorm;
+        case Format::RGBA8Unorm: return MTLPixelFormatRGBA8Unorm;
+        case Format::RGBA8Snorm: return MTLPixelFormatRGBA8Snorm;
+        case Format::RG16Sfloat: return MTLPixelFormatRG16Float;
+        case Format::RGBA16Sfloat: return MTLPixelFormatRGBA16Float;
+        case Format::RGBA16Unorm: return MTLPixelFormatRGBA16Unorm;
+        case Format::RGBA16Snorm: return MTLPixelFormatRGBA16Snorm;
+        case Format::R32Sfloat: return MTLPixelFormatR32Float;
+        case Format::RG32Sfloat: return MTLPixelFormatRG32Float;
+        case Format::RGBA32Sfloat: return MTLPixelFormatRGBA32Float;
+        case Format::RGBA32Sint: return MTLPixelFormatRGBA32Sint;
+        case Format::RGBA32Uint: return MTLPixelFormatRGBA32Uint;
+        case Format::D32Sfloat: return MTLPixelFormatDepth32Float;
+        case Format::D24UnormS8Uint: return MTLPixelFormatDepth24Unorm_Stencil8;
+        default: Require(false, "Unsupported texture format %u", uint32_t(format)); return MTLPixelFormatInvalid;
+    }
+}
+
+uint32_t PixelBytes(Format format) {
+    switch (format) {
+        case Format::R8Uint: return 1;
+        case Format::R16Uint: return 2;
+        case Format::RGBA16Sfloat: case Format::RGBA16Unorm: case Format::RGBA16Snorm: case Format::RG32Sfloat: return 8;
+        case Format::RGB32Sfloat: return 12;
+        case Format::RGBA32Sfloat: case Format::RGBA32Sint: case Format::RGBA32Uint: return 16;
+        default: return 4;
+    }
+}
+
+MTLVertexFormat VertexFormat(Format format) {
+    switch (format) {
+        case Format::R32Sfloat: return MTLVertexFormatFloat;
+        case Format::RG32Sfloat: return MTLVertexFormatFloat2;
+        case Format::RGB32Sfloat: return MTLVertexFormatFloat3;
+        case Format::RGBA32Sfloat: return MTLVertexFormatFloat4;
+        case Format::RGBA8Unorm: return MTLVertexFormatUChar4Normalized;
+        case Format::RGBA8Snorm: return MTLVertexFormatChar4Normalized;
+        case Format::RGBA32Uint: return MTLVertexFormatUInt4;
+        case Format::RGBA32Sint: return MTLVertexFormatInt4;
+        default: Require(false, "Unsupported vertex format %u", uint32_t(format)); return MTLVertexFormatInvalid;
+    }
+}
+
+struct Slots {
+    uint32_t limit = 0;
+    uint32_t next = 0;
+    std::vector<int> free;
+    void Initialize(uint32_t count) { limit = count; free.reserve(count); }
+    int Allocate() {
+        if (!free.empty()) { int value = free.back(); free.pop_back(); return value; }
+        Require(next < limit, "Bindless resource limit exceeded (%u)", limit);
+        return int(next++);
+    }
+    void Release(int value) { free.push_back(value); }
+};
+
+struct MetalBuffer : Resource {
+    BufferDesc desc;
+    id<MTLBuffer> buffer = nil;
+    ~MetalBuffer();
+};
+struct MetalImage : Resource {
+    ImageDesc desc;
+    id<MTLTexture> texture = nil;
+    ~MetalImage();
+};
+struct MetalPipeline : Resource {
+    PipelineDesc desc;
+    id<MTLRenderPipelineState> render = nil;
+    id<MTLComputePipelineState> compute = nil;
+    id<MTLDepthStencilState> depth = nil;
+    MTLSize group = {1, 1, 1};
+};
+
+struct Marker { const char* name = nullptr; uint32_t first = 0; uint32_t last = 0; };
+struct Command {
+    Cmd api;
+    id<MTLCommandBuffer> buffer = nil;
+    id<MTLRenderCommandEncoder> render = nil;
+    id<MTLComputeCommandEncoder> compute = nil;
+    id<MTLBlitCommandEncoder> blit = nil;
+    MTLRenderPassDescriptor* renderPass = nil;
+    MTLComputePassDescriptor* computePass = nil;
+    MTLBlitPassDescriptor* blitPass = nil;
+    id<MTLCounterSampleBuffer> counters = nil;
+    Buffer staging;
+    uint64_t stagingOffset = 0;
+    uint64_t submission = 0;
+    bool recording = false;
+    bool pending = false;
+    Pipeline pipeline;
+    Buffer vertices;
+    Buffer indices;
+    uint64_t vertexOffset = 0;
+    uint64_t indexOffset = 0;
+    bool halfIndices = false;
+    std::array<uint8_t, 256> push = {};
+    std::array<Marker, TIMESTAMP_COUNT> markers;
+    uint32_t markerCount = 0;
+    uint32_t samples = 0;
+    id<CAMetalDrawable> drawable = nil;
+    Image drawableImage;
+};
+
+struct State {
+    id<MTLDevice> device = nil;
+    id<MTLCommandQueue> queue = nil;
+    id<MTLArgumentEncoder> arguments = nil;
+    id<MTLBuffer> argumentBuffer = nil;
+    id<MTLSamplerState> nearest = nil;
+    id<MTLSamplerState> linear = nil;
+    CAMetalLayer* layer = nil;
+    NSView* view = nil;
+    Features features;
+    Slots buffers;
+    Slots images;
+    std::array<Command, COMMAND_COUNT> commands;
+    std::vector<id<MTLResource>> reads;
+    std::vector<id<MTLResource>> writes;
+    std::vector<std::pair<uint64_t, Resource*>> deletions;
+    std::vector<TimestampEntry> timestamps;
+    uint64_t nextSubmission = 1;
+    uint64_t completed = 0;
+    uint64_t liveBytes = 0;
+    uint32_t allocations = 0;
+    bool shuttingDown = false;
+};
+State* G = nullptr;
+State& S() { Require(G != nullptr, "Backend is not initialized"); return *G; }
+MetalBuffer& B(const Buffer& buffer) { Require(bool(buffer), "Invalid buffer"); return *static_cast<MetalBuffer*>(buffer.res); }
+MetalImage& I(const Image& image) { Require(bool(image), "Invalid image"); return *static_cast<MetalImage*>(image.res); }
+MetalPipeline& P(const Pipeline& pipeline) { Require(bool(pipeline), "Invalid pipeline"); return *static_cast<MetalPipeline*>(pipeline.res); }
+Command& C(const Cmd& cmd) { Require(cmd._internal != nullptr, "Invalid command buffer"); return *static_cast<Command*>(cmd._internal); }
+
+void AddResource(id<MTLResource> resource, bool writable) {
+    auto& list = writable ? S().writes : S().reads;
+    Require(list.size() < list.capacity(), "Resource residency capacity exceeded");
+    list.push_back(resource);
+    S().liveBytes += resource.allocatedSize;
+    ++S().allocations;
+}
+void RemoveResource(id<MTLResource> resource) {
+    for (auto* list : {&S().reads, &S().writes}) {
+        auto found = std::find(list->begin(), list->end(), resource);
+        if (found == list->end()) continue;
+        *found = list->back(); list->pop_back();
+        S().liveBytes -= resource.allocatedSize;
+        --S().allocations;
+        return;
+    }
+}
+MetalBuffer::~MetalBuffer() {
+    if (resourceid >= 0) {
+        [S().arguments setBuffer:nil offset:0 atIndex:metal::STORAGE_ID + resourceid];
+        S().buffers.Release(resourceid);
+    }
+    RemoveResource(buffer);
+}
+MetalImage::~MetalImage() {
+    if (resourceid >= 0) {
+        [S().arguments setTexture:nil atIndex:metal::TEXTURE_ID + resourceid];
+        [S().arguments setTexture:nil atIndex:metal::IMAGE_ID + resourceid];
+        [S().arguments setSamplerState:nil atIndex:metal::SAMPLER_ID + resourceid];
+        S().images.Release(resourceid);
+    }
+    if (texture) RemoveResource(texture);
+}
+
+void Retire() {
+    auto& list = S().deletions;
+    for (size_t n = 0; n < list.size();) {
+        if (!S().shuttingDown && list[n].first > S().completed) { ++n; continue; }
+        Resource* resource = list[n].second;
+        list[n] = list.back(); list.pop_back();
+        delete resource;
+    }
+}
+void EndEncoder(Command& cmd) {
+    if (cmd.render) [cmd.render endEncoding];
+    if (cmd.compute) [cmd.compute endEncoding];
+    if (cmd.blit) [cmd.blit endEncoding];
+    cmd.render = nil; cmd.compute = nil; cmd.blit = nil;
+}
+uint32_t EncoderSamples(Command& cmd) {
+    if (!cmd.counters) return 0;
+    Require(cmd.samples + 4 <= SAMPLE_COUNT, "Encoder timestamp capacity exceeded");
+    uint32_t first = cmd.samples;
+    cmd.samples += 4;
+    return first;
+}
+void Residency(id<MTLComputeCommandEncoder> encoder) {
+    auto& state = S();
+    if (!state.reads.empty()) [encoder useResources:state.reads.data() count:state.reads.size() usage:MTLResourceUsageRead];
+    if (!state.writes.empty()) [encoder useResources:state.writes.data() count:state.writes.size() usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+}
+void Residency(id<MTLRenderCommandEncoder> encoder) {
+    auto& state = S();
+    if (!state.reads.empty()) [encoder useResources:state.reads.data() count:state.reads.size() usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    if (!state.writes.empty()) [encoder useResources:state.writes.data() count:state.writes.size() usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex | MTLRenderStageFragment];
+}
+void Compute(Command& cmd) {
+    if (cmd.compute) return;
+    Require(!cmd.render, "Compute dispatch inside render pass");
+    EndEncoder(cmd);
+    @autoreleasepool {
+        auto attachment = cmd.computePass.sampleBufferAttachments[0];
+        if (cmd.counters) {
+            uint32_t first = EncoderSamples(cmd);
+            attachment.sampleBuffer = cmd.counters;
+            attachment.startOfEncoderSampleIndex = first;
+            attachment.endOfEncoderSampleIndex = first + 3;
+        }
+        cmd.compute = [cmd.buffer computeCommandEncoderWithDescriptor:cmd.computePass];
+        [cmd.compute setBuffer:S().argumentBuffer offset:0 atIndex:metal::ARGUMENT_BUFFER];
+        Residency(cmd.compute);
+    }
+}
+void Blit(Command& cmd) {
+    if (cmd.blit) return;
+    Require(!cmd.render, "Transfer inside render pass");
+    EndEncoder(cmd);
+    @autoreleasepool {
+        auto attachment = cmd.blitPass.sampleBufferAttachments[0];
+        if (cmd.counters) {
+            uint32_t first = EncoderSamples(cmd);
+            attachment.sampleBuffer = cmd.counters;
+            attachment.startOfEncoderSampleIndex = first;
+            attachment.endOfEncoderSampleIndex = first + 3;
+        }
+        cmd.blit = [cmd.buffer blitCommandEncoderWithDescriptor:cmd.blitPass];
+    }
+}
+void Push(Command& cmd) {
+    if (cmd.render) {
+        [cmd.render setVertexBytes:cmd.push.data() length:cmd.push.size() atIndex:metal::PUSH_BUFFER];
+        [cmd.render setFragmentBytes:cmd.push.data() length:cmd.push.size() atIndex:metal::PUSH_BUFFER];
+    }
+    if (cmd.compute) [cmd.compute setBytes:cmd.push.data() length:cmd.push.size() atIndex:metal::PUSH_BUFFER];
+}
+uint64_t StageUpload(Command& cmd, const void* bytes, uint64_t size) {
+    uint64_t offset = (cmd.stagingOffset + 255) & ~uint64_t(255);
+    Require(offset <= STAGING_BYTES && size <= STAGING_BYTES - offset, "Staging buffer capacity exceeded");
+    std::memcpy(static_cast<uint8_t*>(cmd.staging.GetPtr()) + offset, bytes, size);
+    cmd.stagingOffset = offset + size;
+    return offset;
+}
+
+void ReadTimestamps(Command& cmd) {
+    S().timestamps.clear();
+    if (!cmd.counters || !cmd.samples || !cmd.markerCount) return;
+    @autoreleasepool {
+        NSData* data = [cmd.counters resolveCounterRange:NSMakeRange(0, cmd.samples)];
+        Require(data.length >= cmd.samples * sizeof(MTLCounterResultTimestamp), "Timestamp resolution failed");
+        const auto* samples = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
+        uint64_t origin = 0;
+        for (uint32_t index = 0; index < cmd.markerCount; ++index) {
+            const auto& marker = cmd.markers[index];
+            if (marker.last <= marker.first) continue;
+            uint64_t start = samples[marker.first].timestamp;
+            uint64_t end = samples[marker.last - 1].timestamp;
+            if (start == MTLCounterErrorValue || end == MTLCounterErrorValue || end < start) continue;
+            if (!origin) origin = start;
+            S().timestamps.push_back({double(start - origin) * 1e-6, double(end - origin) * 1e-6, marker.name});
+        }
+    }
+}
+void Complete(Command& cmd) {
+    Require(cmd.buffer.status != MTLCommandBufferStatusError, "GPU submission failed: %s", cmd.buffer.error.localizedDescription.UTF8String);
+    S().completed = std::max(S().completed, cmd.submission);
+    ReadTimestamps(cmd);
+    cmd.pending = false;
+    cmd.pipeline.release(); cmd.vertices.release(); cmd.indices.release();
+    if (cmd.drawableImage) I(cmd.drawableImage).texture = nil;
+    cmd.drawable = nil;
+    Retire();
+}
+void ResizeLayer() {
+    auto& state = S();
+    if (!state.layer) return;
+    CGFloat scale = state.view.window.backingScaleFactor;
+    CGSize size = state.view.bounds.size;
+    state.layer.frame = state.view.bounds;
+    state.layer.contentsScale = scale;
+    state.layer.drawableSize = CGSizeMake(std::max(1.0, size.width * scale), std::max(1.0, size.height * scale));
+}
+
+id<MTLFunction> Function(const std::vector<uint8_t>& bytes, const ConstantRaw& constants, metal::ShaderInfo& info) {
+    char hash[17];
+    std::snprintf(hash, sizeof(hash), "%016llx", (unsigned long long)metal::ShaderHash(bytes));
+    const char* directory = std::getenv("EVK_METAL_SHADER_DIR");
+    std::string stem = std::string(directory ? directory : ".cache/metal/shaders") + "/" + hash;
+    std::ifstream metadata(stem + ".info", std::ios::binary);
+    Require(bool(metadata.read(reinterpret_cast<char*>(&info), sizeof(info))), "Missing shader metadata: %s.info", stem.c_str());
+    Require(info.magic == 0x4D534C31 && info.version == 1 && info.hash == metal::ShaderHash(bytes), "Invalid shader metadata: %s", stem.c_str());
+    NSError* error = nil;
+    NSURL* url = [NSURL fileURLWithPath:[[NSString alloc] initWithUTF8String:(stem + ".metallib").c_str()]];
+    id<MTLLibrary> library = [S().device newLibraryWithURL:url error:&error];
+    Require(library != nil, "Cannot load shader %s: %s", stem.c_str(), error.localizedDescription.UTF8String);
+    MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
+    for (uint32_t index = 0; index < constants.count; ++index) {
+        MTLDataType type = MTLDataTypeNone;
+        switch (info.constantTypes[index]) {
+            case metal::ConstantType::Bool: type = MTLDataTypeBool; break;
+            case metal::ConstantType::Int: type = MTLDataTypeInt; break;
+            case metal::ConstantType::UInt: type = MTLDataTypeUInt; break;
+            case metal::ConstantType::Float: type = MTLDataTypeFloat; break;
+            default: continue;
+        }
+        bool boolean = constants.data[index * 4] != 0;
+        const void* value = type == MTLDataTypeBool ? static_cast<const void*>(&boolean) : constants.data + index * 4;
+        [values setConstantValue:value type:type atIndex:index];
+    }
+    id<MTLFunction> function = [library newFunctionWithName:@"main0" constantValues:values error:&error];
+    Require(function != nil, "Cannot specialize shader %s: %s", stem.c_str(), error.localizedDescription.UTF8String);
+    return function;
+}
+}
+
+void Resource::decRef() {
+    Require(refCount > 0, "Resource reference underflow");
+    if (--refCount) return;
+    Require(S().deletions.size() < S().deletions.capacity(), "Resource retirement capacity exceeded");
+    S().deletions.push_back({S().nextSubmission, this});
+}
+RID ResourceRef::GetRID() const { Require(res && res->resourceid >= 0, "Resource has no bindless descriptor"); return res->resourceid; }
+const BufferDesc& GetDesc(const Buffer& buffer) { return B(buffer).desc; }
+const ImageDesc& GetDesc(const Image& image) { return I(image).desc; }
+void* Buffer::GetPtr() {
+    Require(GetDesc(*this).memoryType != MemoryType::GPU, "Buffer is not CPU-visible");
+    return B(*this).buffer.contents;
+}
+uint64_t Buffer::GetReference() { return B(*this).buffer.gpuAddress; }
+
+Buffer CreateBuffer(const BufferDesc& desc) {
+    @autoreleasepool {
+        Require(desc.size > 0 && desc.size <= S().device.maxBufferLength, "Invalid buffer size");
+        auto* buffer = new MetalBuffer;
+        buffer->desc = desc;
+        auto mode = desc.memoryType == MemoryType::GPU ? MTLResourceStorageModePrivate : MTLResourceStorageModeShared;
+        buffer->buffer = [S().device newBufferWithLength:desc.size options:mode];
+        Require(buffer->buffer != nil, "Cannot allocate buffer %s", desc.name.c_str());
+        buffer->buffer.label = [[NSString alloc] initWithUTF8String:desc.name.c_str()];
+        AddResource(buffer->buffer, Has(desc.usage, BufferUsage::Storage));
+        if (Has(desc.usage, BufferUsage::Storage)) {
+            buffer->resourceid = S().buffers.Allocate();
+            [S().arguments setBuffer:buffer->buffer offset:0 atIndex:metal::STORAGE_ID + buffer->resourceid];
+        }
+        return Buffer(buffer);
+    }
+}
+void WriteBuffer(Buffer& buffer, void* bytes, uint64_t size, uint64_t offset) {
+    Require(offset <= GetDesc(buffer).size && size <= GetDesc(buffer).size - offset, "Buffer write is out of bounds");
+    std::memcpy(static_cast<uint8_t*>(buffer.GetPtr()) + offset, bytes, size);
+}
+void ReadBuffer(Buffer& buffer, void* bytes, uint64_t size, uint64_t offset) {
+    Require(offset <= GetDesc(buffer).size && size <= GetDesc(buffer).size - offset, "Buffer read is out of bounds");
+    std::memcpy(bytes, static_cast<uint8_t*>(buffer.GetPtr()) + offset, size);
+}
+
+Image CreateImage(const ImageDesc& desc) {
+    @autoreleasepool {
+        Require(desc.extent.width && desc.extent.height && desc.extent.depth && desc.mipCount && desc.layerCount, "Invalid texture extent");
+        auto* image = new MetalImage;
+        image->desc = desc;
+        MTLTextureDescriptor* texture = [MTLTextureDescriptor new];
+        texture.pixelFormat = PixelFormat(desc.format);
+        texture.width = desc.extent.width; texture.height = desc.extent.height; texture.depth = desc.extent.depth;
+        texture.mipmapLevelCount = desc.mipCount;
+        texture.sampleCount = uint32_t(desc.sampleCount);
+        texture.arrayLength = desc.layerCount;
+        texture.textureType = desc.layerCount > 1 ? MTLTextureType2DArray : MTLTextureType2D;
+        if (desc.extent.depth > 1) texture.textureType = MTLTextureType3D;
+        if (desc.isCube) {
+            Require(desc.layerCount % 6 == 0, "Cube textures need six layers per cube");
+            texture.arrayLength = desc.layerCount / 6;
+            texture.textureType = texture.arrayLength > 1 ? MTLTextureTypeCubeArray : MTLTextureTypeCube;
+        }
+        if (desc.sampleCount != SampleCount::One) {
+            Require(desc.layerCount == 1 && desc.mipCount == 1, "Multisample arrays are not implemented");
+            texture.textureType = MTLTextureType2DMultisample;
+        }
+        texture.storageMode = MTLStorageModePrivate;
+        texture.usage = MTLTextureUsageRenderTarget;
+        if (Has(desc.usage, ImageUsage::Sampled)) texture.usage |= MTLTextureUsageShaderRead;
+        if (Has(desc.usage, ImageUsage::Storage)) texture.usage |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        image->texture = [S().device newTextureWithDescriptor:texture];
+        Require(image->texture != nil, "Cannot allocate texture %s", desc.name.c_str());
+        image->texture.label = [[NSString alloc] initWithUTF8String:desc.name.c_str()];
+        AddResource(image->texture, Has(desc.usage, ImageUsage::Storage));
+        if (Has(desc.usage, ImageUsage::Sampled) || Has(desc.usage, ImageUsage::Storage)) {
+            image->resourceid = S().images.Allocate();
+            [S().arguments setTexture:image->texture atIndex:metal::TEXTURE_ID + image->resourceid];
+            [S().arguments setTexture:image->texture atIndex:metal::IMAGE_ID + image->resourceid];
+            [S().arguments setSamplerState:desc.filter == Filter::Nearest ? S().nearest : S().linear atIndex:metal::SAMPLER_ID + image->resourceid];
+        }
+        return Image(image);
+    }
+}
+
+Pipeline CreatePipeline(const PipelineDesc& desc) {
+    @autoreleasepool {
+        auto* pipeline = new MetalPipeline;
+        pipeline->desc = desc;
+        metal::ShaderInfo info;
+        NSError* error = nil;
+        if (!desc.CS.empty()) {
+            id<MTLFunction> function = Function(desc.CS, desc.constants, info);
+            pipeline->group = MTLSizeMake(info.groupX, info.groupY, info.groupZ);
+            MTLComputePipelineDescriptor* compute = [MTLComputePipelineDescriptor new];
+            compute.computeFunction = function;
+            compute.maxTotalThreadsPerThreadgroup = info.groupX * info.groupY * info.groupZ;
+            pipeline->compute = [S().device newComputePipelineStateWithDescriptor:compute options:MTLPipelineOptionNone reflection:nil error:&error];
+            Require(pipeline->compute != nil, "Cannot create compute pipeline %s: %s", desc.name.c_str(), error.localizedDescription.UTF8String);
+            return Pipeline(pipeline);
+        }
+        MTLRenderPipelineDescriptor* render = [MTLRenderPipelineDescriptor new];
+        render.vertexFunction = Function(desc.VS, desc.constants, info);
+        if (!desc.FS.empty()) render.fragmentFunction = Function(desc.FS, desc.constants, info);
+        render.rasterSampleCount = uint32_t(desc.sampleCount);
+        MTLVertexDescriptor* vertices = [MTLVertexDescriptor new];
+        uint32_t attribute = 0;
+        for (size_t binding = 0; binding < desc.bindings.size(); ++binding) {
+            uint32_t offset = 0;
+            for (Format format : desc.bindings[binding]) {
+                vertices.attributes[attribute].format = VertexFormat(format);
+                vertices.attributes[attribute].offset = offset;
+                vertices.attributes[attribute].bufferIndex = metal::VERTEX_BUFFER + binding;
+                offset += PixelBytes(format); ++attribute;
+            }
+            vertices.layouts[metal::VERTEX_BUFFER + binding].stride = offset;
+            vertices.layouts[metal::VERTEX_BUFFER + binding].stepFunction = MTLVertexStepFunctionPerVertex;
+        }
+        if (attribute) render.vertexDescriptor = vertices;
+        uint32_t color = 0;
+        for (size_t index = 0; index < desc.attachments.size(); ++index) {
+            Format format = desc.attachments[index];
+            if (Depth(format)) {
+                render.depthAttachmentPixelFormat = PixelFormat(format);
+                if (format == Format::D24UnormS8Uint) render.stencilAttachmentPixelFormat = PixelFormat(format);
+                continue;
+            }
+            auto attachment = render.colorAttachments[color++];
+            attachment.pixelFormat = PixelFormat(format);
+            Blend blend = index < desc.blends.size() ? desc.blends[index] : Blend::Disabled;
+            attachment.blendingEnabled = blend != Blend::Disabled;
+            attachment.sourceRGBBlendFactor = blend == Blend::Alpha ? MTLBlendFactorSourceAlpha : MTLBlendFactorOne;
+            attachment.destinationRGBBlendFactor = blend == Blend::Alpha ? MTLBlendFactorOneMinusSourceAlpha : MTLBlendFactorOne;
+            attachment.sourceAlphaBlendFactor = blend == Blend::Alpha ? MTLBlendFactorZero : MTLBlendFactorOne;
+            attachment.destinationAlphaBlendFactor = blend == Blend::Alpha ? MTLBlendFactorOne : MTLBlendFactorZero;
+        }
+        pipeline->render = [S().device newRenderPipelineStateWithDescriptor:render error:&error];
+        Require(pipeline->render != nil, "Cannot create graphics pipeline %s: %s", desc.name.c_str(), error.localizedDescription.UTF8String);
+        MTLDepthStencilDescriptor* depth = [MTLDepthStencilDescriptor new];
+        depth.depthCompareFunction = desc.depthTest ? MTLCompareFunction(uint32_t(desc.depthOp)) : MTLCompareFunctionAlways;
+        depth.depthWriteEnabled = desc.depthWrite;
+        pipeline->depth = [S().device newDepthStencilStateWithDescriptor:depth];
+        return Pipeline(pipeline);
+    }
+}
+
+bool InitializeEVK(const EvkDesc& desc) {
+    @autoreleasepool {
+        Require(G == nullptr, "Backend already initialized");
+        G = new State;
+        auto& state = S();
+        state.device = MTLCreateSystemDefaultDevice();
+        Require(state.device != nil && state.device.argumentBuffersSupport == MTLArgumentBuffersTier2, "A tier-2 Metal device is required");
+        state.queue = [state.device newCommandQueueWithMaxCommandBufferCount:COMMAND_COUNT];
+        state.features.maxFramebufferSampleCount = GetSupportedSampleCount(SampleCount::SixtyFour);
+        state.buffers.Initialize(std::min(desc.bindless.storageBufferCount, metal::BUFFER_COUNT));
+        state.images.Initialize(std::min(desc.bindless.imageCount, metal::IMAGE_COUNT));
+        state.reads.reserve(metal::BUFFER_COUNT + metal::IMAGE_COUNT + 32);
+        state.writes.reserve(metal::BUFFER_COUNT + metal::IMAGE_COUNT + 32);
+        state.deletions.reserve(metal::BUFFER_COUNT + metal::IMAGE_COUNT + 4096);
+        state.timestamps.reserve(TIMESTAMP_COUNT);
+        NSMutableArray<MTLArgumentDescriptor*>* arguments = [NSMutableArray new];
+        for (uint32_t binding = 0; binding < 4; ++binding) {
+            MTLArgumentDescriptor* argument = [MTLArgumentDescriptor new];
+            argument.index = binding == 0 ? metal::STORAGE_ID : binding == 1 ? metal::TEXTURE_ID : binding == 2 ? metal::SAMPLER_ID : metal::IMAGE_ID;
+            argument.arrayLength = binding == 0 ? metal::BUFFER_COUNT : metal::IMAGE_COUNT;
+            argument.dataType = binding == 0 ? MTLDataTypePointer : binding == 2 ? MTLDataTypeSampler : MTLDataTypeTexture;
+            argument.textureType = MTLTextureType2D;
+            argument.access = binding == 0 || binding == 3 ? MTLBindingAccessReadWrite : MTLBindingAccessReadOnly;
+            [arguments addObject:argument];
+        }
+        state.arguments = [state.device newArgumentEncoderWithArguments:arguments];
+        Require(state.arguments != nil, "Cannot create bindless encoder");
+        state.argumentBuffer = [state.device newBufferWithLength:state.arguments.encodedLength options:MTLResourceStorageModeShared];
+        Require(state.argumentBuffer != nil, "Cannot allocate bindless table");
+        [state.arguments setArgumentBuffer:state.argumentBuffer offset:0];
+        MTLSamplerDescriptor* sampler = [MTLSamplerDescriptor new];
+        sampler.supportArgumentBuffers = YES;
+        sampler.sAddressMode = sampler.tAddressMode = sampler.rAddressMode = MTLSamplerAddressModeClampToEdge;
+        sampler.minFilter = sampler.magFilter = MTLSamplerMinMagFilterNearest;
+        sampler.mipFilter = MTLSamplerMipFilterNearest;
+        state.nearest = [state.device newSamplerStateWithDescriptor:sampler];
+        sampler.minFilter = sampler.magFilter = MTLSamplerMinMagFilterLinear;
+        state.linear = [state.device newSamplerStateWithDescriptor:sampler];
+        id<MTLCounterSet> counterSet = nil;
+        for (id<MTLCounterSet> set in state.device.counterSets) if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) counterSet = set;
+        state.features.timestamps = desc.enableTimestamps && counterSet != nil && [state.device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary];
+        for (uint32_t samples = 1; samples <= 8; samples *= 2) if ([state.device supportsTextureSampleCount:samples]) state.features.maxFramebufferSampleCount = SampleCount(samples);
+        for (auto& cmd : state.commands) {
+            cmd.api._internal = &cmd;
+            cmd.drawableImage = Image(new MetalImage);
+            cmd.renderPass = [MTLRenderPassDescriptor new];
+            cmd.computePass = [MTLComputePassDescriptor new];
+            cmd.blitPass = [MTLBlitPassDescriptor new];
+            cmd.staging = CreateBuffer({.name = "Metal command staging", .size = STAGING_BYTES, .usage = BufferUsage::TransferSrc, .memoryType = MemoryType::CPU_TO_GPU});
+            if (state.features.timestamps) {
+                MTLCounterSampleBufferDescriptor* counters = [MTLCounterSampleBufferDescriptor new];
+                counters.counterSet = counterSet; counters.sampleCount = SAMPLE_COUNT; counters.storageMode = MTLStorageModeShared;
+                NSError* error = nil;
+                cmd.counters = [state.device newCounterSampleBufferWithDescriptor:counters error:&error];
+                Require(cmd.counters != nil, "Cannot create timestamp buffer: %s", error.localizedDescription.UTF8String);
+            }
+        }
+        std::printf("[evk] Backend Metal | %s | stage_boundary_timestamps=%d | device_ray_api=%d | ray_paths_ready=0\n", state.device.name.UTF8String, state.features.timestamps, state.device.supportsRaytracing);
+        return true;
+    }
+}
+bool InitializeSwapchain(void* nativeWindow) {
+    @autoreleasepool {
+        NSWindow* window = (__bridge NSWindow*)nativeWindow;
+        Require(window != nil, "Missing Cocoa window");
+        S().view = window.contentView;
+        S().layer = [CAMetalLayer new];
+        S().layer.device = S().device;
+        S().layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        S().layer.framebufferOnly = YES;
+        S().layer.maximumDrawableCount = 3;
+        S().view.wantsLayer = YES;
+        S().view.layer = S().layer;
+        ResizeLayer();
+        return true;
+    }
+}
+const Features& GetFeatures() { return S().features; }
+SampleCount GetSupportedSampleCount(SampleCount requested) {
+    uint32_t count = uint32_t(requested);
+    while (count > 1 && ![S().device supportsTextureSampleCount:count]) count /= 2;
+    return SampleCount(count);
+}
+Extent GetSwapchainExtent() { ResizeLayer(); return {uint32_t(S().layer.drawableSize.width), uint32_t(S().layer.drawableSize.height)}; }
+void RequestSwapchainRecreate() { ResizeLayer(); }
+MemoryBudget GetMemoryBudget() {
+    MemoryBudget budget = {};
+    auto& heap = budget.heaps[0];
+    heap.allocationBytes = S().liveBytes + S().argumentBuffer.allocatedSize;
+    heap.allocationCount = S().allocations + 1;
+    heap.blockBytes = heap.usage = S().device.currentAllocatedSize;
+    heap.blockCount = heap.allocationCount;
+    heap.budget = S().device.recommendedMaxWorkingSetSize;
+    return budget;
+}
+const std::vector<TimestampEntry>& CmdTimestamps() { return S().timestamps; }
+
+Cmd& CmdBegin(Queue) {
+    @autoreleasepool {
+        for (auto& cmd : S().commands) if (cmd.pending && cmd.buffer.status == MTLCommandBufferStatusCompleted) Complete(cmd);
+        for (auto& cmd : S().commands) {
+            if (cmd.pending || cmd.recording) continue;
+            cmd.buffer = [S().queue commandBuffer];
+            Require(cmd.buffer != nil, "Cannot create command buffer");
+            cmd.recording = true;
+            cmd.stagingOffset = 0; cmd.markerCount = 0; cmd.samples = 0; cmd.push.fill(0);
+            return cmd.api;
+        }
+        auto oldest = std::min_element(S().commands.begin(), S().commands.end(), [](const Command& a, const Command& b) { return a.submission < b.submission; });
+        Require(oldest->pending, "All command buffers are still recording");
+        CmdWait(oldest->submission);
+        return CmdBegin();
+    }
+}
+bool CmdDone(uint64_t submission) {
+    if (submission <= S().completed) return true;
+    for (auto& cmd : S().commands) {
+        if (!cmd.pending || cmd.submission != submission) continue;
+        if (cmd.buffer.status != MTLCommandBufferStatusCompleted) return false;
+        Complete(cmd); return true;
+    }
+    return false;
+}
+void CmdWait(uint64_t submission) {
+    if (submission <= S().completed) return;
+    @autoreleasepool {
+        for (auto& cmd : S().commands) {
+            if (!cmd.pending || cmd.submission != submission) continue;
+            [cmd.buffer waitUntilCompleted]; Complete(cmd); return;
+        }
+        Require(false, "Unknown submission %llu", (unsigned long long)submission);
+    }
+}
+uint64_t Cmd::submit() {
+    @autoreleasepool {
+        auto& cmd = C(*this);
+        Require(cmd.recording && !cmd.render, "Submission contains an unfinished render pass");
+        EndEncoder(cmd);
+        if (cmd.drawable) [cmd.buffer presentDrawable:cmd.drawable];
+        cmd.submission = S().nextSubmission++;
+        cmd.pending = true; cmd.recording = false;
+        [cmd.buffer commit];
+        return cmd.submission;
+    }
+}
+void Cmd::push(void* bytes, uint32_t size, uint32_t offset) {
+    Require(offset <= C(*this).push.size() && size <= C(*this).push.size() - offset, "Push constants exceed 256 bytes");
+    std::memcpy(C(*this).push.data() + offset, bytes, size);
+}
+void Cmd::bind(Pipeline pipeline) { C(*this).pipeline = pipeline; }
+void Cmd::dispatch(uint32_t x, uint32_t y, uint32_t z) {
+    auto& cmd = C(*this); Compute(cmd);
+    auto& pipeline = P(cmd.pipeline);
+    Require(pipeline.compute != nil, "Dispatch requires a compute pipeline");
+    [cmd.compute setComputePipelineState:pipeline.compute]; Push(cmd);
+    [cmd.compute dispatchThreadgroups:MTLSizeMake(x, y, z) threadsPerThreadgroup:pipeline.group];
+}
+void Cmd::restoreBindings() { if (C(*this).render) Residency(C(*this).render); if (C(*this).compute) Residency(C(*this).compute); }
+void Cmd::barrier(Image&, ImageLayout, ImageLayout, uint32_t, uint32_t, uint32_t, uint32_t) { Require(!C(*this).render, "Image transition inside a render pass"); EndEncoder(C(*this)); }
+void Cmd::barrier() { Require(!C(*this).render, "Global barrier inside a render pass"); EndEncoder(C(*this)); }
+void Cmd::computeBarrier() { if (C(*this).compute) [C(*this).compute memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures]; }
+void Cmd::copy(Buffer& src, Buffer& dst, uint64_t size, uint64_t srcOffset, uint64_t dstOffset) {
+    Require(srcOffset <= GetDesc(src).size && size <= GetDesc(src).size - srcOffset && dstOffset <= GetDesc(dst).size && size <= GetDesc(dst).size - dstOffset, "Buffer copy is out of bounds");
+    auto& cmd = C(*this); Blit(cmd);
+    [cmd.blit copyFromBuffer:B(src).buffer sourceOffset:srcOffset toBuffer:B(dst).buffer destinationOffset:dstOffset size:size];
+}
+void Cmd::copy(void* src, Buffer& dst, uint64_t size, uint64_t dstOffset) {
+    auto& cmd = C(*this); uint64_t offset = StageUpload(cmd, src, size); copy(cmd.staging, dst, size, offset, dstOffset);
+}
+void Cmd::update(Buffer& dst, uint64_t offset, uint64_t size, void* src) { copy(src, dst, size, offset); }
+void Cmd::fill(Buffer dst, uint32_t value, uint64_t size, uint64_t offset) {
+    auto& cmd = C(*this);
+    Require(offset <= GetDesc(dst).size && size <= GetDesc(dst).size - offset && size % 4 == 0, "Buffer fill is out of bounds or unaligned");
+    if ((value & 255) * 0x01010101u == value) {
+        Blit(cmd); [cmd.blit fillBuffer:B(dst).buffer range:NSMakeRange(offset, size) value:uint8_t(value)]; return;
+    }
+    uint64_t stage = (cmd.stagingOffset + 255) & ~uint64_t(255);
+    Require(stage <= STAGING_BYTES && size <= STAGING_BYTES - stage, "Staging buffer fill capacity exceeded");
+    std::fill_n(reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(cmd.staging.GetPtr()) + stage), size / 4, value);
+    cmd.stagingOffset = stage + size; copy(cmd.staging, dst, size, stage, offset);
+}
+
+void Cmd::copy(Buffer& src, Image& dst, uint32_t mip, uint32_t layer) {
+    const auto& desc = GetDesc(dst);
+    uint32_t width = std::max(1u, desc.extent.width >> mip), height = std::max(1u, desc.extent.height >> mip), depth = std::max(1u, desc.extent.depth >> mip);
+    Require(mip < desc.mipCount && layer < desc.layerCount, "Texture upload subresource is out of bounds");
+    auto& cmd = C(*this); Blit(cmd);
+    [cmd.blit copyFromBuffer:B(src).buffer sourceOffset:0 sourceBytesPerRow:width * PixelBytes(desc.format) sourceBytesPerImage:width * height * PixelBytes(desc.format)
+        sourceSize:MTLSizeMake(width, height, depth) toTexture:I(dst).texture destinationSlice:layer destinationLevel:mip destinationOrigin:MTLOriginMake(0, 0, 0)];
+}
+void Cmd::copy(void* src, Image& dst, uint64_t size, uint32_t mip, uint32_t layer) {
+    const auto& desc = GetDesc(dst);
+    uint32_t width = std::max(1u, desc.extent.width >> mip), height = std::max(1u, desc.extent.height >> mip), depth = std::max(1u, desc.extent.depth >> mip);
+    Require(mip < desc.mipCount && layer < desc.layerCount && size == uint64_t(width) * height * depth * PixelBytes(desc.format), "Invalid texture upload size");
+    auto& cmd = C(*this); uint64_t offset = StageUpload(cmd, src, size); Blit(cmd);
+    [cmd.blit copyFromBuffer:B(cmd.staging).buffer sourceOffset:offset sourceBytesPerRow:width * PixelBytes(desc.format) sourceBytesPerImage:width * height * PixelBytes(desc.format)
+        sourceSize:MTLSizeMake(width, height, depth) toTexture:I(dst).texture destinationSlice:layer destinationLevel:mip destinationOrigin:MTLOriginMake(0, 0, 0)];
+}
+void Cmd::copy(Image& src, Buffer& dst, uint32_t mip, uint32_t layer) {
+    const auto& desc = GetDesc(src);
+    Require(mip < desc.mipCount && layer < desc.layerCount, "Readback subresource is out of bounds");
+    uint32_t width = std::max(1u, desc.extent.width >> mip), height = std::max(1u, desc.extent.height >> mip), depth = std::max(1u, desc.extent.depth >> mip);
+    Require(GetDesc(dst).size >= uint64_t(width) * height * depth * PixelBytes(desc.format), "Readback buffer is too small");
+    auto& cmd = C(*this); Blit(cmd);
+    [cmd.blit copyFromTexture:I(src).texture sourceSlice:layer sourceLevel:mip sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(width, height, depth)
+        toBuffer:B(dst).buffer destinationOffset:0 destinationBytesPerRow:width * PixelBytes(desc.format) destinationBytesPerImage:width * height * PixelBytes(desc.format)];
+}
+void Cmd::copy(Image& src, Image& dst, uint32_t srcMip, uint32_t srcLayer, uint32_t dstMip, uint32_t dstLayer, uint32_t layers) {
+    const auto& desc = GetDesc(src);
+    auto& cmd = C(*this); Blit(cmd);
+    MTLSize size = MTLSizeMake(std::max(1u, desc.extent.width >> srcMip), std::max(1u, desc.extent.height >> srcMip), std::max(1u, desc.extent.depth >> srcMip));
+    for (uint32_t layer = 0; layer < layers; ++layer) [cmd.blit copyFromTexture:I(src).texture sourceSlice:srcLayer + layer sourceLevel:srcMip sourceOrigin:MTLOriginMake(0, 0, 0)
+        sourceSize:size toTexture:I(dst).texture destinationSlice:dstLayer + layer destinationLevel:dstMip destinationOrigin:MTLOriginMake(0, 0, 0)];
+}
+void Cmd::copy(Buffer& src, Image& dst, const std::vector<ImageRegion>& regions) {
+    auto& cmd = C(*this); Blit(cmd);
+    uint64_t offset = 0;
+    for (const auto& region : regions) {
+        uint32_t bytes = PixelBytes(GetDesc(dst).format);
+        [cmd.blit copyFromBuffer:B(src).buffer sourceOffset:offset sourceBytesPerRow:region.width * bytes sourceBytesPerImage:region.width * region.height * bytes
+            sourceSize:MTLSizeMake(region.width, region.height, region.depth) toTexture:I(dst).texture destinationSlice:region.layer destinationLevel:region.mip destinationOrigin:MTLOriginMake(region.x, region.y, region.z)];
+        offset += uint64_t(region.width) * region.height * region.depth * bytes;
+    }
+}
+void Cmd::blit(Image& src, Image& dst, ImageRegion from, ImageRegion to, Filter) {
+    Require(from.width == to.width && from.height == to.height && from.depth == to.depth && GetDesc(src).format == GetDesc(dst).format, "Scaled/format-converting blit is not implemented yet");
+    auto& cmd = C(*this); Blit(cmd);
+    [cmd.blit copyFromTexture:I(src).texture sourceSlice:from.layer sourceLevel:from.mip sourceOrigin:MTLOriginMake(from.x, from.y, from.z)
+        sourceSize:MTLSizeMake(from.width, from.height, from.depth) toTexture:I(dst).texture destinationSlice:to.layer destinationLevel:to.mip destinationOrigin:MTLOriginMake(to.x, to.y, to.z)];
+}
+
+namespace {
+void BeginRender(Cmd& api, Image* attachments, ClearValue* clears, int count, Image* resolves, bool loadDepth, uint32_t mip, uint32_t layer) {
+    auto& cmd = C(api);
+    Require(!cmd.render && count > 0 && count <= MAX_ATTACHMENTS_COUNT, "Invalid render pass");
+    EndEncoder(cmd);
+    @autoreleasepool {
+        auto pass = cmd.renderPass;
+        for (uint32_t index = 0; index < MAX_ATTACHMENTS_COUNT; ++index) { pass.colorAttachments[index].texture = nil; pass.colorAttachments[index].resolveTexture = nil; }
+        pass.depthAttachment.texture = nil;
+        pass.stencilAttachment.texture = nil;
+        uint32_t color = 0;
+        for (int index = 0; index < count; ++index) {
+            const auto& desc = GetDesc(attachments[index]);
+            auto action = clears ? MTLLoadActionClear : MTLLoadActionDontCare;
+            auto store = Has(desc.usage, ImageUsage::Transient) ? MTLStoreActionDontCare : MTLStoreActionStore;
+            if (Depth(desc.format)) {
+                auto attachment = pass.depthAttachment;
+                attachment.texture = I(attachments[index]).texture;
+                attachment.level = mip; attachment.slice = layer; attachment.depthPlane = 0;
+                attachment.loadAction = loadDepth ? MTLLoadActionLoad : action;
+                attachment.storeAction = store;
+                attachment.clearDepth = clears ? clears[index].depthStencil.depth : 1.0;
+                if (desc.format == Format::D24UnormS8Uint) {
+                    pass.stencilAttachment.texture = attachment.texture;
+                    pass.stencilAttachment.level = mip; pass.stencilAttachment.slice = layer; pass.stencilAttachment.depthPlane = 0;
+                    pass.stencilAttachment.loadAction = attachment.loadAction;
+                    pass.stencilAttachment.storeAction = store;
+                    pass.stencilAttachment.clearStencil = clears ? clears[index].depthStencil.stencil : 0;
+                }
+                continue;
+            }
+            auto attachment = pass.colorAttachments[color++];
+            attachment.texture = I(attachments[index]).texture;
+            attachment.level = mip;
+            attachment.slice = desc.extent.depth > 1 ? 0 : layer;
+            attachment.depthPlane = desc.extent.depth > 1 ? layer : 0;
+            attachment.loadAction = action; attachment.storeAction = store;
+            if (clears) {
+                auto& value = clears[index].color;
+                attachment.clearColor = UInt(desc.format) ? MTLClearColorMake(value.uint32[0], value.uint32[1], value.uint32[2], value.uint32[3])
+                    : desc.format == Format::RGBA32Sint ? MTLClearColorMake(value.int32[0], value.int32[1], value.int32[2], value.int32[3])
+                    : MTLClearColorMake(value.float32[0], value.float32[1], value.float32[2], value.float32[3]);
+            }
+            if (resolves && resolves[index]) { attachment.resolveTexture = I(resolves[index]).texture; attachment.storeAction = MTLStoreActionMultisampleResolve; }
+        }
+        if (cmd.counters) {
+            uint32_t first = EncoderSamples(cmd);
+            auto sample = pass.sampleBufferAttachments[0];
+            sample.sampleBuffer = cmd.counters;
+            sample.startOfVertexSampleIndex = first;
+            sample.endOfVertexSampleIndex = first + 1;
+            sample.startOfFragmentSampleIndex = first + 2;
+            sample.endOfFragmentSampleIndex = first + 3;
+        }
+        cmd.render = [cmd.buffer renderCommandEncoderWithDescriptor:pass];
+        Require(cmd.render != nil, "Cannot create render encoder");
+        auto extent = GetDesc(attachments[0]).extent;
+        extent.width = std::max(1u, extent.width >> mip);
+        extent.height = std::max(1u, extent.height >> mip);
+        [cmd.render setViewport:MTLViewport{0, 0, double(extent.width), double(extent.height), 0, 1}];
+        [cmd.render setScissorRect:MTLScissorRect{0, 0, extent.width, extent.height}];
+        [cmd.render setVertexBuffer:S().argumentBuffer offset:0 atIndex:metal::ARGUMENT_BUFFER];
+        [cmd.render setFragmentBuffer:S().argumentBuffer offset:0 atIndex:metal::ARGUMENT_BUFFER];
+        Residency(cmd.render);
+    }
+}
+}
+void Cmd::beginRender(Image* attachments, ClearValue* clears, int count, Image* resolves, bool loadDepth) {
+    BeginRender(*this, attachments, clears, count, resolves, loadDepth, 0, 0);
+}
+void Cmd::endRender() { Require(C(*this).render != nil, "No active render pass"); EndEncoder(C(*this)); }
+void Cmd::clear(Image image, ClearValue value) {
+    const auto& desc = GetDesc(image);
+    for (uint32_t mip = 0; mip < desc.mipCount; ++mip) {
+        uint32_t slices = desc.extent.depth > 1 ? std::max(1u, desc.extent.depth >> mip) : desc.layerCount;
+        for (uint32_t layer = 0; layer < slices; ++layer) {
+            BeginRender(*this, &image, &value, 1, nullptr, false, mip, layer);
+            endRender();
+        }
+    }
+}
+void Cmd::vertex(Buffer& buffer, uint64_t offset) { C(*this).vertices = buffer; C(*this).vertexOffset = offset; }
+void Cmd::index(Buffer& buffer, bool half, uint64_t offset) { C(*this).indices = buffer; C(*this).halfIndices = half; C(*this).indexOffset = offset; }
+void Cmd::viewport(float x, float y, float width, float height, float near, float far) {
+    Require(C(*this).render != nil, "Viewport requires render pass");
+    [C(*this).render setViewport:MTLViewport{double(x), double(y), double(width), double(height), double(near), double(far)}];
+}
+void Cmd::scissor(int32_t x, int32_t y, uint32_t width, uint32_t height) {
+    Require(C(*this).render != nil && x >= 0 && y >= 0, "Invalid scissor");
+    [C(*this).render setScissorRect:MTLScissorRect{NSUInteger(x), NSUInteger(y), width, height}];
+}
+void Cmd::lineWidth(float) {}
+namespace {
+void DrawState(Command& cmd) {
+    Require(cmd.render != nil, "Draw requires a render pass");
+    auto& pipeline = P(cmd.pipeline);
+    Require(pipeline.render != nil, "Draw requires graphics pipeline");
+    [cmd.render setRenderPipelineState:pipeline.render];
+    [cmd.render setDepthStencilState:pipeline.depth];
+    [cmd.render setCullMode:pipeline.desc.cull == Cull::None ? MTLCullModeNone : pipeline.desc.cull == Cull::Front ? MTLCullModeFront : MTLCullModeBack];
+    [cmd.render setFrontFacingWinding:pipeline.desc.frontClockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+    [cmd.render setTriangleFillMode:pipeline.desc.wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+    if (cmd.vertices) [cmd.render setVertexBuffer:B(cmd.vertices).buffer offset:cmd.vertexOffset atIndex:metal::VERTEX_BUFFER];
+    Push(cmd);
+}
+MTLPrimitiveType PrimitiveType(Command& cmd) { return P(cmd.pipeline).desc.primitive == Primitive::Triangle ? MTLPrimitiveTypeTriangle : MTLPrimitiveTypeLine; }
+}
+void Cmd::draw(uint32_t vertices, uint32_t instances, uint32_t first, uint32_t baseInstance) {
+    auto& cmd = C(*this); DrawState(cmd);
+    [cmd.render drawPrimitives:PrimitiveType(cmd) vertexStart:first vertexCount:vertices instanceCount:instances baseInstance:baseInstance];
+}
+void Cmd::drawIndexed(uint32_t indices, uint32_t instances, uint32_t first, int32_t baseVertex, uint32_t baseInstance) {
+    auto& cmd = C(*this); DrawState(cmd);
+    [cmd.render drawIndexedPrimitives:PrimitiveType(cmd) indexCount:indices indexType:cmd.halfIndices ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+        indexBuffer:B(cmd.indices).buffer indexBufferOffset:cmd.indexOffset + first * (cmd.halfIndices ? 2 : 4) instanceCount:instances baseVertex:baseVertex baseInstance:baseInstance];
+}
+void Cmd::drawIndirect(Buffer& buffer, uint64_t offset, uint32_t count, uint32_t stride) {
+    auto& cmd = C(*this); DrawState(cmd);
+    for (uint32_t index = 0; index < count; ++index) [cmd.render drawPrimitives:PrimitiveType(cmd) indirectBuffer:B(buffer).buffer indirectBufferOffset:offset + index * stride];
+}
+void Cmd::drawIndexedIndirect(Buffer& buffer, uint64_t offset, uint32_t count, uint32_t stride) {
+    auto& cmd = C(*this); DrawState(cmd);
+    for (uint32_t index = 0; index < count; ++index) [cmd.render drawIndexedPrimitives:PrimitiveType(cmd) indexType:cmd.halfIndices ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+        indexBuffer:B(cmd.indices).buffer indexBufferOffset:cmd.indexOffset indirectBuffer:B(buffer).buffer indirectBufferOffset:offset + index * stride];
+}
+void Cmd::drawIndirectCount(Buffer&, uint64_t, Buffer&, uint64_t, uint32_t, uint32_t) { Require(false, "GPU-counted indirect drawing is not implemented yet"); }
+void Cmd::drawIndexedIndirectCount(Buffer&, uint64_t, Buffer&, uint64_t, uint32_t, uint32_t) { Require(false, "GPU-counted indexed drawing is not implemented yet"); }
+int Cmd::beginTimestamp(const char* name) {
+    auto& cmd = C(*this);
+    if (!cmd.counters) return -1;
+    Require(!cmd.render, "Timestamp boundaries inside render encoders are unsupported on this GPU");
+    EndEncoder(cmd);
+    Require(cmd.markerCount < TIMESTAMP_COUNT, "Timestamp marker capacity exceeded");
+    uint32_t id = cmd.markerCount++;
+    cmd.markers[id] = {name, cmd.samples, cmd.samples};
+    return int(id);
+}
+void Cmd::endTimestamp(int id) {
+    if (id < 0) return;
+    auto& cmd = C(*this);
+    Require(!cmd.render && uint32_t(id) < cmd.markerCount, "Invalid encoder timestamp boundary");
+    EndEncoder(cmd); cmd.markers[id].last = cmd.samples;
+}
+void Cmd::beginPresent() { beginPresent(nullptr, nullptr, 0); }
+void Cmd::beginPresent(Image* attachments, ClearValue* clearValues, int count) {
+    auto& cmd = C(*this);
+    Require(!cmd.drawable && S().layer != nil && count < MAX_ATTACHMENTS_COUNT, "Invalid presentation");
+    @autoreleasepool {
+        ResizeLayer();
+        cmd.drawable = [S().layer nextDrawable];
+        Require(cmd.drawable != nil, "Cannot acquire Metal drawable");
+        auto& image = I(cmd.drawableImage);
+        image.texture = cmd.drawable.texture;
+        image.desc = {.extent = {uint32_t(image.texture.width), uint32_t(image.texture.height)}, .format = Format::BGRA8Unorm, .usage = ImageUsage::Attachment};
+        std::array<Image, MAX_ATTACHMENTS_COUNT> images;
+        std::array<ClearValue, MAX_ATTACHMENTS_COUNT> clears = {
+            ClearColor{}, ClearColor{}, ClearColor{}, ClearColor{}, ClearColor{}, ClearColor{}, ClearColor{}, ClearColor{},
+        };
+        images[0] = cmd.drawableImage; clears[0].color.float32[3] = 1;
+        for (int index = 0; index < count; ++index) { images[index + 1] = attachments[index]; if (clearValues) clears[index + 1] = clearValues[index]; }
+        beginRender(images.data(), clears.data(), count + 1);
+    }
+}
+void Cmd::endPresent() { endRender(); }
+BLAS CreateBLAS(const BLASDesc&) { Require(false, "Native acceleration structure implementation is pending"); return {}; }
+TLAS CreateTLAS(uint32_t, bool) { Require(false, "Native acceleration structure implementation is pending"); return {}; }
+void Cmd::buildBLAS(const std::vector<BLAS>&, bool) { Require(false, "Native BLAS build implementation is pending"); }
+void Cmd::buildTLAS(const TLAS&, const std::vector<BLASInstance>&, bool) { Require(false, "Native TLAS build implementation is pending"); }
+void Shutdown() {
+    if (!G) return;
+    @autoreleasepool {
+        for (auto& cmd : S().commands) if (cmd.pending) CmdWait(cmd.submission);
+        S().shuttingDown = true;
+        for (auto& cmd : S().commands) {
+            cmd.pipeline.release(); cmd.vertices.release(); cmd.indices.release(); cmd.drawableImage.release(); cmd.staging.release();
+            cmd.buffer = nil;
+        }
+        Retire();
+        if (S().view.layer == S().layer) S().view.layer = nil;
+        State* state = G; delete state; G = nullptr;
+    }
+}
+}

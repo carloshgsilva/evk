@@ -35,11 +35,11 @@ void Translate(const std::filesystem::path& input, const std::filesystem::path& 
     options.msl_version = 30000;
     options.argument_buffers = true;
     options.argument_buffers_tier = spirv_cross::CompilerMSL::Options::ArgumentBuffersTier::Tier2;
-    options.invariant_float_math = true;
+    options.pad_argument_buffer_resources = true;
     compiler.set_msl_options(options);
     compiler.set_argument_buffer_device_address_space(0, true);
     auto common = compiler.get_common_options();
-    common.vertex.flip_vert_y = true;
+    common.vertex.flip_vert_y = false;
     compiler.set_common_options(common);
 
     for (uint32_t binding = 0; binding < 4; ++binding) {
@@ -47,6 +47,10 @@ void Translate(const std::filesystem::path& input, const std::filesystem::path& 
         resource.stage = stage;
         resource.desc_set = 0;
         resource.binding = binding;
+        resource.basetype = binding == 0 ? spirv_cross::SPIRType::UInt
+            : binding == 1 ? spirv_cross::SPIRType::SampledImage
+            : binding == 2 ? spirv_cross::SPIRType::Image
+            : spirv_cross::SPIRType::UInt64;
         resource.count = binding == 0 ? evk::metal::BUFFER_COUNT : evk::metal::IMAGE_COUNT;
         resource.msl_buffer = binding == 0 ? evk::metal::STORAGE_ID : evk::metal::TLAS_ID;
         resource.msl_texture = binding == 1 ? evk::metal::TEXTURE_ID : evk::metal::IMAGE_ID;
@@ -57,6 +61,7 @@ void Translate(const std::filesystem::path& input, const std::filesystem::path& 
     push.stage = stage;
     push.desc_set = spirv_cross::kPushConstDescSet;
     push.binding = spirv_cross::kPushConstBinding;
+    push.basetype = spirv_cross::SPIRType::UInt;
     push.msl_buffer = evk::metal::PUSH_BUFFER;
     compiler.add_msl_resource_binding(push);
 
