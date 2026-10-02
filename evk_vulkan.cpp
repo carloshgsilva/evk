@@ -894,6 +894,10 @@ namespace evk {
 
             std::vector<std::string> instanceLayers = desc.instanceLayers;
             std::vector<std::string> instanceExtensions = desc.instanceExtensions;
+            const bool enumeratePortability = isInstanceExtensionSupported(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+            if (enumeratePortability) {
+                addUnique(instanceExtensions, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+            }
 
             if (desc.enableSwapchain) {
                 addUnique(instanceExtensions, VK_KHR_SURFACE_EXTENSION_NAME);
@@ -992,6 +996,9 @@ namespace evk {
             }
 
             VkInstanceCreateInfo instanceci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+            if (enumeratePortability) {
+                instanceci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+            }
             instanceci.pApplicationInfo = &appInfo;
             instanceci.enabledExtensionCount = uint32_t(extensions.size());
             instanceci.ppEnabledExtensionNames = extensions.data();
@@ -1032,8 +1039,11 @@ namespace evk {
             S.physicalDevice = physicalDevices[0];
 
             // PhysicalDevice properties
-            VkPhysicalDeviceProperties props = {};
-            vkGetPhysicalDeviceProperties(S.physicalDevice, &props);
+            VkPhysicalDeviceDriverProperties driver = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            properties.pNext = &driver;
+            vkGetPhysicalDeviceProperties2(S.physicalDevice, &properties);
+            const auto& props = properties.properties;
             EVK_ASSERT(props.apiVersion >= VK_API_VERSION_1_3, "EVK requires Vulkan 1.3");
             S.timestampPeriod = props.limits.timestampPeriod;
             S.framebufferSampleCounts = props.limits.framebufferColorSampleCounts & props.limits.framebufferDepthSampleCounts;
@@ -1045,6 +1055,8 @@ namespace evk {
             }
 
             printf("[evk] Vulkan %d.%d.%d | %s \n", VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion), props.deviceName);
+            printf("[evk] Driver %s | %s | id=%u | timestamp_period_ns=%g\n", driver.driverName, driver.driverInfo,
+                static_cast<uint32_t>(driver.driverID), props.limits.timestampPeriod);
 
             uint32_t familyPropsCount = 0;
             std::vector<VkQueueFamilyProperties> familyProps;
@@ -2273,6 +2285,24 @@ namespace evk {
         vkCmdCopyBufferToImage(cb->cmd, ToInternal(src).buffer, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }
     
+    void Cmd::copy(Image& src, Buffer& dst, uint32_t mip, uint32_t layer) {
+        auto* cb = static_cast<CommandBufferData*>(_internal);
+        const auto& desc = GetDesc(src);
+        EVK_ASSERT(mip < desc.mipCount && layer < desc.layerCount, "Image readback subresource is out of bounds");
+        VkBufferImageCopy copy = {};
+        copy.imageSubresource.aspectMask = DoesFormatHaveDepth(desc.format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.mipLevel = mip;
+        copy.imageSubresource.baseArrayLayer = layer;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageExtent = {
+            std::max(1u, desc.extent.width >> mip),
+            std::max(1u, desc.extent.height >> mip),
+            std::max(1u, desc.extent.depth >> mip),
+        };
+        vkCmdCopyImageToBuffer(cb->cmd, ToInternal(src).image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            ToInternal(dst).buffer, 1, &copy);
+    }
+
     void Cmd::copy(Buffer& src, Image& dst, const std::vector<ImageRegion>& regions) {
         CommandBufferData* cb = (CommandBufferData*)_internal;
         EVK_ASSERT(regions.size() <= 16, "regions size must be less or equals than 16");

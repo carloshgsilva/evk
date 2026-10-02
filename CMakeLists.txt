@@ -21,6 +21,21 @@ target_link_libraries(evk PUBLIC Vulkan::Vulkan)
 target_compile_definitions(evk PUBLIC "EVK_VULKAN=1")
 add_library(evk::evk ALIAS evk)
 
+option(EVK_BUILD_METAL_SHADER_TOOL "Build the offline SPIR-V to Metal shader translator" OFF)
+if(EVK_BUILD_METAL_SHADER_TOOL)
+  find_path(EVK_SPIRV_CROSS_INCLUDE spirv_msl.hpp
+      HINTS "$ENV{VULKAN_SDK}/include/spirv_cross" REQUIRED)
+  foreach(component msl glsl core)
+    find_library(EVK_SPIRV_CROSS_${component} NAMES spirv-cross-${component}
+        HINTS "$ENV{VULKAN_SDK}/lib" REQUIRED)
+  endforeach()
+  add_executable(evk_metal_shader tools/metal_shader.cpp)
+  target_compile_features(evk_metal_shader PRIVATE cxx_std_20)
+  target_include_directories(evk_metal_shader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${EVK_SPIRV_CROSS_INCLUDE})
+  target_link_libraries(evk_metal_shader PRIVATE
+      ${EVK_SPIRV_CROSS_msl} ${EVK_SPIRV_CROSS_glsl} ${EVK_SPIRV_CROSS_core})
+endif()
+
 # evk::ai
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/evk_embed_shaders.cmake")
 

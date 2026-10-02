@@ -413,6 +413,7 @@ namespace evk {
         void blit(Image& src, Image& dst, ImageRegion srcRegion, ImageRegion dstRegion, Filter filter = Filter::Linear);
         void copy(Image& src, Image& dst, uint32_t srcMip = 0, uint32_t srcLayer = 0, uint32_t dstMip = 0, uint32_t dstLayer = 0, uint32_t layerCount = 1);
         void copy(Buffer& src, Image& dst, uint32_t mip = 0, uint32_t layer = 0);
+        void copy(Image& src, Buffer& dst, uint32_t mip = 0, uint32_t layer = 0);
         void copy(Buffer& src, Image& dst, const std::vector<ImageRegion>& regions);
         void copy(void* src, Image& dst, uint64_t size, uint32_t mip = 0, uint32_t layer = 0);
         void clear(Image image, ClearValue value);
