@@ -10,6 +10,7 @@ PUSH(
     BufferFp16 scoresBuffer;  // (batch, N, N)
     uint batch;
     uint N;
+    uint window;
 )
 
 // Apply causal mask: set scores[b, i, j] = -inf for j > i
@@ -27,7 +28,7 @@ void main() {
     // uint b = temp / N;  // Not needed
     
     // Causal mask: j > i should be -inf
-    if (j > i) {
+    if (j > i || (window != 0u && j + window <= i)) {
         scoresBuffer.x[gid] = float16_t(-65504.0); // fp16 min
     }
 }

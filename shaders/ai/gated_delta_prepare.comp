@@ -1,0 +1,68 @@
+#include "../common/evk.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 projectionBuffer;
+    BufferFp16 preparedBuffer;
+    uint rowCount;
+    uint sequenceLength;
+    uint modelDim;
+    uint headCount;
+    float ropeBase;
+    float decayBias;
+)
+
+float headSum(float value, uint size) {
+    for (uint offset = size / 2u; offset > 0u; offset >>= 1u)
+        value += subgroupShuffleXor(value, offset);
+    return value;
+}
+
+COMPUTE(128, 1, 1)
+void main() {
+    uint headDim = modelDim / headCount;
+    uint lane = gl_LocalInvocationID.x;
+    uint index = gl_WorkGroupID.x * 128u + lane;
+    uint row = index / (modelDim / 2u);
+    uint feature = 2u * (index % (modelDim / 2u));
+    uint head = feature / headDim;
+    uint start = row * (3u * modelDim + 2u * headCount);
+    bool isActive = row < rowCount;
+    vec2 q = isActive ? vec2(projectionBuffer.x[start + feature],
+                             projectionBuffer.x[start + feature + 1u])
+                      : vec2(0.0);
+    vec2 k = isActive ? vec2(projectionBuffer.x[start + modelDim + feature],
+                             projectionBuffer.x[start + modelDim + feature + 1u])
+                      : vec2(0.0);
+    float angle = float(row % sequenceLength) * pow(ropeBase, -float(feature) / float(modelDim));
+    float c = cos(angle), s = sin(angle);
+    q = vec2(f16vec2(q.x * c - q.y * s, q.x * s + q.y * c));
+    k = vec2(f16vec2(k.x * c - k.y * s, k.x * s + k.y * c));
+    float inverseQ = inversesqrt(headSum(dot(q, q), headDim / 2u) + 1.0e-6);
+    float inverseK = inversesqrt(headSum(dot(k, k), headDim / 2u) + 1.0e-6);
+    q *= inverseQ;
+    k *= inverseK;
+    if (isActive) {
+        preparedBuffer.x[start + feature] = float16_t(q.x);
+        preparedBuffer.x[start + feature + 1u] = float16_t(q.y);
+        preparedBuffer.x[start + modelDim + feature] = float16_t(k.x);
+        preparedBuffer.x[start + modelDim + feature + 1u] = float16_t(k.y);
+        preparedBuffer.x[start + 2u * modelDim + feature] =
+            projectionBuffer.x[start + 2u * modelDim + feature];
+        preparedBuffer.x[start + 2u * modelDim + feature + 1u] =
+            projectionBuffer.x[start + 2u * modelDim + feature + 1u];
+        if (feature % headDim == 0u) {
+            uint gate = start + 3u * modelDim + head;
+            preparedBuffer.x[gate] =
+                float16_t(1.0 / (1.0 + exp(float(projectionBuffer.x[gate]) + decayBias)));
+            preparedBuffer.x[gate + headCount] =
+                float16_t(1.0 / (1.0 + exp(-float(projectionBuffer.x[gate + headCount]))));
+        }
+    }
+}

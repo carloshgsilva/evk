@@ -243,6 +243,12 @@ void oidn_demo(const char* weights_path) {
     auto load_begin = std::chrono::steady_clock::now();
     evk::ai::oidn::Denoiser denoiser(weights_path, width, height);
     auto load_end = std::chrono::steady_clock::now();
+    const evk::ai::Plan& plan = denoiser.plan();
+    printf("oidn_plan_steps: %zu\n", plan.size());
+    size_t fused_steps = std::count_if(
+        plan.begin(), plan.end(),
+        [](const evk::ai::PlanStep& step) { return step.nodes.size() > 1u; });
+    printf("oidn_fused_steps: %zu\n", fused_steps);
     std::vector<float> denoised(rendered.color.size());
     auto inference_begin = std::chrono::steady_clock::now();
     if (denoiser.uses_auxiliary_inputs()) {

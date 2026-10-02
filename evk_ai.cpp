@@ -1,5 +1,6 @@
 #include "evk_ai.h"
 
+#include <bit>
 #include <stdexcept>
 #include <string_view>
 
@@ -65,8 +66,15 @@ namespace evk::ai {
         evk::Pipeline embed;
         evk::Pipeline embed_bwd;
         evk::Pipeline greedy_sample;
+        evk::Pipeline swiglu;
+        evk::Pipeline attention_cache_append;
         evk::Pipeline position_add;
         evk::Pipeline position_add_bwd;
+        evk::Pipeline gated_delta_projected_step;
+        evk::Pipeline gated_delta_prepare;
+        evk::Pipeline gated_delta_projected[2][6];
+        evk::Pipeline gated_delta_projected_bwd_boundaries[2][6];
+        evk::Pipeline gated_delta_projected_bwd[2][6];
         evk::Pipeline rope;
         evk::Pipeline rope_bwd;
         evk::Pipeline causal_mask;
@@ -85,6 +93,7 @@ namespace evk::ai {
         evk::Pipeline sum_batch;
         evk::Pipeline rms_norm;
         evk::Pipeline rms_norm_bwd;
+        evk::Pipeline matmul_weight_bwd;
         evk::Buffer cross_entropy_accum;
         evk::Buffer flash_scratch;
         uint64_t flash_scratch_elems = 0;
@@ -109,12 +118,16 @@ namespace evk::ai {
         uint8_t acc_c;
         uint8_t transpose_a;
         uint8_t transpose_b;
+        uint8_t fuse_residual;
+        uint8_t fuse_gelu;
         uint32_t stride_a;
         uint32_t stride_b;
         uint32_t stride_c;
 
         operator uint64_t() const {
-            return hash_combine(m, k, n, tile_m, tile_n, acc_c, transpose_a, transpose_b, stride_a, stride_b, stride_c);
+            return hash_combine(m, k, n, tile_m, tile_n, acc_c, transpose_a,
+                                transpose_b, fuse_residual, fuse_gelu, stride_a, stride_b,
+                                stride_c);
         }
     };
     
@@ -142,6 +155,8 @@ namespace evk::ai {
                 uint32_t(config.stride_a),
                 uint32_t(config.stride_b),
                 uint32_t(config.stride_c),
+                uint32_t(config.fuse_residual),
+                uint32_t(config.fuse_gelu),
             },
         });
         matmul_configs[key] = pipeline;
@@ -160,6 +175,27 @@ namespace evk::ai {
         }
     };
     static std::unordered_map<uint64_t, evk::Pipeline> flash_configs;
+    static std::unordered_map<uint64_t, evk::Pipeline> causal_attention_configs;
+    static std::unordered_map<uint64_t, evk::Pipeline> cached_attention_configs;
+
+    static uint32_t causal_attention_tile_width(uint32_t d) {
+        return d % 64u == 0u ? 64u : 16u;
+    }
+
+    static evk::Pipeline& causal_attention_pipeline(uint32_t n, uint32_t d, uint32_t stage,
+                                                    uint32_t window) {
+        auto& pipeline = causal_attention_configs[hash_combine(n, d, stage, window)];
+        if (!pipeline) {
+            const char* name = stage == 2u ? "causal_attention_bwd" : "causal_attention";
+            uint32_t variant = stage == 2u ? causal_attention_tile_width(d) : uint32_t(stage == 1u);
+            pipeline = evk::CreatePipeline({
+                .name = name,
+                .CS = detail::load_embedded_shader(name),
+                .constants = evk::Constant{n, d, variant, window},
+            });
+        }
+        return pipeline;
+    }
 
     static void ensure_flash_scratch(uint32_t B, uint32_t H, uint32_t N, uint32_t Dh) {
         const uint64_t TILE_M = 16u;
@@ -255,8 +291,13 @@ namespace evk::ai {
         pipelines->embed = create_named_compute_pipeline("embed");
         pipelines->embed_bwd = create_named_compute_pipeline("embed_bwd");
         pipelines->greedy_sample = create_named_compute_pipeline("greedy_sample");
+        pipelines->swiglu = create_named_compute_pipeline("swiglu");
+        pipelines->attention_cache_append = create_named_compute_pipeline("attention_cache_append");
         pipelines->position_add = create_named_compute_pipeline("position_add");
         pipelines->position_add_bwd = create_named_compute_pipeline("position_add_bwd");
+        pipelines->gated_delta_projected_step =
+            create_named_compute_pipeline("gated_delta_projected_step");
+        pipelines->gated_delta_prepare = create_named_compute_pipeline("gated_delta_prepare");
         pipelines->rope = create_named_compute_pipeline("rope");
         pipelines->rope_bwd = create_named_compute_pipeline("rope_bwd");
         pipelines->causal_mask = create_named_compute_pipeline("causal_mask");
@@ -275,6 +316,8 @@ namespace evk::ai {
         pipelines->sum_batch = create_named_compute_pipeline("sum_batch");
         pipelines->rms_norm = create_named_compute_pipeline("rms_norm");
         pipelines->rms_norm_bwd = create_named_compute_pipeline("rms_norm_bwd");
+        pipelines->matmul_weight_bwd =
+            create_named_compute_pipeline("matmul_weight_bwd");
         pipelines->cross_entropy_accum = {};
         pipelines->flash_scratch = {};
         pipelines->flash_scratch_elems = 0;
@@ -284,9 +327,13 @@ namespace evk::ai {
         pipelines.reset();
         matmul_configs.clear();
         flash_configs.clear();
+        causal_attention_configs.clear();
+        cached_attention_configs.clear();
     }
 
-    void matmul(Tensor& a, Tensor& b, Tensor& c, bool transpose_a, bool transpose_b, bool acc_c, uint8_t TILE_M, uint8_t TILE_N) {
+    void matmul(Tensor& a, Tensor& b, Tensor& c, bool transpose_a, bool transpose_b,
+                bool acc_c, uint8_t TILE_M, uint8_t TILE_N, Tensor* residual,
+                Tensor* gelu_output) {
         const uint32_t TILE_K = 16u;
 
         // Basic rank and batch compatibility
@@ -343,6 +390,8 @@ namespace evk::ai {
             a.buffer.GetReference(),
             b.buffer.GetReference(),
             c.buffer.GetReference(),
+            (residual ? residual->buffer : c.buffer).GetReference(),
+            (gelu_output ? gelu_output->buffer : c.buffer).GetReference(),
         });
 
         uint32_t tilesCols = N / TILE_N; // columns
@@ -356,12 +405,146 @@ namespace evk::ai {
             .acc_c = acc_c,
             .transpose_a = transpose_a,
             .transpose_b = transpose_b,
+            .fuse_residual = residual ? uint8_t(1u) : uint8_t(0u),
+            .fuse_gelu = gelu_output ? uint8_t(1u) : uint8_t(0u),
             .stride_a = strideA,
             .stride_b = strideB,
             .stride_c = strideC,
         }));
         cmd.dispatch(tilesCols, tilesRows, batch);
-        cmd.barrier();
+        cmd.computeBarrier();
+    }
+
+    void matmul_weight_backward(Tensor& input, Tensor& grad_output,
+                                Tensor& grad_weight) {
+        assert(input.shape.rank() == 3u && grad_output.shape.rank() == 3u);
+        uint32_t batch_size = input.shape[0];
+        uint32_t row_count = input.shape[1];
+        uint32_t input_dim = input.shape[2];
+        uint32_t output_dim = grad_output.shape[2];
+        assert(grad_output.shape[0] == batch_size &&
+               grad_output.shape[1] == row_count);
+        assert(grad_weight.shape == Shape({input_dim, output_dim}));
+        assert((row_count % 16u) == 0u && (input_dim % 16u) == 0u &&
+               (output_dim % 16u) == 0u);
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(pipelines->matmul_weight_bwd);
+        cmd.push(evk::Constant{
+            input.buffer.GetReference(), grad_output.buffer.GetReference(),
+            grad_weight.buffer.GetReference(), batch_size, row_count,
+            input_dim, output_dim,
+        });
+        cmd.dispatch(output_dim / 16u, input_dim / 16u, 1u);
+        cmd.computeBarrier();
+    }
+
+    void causal_attention(Tensor& q, Tensor& k, Tensor& v, Tensor& probabilities,
+                          Tensor& output, float scale, uint32_t window) {
+        assert(q.shape.rank() == 3u && q.shape == k.shape &&
+               q.shape == v.shape && q.shape == output.shape);
+        uint32_t b = q.shape[0], n = q.shape[1], d = q.shape[2];
+        assert(supports_fused_causal_attention(n, d));
+        assert(probabilities.shape == Shape({b, n, n}));
+        auto& cmd = GetCmd();
+        cmd.bind(causal_attention_pipeline(n, d, 0u, window));
+        cmd.push(evk::Constant{
+            q.buffer.GetReference(), k.buffer.GetReference(), v.buffer.GetReference(),
+            probabilities.buffer.GetReference(), output.buffer.GetReference(), scale,
+        });
+        cmd.dispatch(1u, n / 16u, b);
+        cmd.computeBarrier();
+    }
+
+    void causal_attention_backward(Tensor& q, Tensor& k, Tensor& v, Tensor& probabilities,
+                                   Tensor& grad_output, Tensor& grad_q, Tensor& grad_k,
+                                   Tensor& grad_v, Tensor& grad_scores, float scale, uint32_t window) {
+        assert(q.shape.rank() == 3u && q.shape == k.shape && q.shape == v.shape);
+        assert(q.shape == grad_output.shape && q.shape == grad_q.shape &&
+               q.shape == grad_k.shape && q.shape == grad_v.shape);
+        uint32_t b = q.shape[0], n = q.shape[1], d = q.shape[2];
+        assert(supports_fused_causal_attention(n, d));
+        assert(probabilities.shape == Shape({b, n, n}) &&
+               probabilities.shape == grad_scores.shape);
+        auto& cmd = GetCmd();
+        cmd.bind(causal_attention_pipeline(n, d, 1u, window));
+        cmd.push(evk::Constant{
+            grad_output.buffer.GetReference(), v.buffer.GetReference(), v.buffer.GetReference(),
+            probabilities.buffer.GetReference(), grad_scores.buffer.GetReference(), scale,
+        });
+        cmd.dispatch(1u, n / 16u, b);
+        cmd.computeBarrier();
+        // Independent workgroups cannot accumulate into aliased gradient buffers.
+        if (grad_q.buffer.GetReference() == grad_k.buffer.GetReference() ||
+            grad_q.buffer.GetReference() == grad_v.buffer.GetReference() ||
+            grad_k.buffer.GetReference() == grad_v.buffer.GetReference()) {
+            matmul(probabilities, grad_output, grad_v, true, false, true, 16, 16);
+            matmul(grad_scores, k, grad_q, false, false, true, 16, 16);
+            matmul(grad_scores, q, grad_k, true, false, true, 16, 16);
+            return;
+        }
+        cmd.bind(causal_attention_pipeline(n, d, 2u, window));
+        cmd.push(evk::Constant{
+            q.buffer.GetReference(), k.buffer.GetReference(), probabilities.buffer.GetReference(),
+            grad_output.buffer.GetReference(), grad_scores.buffer.GetReference(),
+            grad_q.buffer.GetReference(), grad_k.buffer.GetReference(), grad_v.buffer.GetReference(),
+        });
+        cmd.dispatch(d / causal_attention_tile_width(d), n / 16u, b * 3u);
+        cmd.computeBarrier();
+    }
+
+    void attention_cache_append(Tensor& k, Tensor& v, Tensor& key_cache, Tensor& value_cache,
+                                uint32_t position, float rope_base) {
+        assert(k.shape == v.shape && key_cache.shape == value_cache.shape);
+        assert(k.shape.rank() == 3u && k.shape[0] == 1u && key_cache.shape.rank() == 3u);
+        uint32_t b = key_cache.shape[0], c = key_cache.shape[1], d = key_cache.shape[2];
+        assert(c > 0u && d % 2u == 0u && k.shape[1] >= b && k.shape[2] == d);
+        auto& cmd = GetCmd();
+        cmd.bind(pipelines->attention_cache_append);
+        cmd.push(evk::Constant{k.buffer.GetReference(), v.buffer.GetReference(),
+            key_cache.buffer.GetReference(), value_cache.buffer.GetReference(),
+            b, c, d, position, rope_base});
+        cmd.dispatch((b * d / 2u + 255u) / 256u, 1u, 1u);
+        cmd.computeBarrier();
+    }
+
+    void cached_attention(Tensor& q, Tensor& key_cache, Tensor& value_cache,
+                          Tensor& output, uint32_t position) {
+        assert(q.shape == output.shape && key_cache.shape == value_cache.shape);
+        assert(q.shape.rank() == 3u && q.shape[0] == 1u && key_cache.shape.rank() == 3u);
+        uint32_t b = key_cache.shape[0], c = key_cache.shape[1], d = key_cache.shape[2];
+        assert(c > 0u && c <= 16384u && d > 0u && q.shape[1] == b && q.shape[2] == d);
+        auto& pipeline = cached_attention_configs[hash_combine(c, d)];
+        if (!pipeline) pipeline = evk::CreatePipeline({
+            .name = "cached_attention", .CS = detail::load_embedded_shader("cached_attention"),
+            .constants = evk::Constant{c, d},
+        });
+        auto& cmd = GetCmd();
+        cmd.bind(pipeline);
+        cmd.push(evk::Constant{q.buffer.GetReference(), key_cache.buffer.GetReference(),
+            value_cache.buffer.GetReference(), output.buffer.GetReference(), position});
+        cmd.dispatch(b, 1u, 1u);
+        cmd.computeBarrier();
+    }
+
+    void swiglu(Tensor& input, Tensor& output) {
+        assert(input.shape.count() == 2u * output.shape.count());
+        assert(input.shape[-1] == 2u * output.shape[-1]);
+        auto& cmd = GetCmd();
+        cmd.bind(pipelines->swiglu);
+        cmd.push(evk::Constant{input.buffer.GetReference(), output.buffer.GetReference(),
+            input.buffer.GetReference(), output.shape[-1], output.shape.count(), 0u});
+        cmd.dispatch((output.shape.count() + 255u) / 256u, 1u, 1u);
+        cmd.computeBarrier();
+    }
+
+    void swiglu_backward(Tensor& input, Tensor& grad_output, Tensor& grad_input) {
+        assert(input.shape == grad_input.shape && input.shape.count() == 2u * grad_output.shape.count());
+        auto& cmd = GetCmd();
+        cmd.bind(pipelines->swiglu);
+        cmd.push(evk::Constant{input.buffer.GetReference(), grad_output.buffer.GetReference(),
+            grad_input.buffer.GetReference(), grad_output.shape[-1], grad_output.shape.count(), 1u});
+        cmd.dispatch((grad_output.shape.count() + 255u) / 256u, 1u, 1u);
+        cmd.computeBarrier();
     }
 
     void flash_attention(Tensor& q, Tensor& k, Tensor& v, Tensor& o) {
@@ -622,7 +805,7 @@ namespace evk::ai {
         const uint32_t WORKGROUP_SIZE = 256u;
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
-        cmd.barrier();
+        cmd.computeBarrier();
     }
 
     void softmax(Tensor& in, Tensor& out, float input_scale) {
@@ -931,7 +1114,7 @@ namespace evk::ai {
         const uint32_t WORKGROUP_SIZE = 256u;
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
-        cmd.barrier();
+        cmd.computeBarrier();
     }
 
     void cross_entropy_loss(Tensor& logits, Tensor& targets, Tensor& grad, Tensor& result) {
@@ -969,7 +1152,7 @@ namespace evk::ai {
             vocabSize,
         });
         cmd.dispatch(countGroups, 1, 1);
-        cmd.barrier();
+        cmd.computeBarrier();
 
         // Pass 2: Compute logits softmax, unscaled grad, accumulate unscaled loss
         cmd.bind(pipelines->cross_entropy);
@@ -982,7 +1165,7 @@ namespace evk::ai {
             totalPositions,
         });
         cmd.dispatch(totalPositions, 1, 1);
-        cmd.barrier();
+        cmd.computeBarrier();
 
         // Pass 3: Write mean loss
         cmd.bind(pipelines->cross_entropy_scale);
@@ -991,7 +1174,7 @@ namespace evk::ai {
             pipelines->cross_entropy_accum.GetReference(),
         });
         cmd.dispatch(1u, 1, 1);
-        cmd.barrier();
+        cmd.computeBarrier();
     }
 
     void embed(Tensor& embeddings, Tensor& indices, Tensor& out) {
@@ -1017,7 +1200,7 @@ namespace evk::ai {
         const uint32_t WORKGROUP_SIZE = 256u;
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
-        cmd.barrier();
+        cmd.computeBarrier();
     }
 
     void greedy_sample(Tensor& logits, Tensor& out_tokens,
@@ -1048,7 +1231,27 @@ namespace evk::ai {
             uint32_t(token_count),
         });
         cmd.dispatch(batch_size, 1, 1);
-        cmd.barrier();
+        cmd.computeBarrier();
+    }
+
+    void greedy_sample_rows(Tensor& logits, Tensor& out_tokens,
+                            uint16_t token_base, uint16_t token_count) {
+        assert(logits.shape.rank() >= 2u);
+        assert(out_tokens.shape.rank() == 1u);
+        uint32_t vocab_size = logits.shape[-1];
+        uint32_t row_count = logits.shape.count() / vocab_size;
+        assert(out_tokens.shape[0] == row_count);
+        assert(uint32_t(token_base) + uint32_t(token_count) <= vocab_size);
+
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(pipelines->greedy_sample);
+        cmd.push(evk::Constant{
+            logits.buffer.GetReference(), out_tokens.buffer.GetReference(),
+            row_count, 1u, vocab_size, 0u, uint32_t(token_base),
+            uint32_t(token_count),
+        });
+        cmd.dispatch(row_count, 1, 1);
+        cmd.computeBarrier();
     }
 
     void embed_backward(Tensor& grad_out, Tensor& indices, Tensor& grad_embeddings) {
@@ -1071,10 +1274,10 @@ namespace evk::ai {
 
         // Dispatch one workgroup per embedding dimension (sequential over indices to avoid races)
         cmd.dispatch(embed_dim, 1, 1);
-        cmd.barrier();
+        cmd.computeBarrier();
     }
 
-    void apply_causal_mask(Tensor& scores) {
+    void apply_causal_mask(Tensor& scores, uint32_t window) {
         assert(scores.shape.rank() >= 2);
         uint32_t N = scores.shape[-1];
         assert(scores.shape[-2] == N);
@@ -1088,6 +1291,7 @@ namespace evk::ai {
             scores.buffer.GetReference(),
             batch,
             N,
+            window,
         });
 
         const uint32_t WORKGROUP_SIZE = 256u;
@@ -1157,9 +1361,157 @@ namespace evk::ai {
         cmd.barrier();
     }
 
+    void gated_delta_projected_step(Tensor& projection, Tensor& positions,
+                                    Tensor& state, Tensor& output,
+                                    uint32_t head_count, float rope_base,
+                                    float decay_bias) {
+        assert(projection.shape.rank() == 3u && state.shape.rank() == 4u);
+        assert(head_count > 0u);
+        uint32_t batch_size = state.shape[0];
+        uint32_t head_dim = state.shape[2];
+        uint32_t model_dim = head_count * head_dim;
+        uint32_t projection_stride = 3u * model_dim + 2u * head_count;
+        assert(state.shape[1] == head_count && state.shape[3] == head_dim);
+        assert(head_dim >= 1u && head_dim <= 32u &&
+               (head_dim & (head_dim - 1u)) == 0u);
+        assert(projection.shape.count() % (batch_size * projection_stride) == 0u);
+        uint32_t row_count = projection.shape.count() / (batch_size * projection_stride);
+        assert(positions.shape.count() == batch_size * row_count);
+        assert(output.shape.count() == batch_size * row_count * model_dim);
+
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(pipelines->gated_delta_projected_step);
+        cmd.push(evk::Constant{
+            projection.buffer.GetReference(), positions.buffer.GetReference(),
+            state.buffer.GetReference(), output.buffer.GetReference(),
+            batch_size, row_count, model_dim, head_count, rope_base, decay_bias,
+        });
+        uint32_t heads_per_group = 32u / head_dim;
+        cmd.dispatch(batch_size,
+                     (head_count + heads_per_group - 1u) / heads_per_group,
+                     1u);
+        cmd.computeBarrier();
+    }
+
+    static uint32_t head_key_groups(uint32_t head_dim) {
+        return (std::min)(head_dim, 32u / head_dim);
+    }
+
+    static evk::Pipeline& head_pipeline(evk::Pipeline (&variants)[2][6],
+                                       const char* name, uint32_t head_dim, bool prepared) {
+        assert(head_dim > 0u && head_dim <= 32u && std::has_single_bit(head_dim));
+        auto& pipeline = variants[prepared][std::countr_zero(head_dim)];
+        if (!pipeline) {
+            pipeline = evk::CreatePipeline({
+                .name = name,
+                .CS = detail::load_embedded_shader(name),
+                .constants = evk::Constant{head_dim, uint32_t(prepared)},
+            });
+        }
+        return pipeline;
+    }
+
+    void gated_delta_projected(Tensor& projection, Tensor& output,
+                               Tensor& state_history, uint32_t model_dim,
+                               uint32_t head_count, float rope_base,
+                               float decay_bias, Tensor* prepared_projection) {
+        uint32_t batch_size = projection.shape[0];
+        uint32_t sequence_length = projection.shape[1];
+        assert(head_count > 0u && model_dim % head_count == 0u);
+        uint32_t head_dim = model_dim / head_count;
+        assert(head_dim >= 1u && head_dim <= 32u &&
+               (head_dim & (head_dim - 1u)) == 0u);
+        assert(projection.shape[2] == 3u * model_dim + 2u * head_count);
+        assert(output.shape.count() == batch_size * sequence_length * model_dim);
+        assert(state_history.shape.count() ==
+               batch_size * sequence_length * head_count * head_dim * head_dim);
+        auto& cmd = evk::ai::GetCmd();
+        if (prepared_projection) {
+            assert(head_dim >= 2u);
+            assert(prepared_projection->shape.count() == projection.shape.count());
+            assert(prepared_projection->buffer.GetReference() != projection.buffer.GetReference());
+            cmd.bind(pipelines->gated_delta_prepare);
+            cmd.push(evk::Constant{
+                projection.buffer.GetReference(), prepared_projection->buffer.GetReference(),
+                batch_size * sequence_length, sequence_length, model_dim,
+                head_count, rope_base, decay_bias,
+            });
+            cmd.dispatch((batch_size * sequence_length * (model_dim / 2u) + 127u) / 128u, 1u, 1u);
+            cmd.computeBarrier();
+        }
+        cmd.bind(head_pipeline(pipelines->gated_delta_projected,
+                               "gated_delta_projected", head_dim, prepared_projection != nullptr));
+        cmd.push(evk::Constant{
+            (prepared_projection ? prepared_projection->buffer : projection.buffer).GetReference(),
+            output.buffer.GetReference(),
+            state_history.buffer.GetReference(), batch_size, sequence_length,
+            model_dim, head_count, rope_base, decay_bias,
+        });
+        uint32_t value_lanes = (head_dim + 1u) / 2u;
+        uint32_t key_groups = (std::min)(head_dim, 32u / value_lanes);
+        uint32_t heads_per_group = 32u / (value_lanes * key_groups);
+        cmd.dispatch(batch_size,
+                     (head_count + heads_per_group - 1u) / heads_per_group, 1u);
+        cmd.computeBarrier();
+    }
+
+    void gated_delta_projected_backward(
+        Tensor& projection, Tensor& state_history, Tensor& grad_output,
+        Tensor& grad_projection, uint32_t model_dim, uint32_t head_count,
+        float rope_base, float decay_bias, uint32_t backward_chunk_size,
+        Tensor* grad_state_boundaries, Tensor* prepared_projection) {
+        uint32_t batch_size = projection.shape[0];
+        uint32_t sequence_length = projection.shape[1];
+        assert(sequence_length > 0u && head_count > 0u &&
+               model_dim % head_count == 0u);
+        uint32_t head_dim = model_dim / head_count;
+        assert(head_dim >= 1u && head_dim <= 32u &&
+               (head_dim & (head_dim - 1u)) == 0u);
+        auto& cmd = evk::ai::GetCmd();
+        uint32_t chunk_size = backward_chunk_size == 0u
+            ? sequence_length
+            : (std::min)(backward_chunk_size, sequence_length);
+        uint32_t chunk_count =
+            (sequence_length + chunk_size - 1u) / chunk_size;
+        uint32_t heads_per_group = 32u / (head_dim * head_key_groups(head_dim));
+        if (chunk_count > 1u) {
+            assert(grad_state_boundaries &&
+                   grad_state_boundaries->shape.count() ==
+                       batch_size * chunk_count * head_count * head_dim * head_dim);
+            cmd.bind(head_pipeline(pipelines->gated_delta_projected_bwd_boundaries,
+                                   "gated_delta_projected_bwd_boundaries", head_dim, prepared_projection != nullptr));
+            cmd.push(evk::Constant{
+                (prepared_projection ? prepared_projection->buffer : projection.buffer).GetReference(),
+                grad_output.buffer.GetReference(),
+                grad_state_boundaries->buffer.GetReference(), batch_size,
+                sequence_length, model_dim, head_count, rope_base, decay_bias,
+                chunk_size,
+            });
+            cmd.dispatch(batch_size,
+                         (head_count + heads_per_group - 1u) / heads_per_group,
+                         1u);
+            cmd.computeBarrier();
+        }
+        cmd.bind(head_pipeline(pipelines->gated_delta_projected_bwd,
+                               "gated_delta_projected_bwd", head_dim, prepared_projection != nullptr));
+        cmd.push(evk::Constant{
+            (prepared_projection ? prepared_projection->buffer : projection.buffer).GetReference(),
+            projection.buffer.GetReference(), state_history.buffer.GetReference(),
+            grad_output.buffer.GetReference(), grad_projection.buffer.GetReference(),
+            (grad_state_boundaries ? grad_state_boundaries->buffer
+                                   : grad_projection.buffer).GetReference(),
+            batch_size, sequence_length, model_dim, head_count,
+            rope_base, decay_bias, chunk_size,
+        });
+        uint32_t gradient_heads_per_group = 32u / head_dim;
+        cmd.dispatch(batch_size * chunk_count,
+                     (head_count + gradient_heads_per_group - 1u) / gradient_heads_per_group, 1u);
+        cmd.computeBarrier();
+    }
+
     void rope(Tensor& input, Tensor& out,
               uint32_t batch_size, uint32_t seq_len, uint32_t embed_dim,
-              float rotary_base) {
+              float rotary_base, float position_scale, float position_offset) {
         assert((embed_dim % 2u) == 0u);
         uint32_t totalPairs = batch_size * seq_len * (embed_dim / 2u);
 
@@ -1172,6 +1524,8 @@ namespace evk::ai {
             seq_len,
             embed_dim,
             rotary_base,
+            position_scale,
+            position_offset,
         });
 
         const uint32_t WORKGROUP_SIZE = 256u;
@@ -1182,7 +1536,7 @@ namespace evk::ai {
 
     void rope_backward(Tensor& grad_out, Tensor& grad_input,
                        uint32_t batch_size, uint32_t seq_len, uint32_t embed_dim,
-                       float rotary_base) {
+                       float rotary_base, float position_scale, float position_offset) {
         assert((embed_dim % 2u) == 0u);
         uint32_t totalPairs = batch_size * seq_len * (embed_dim / 2u);
 
@@ -1195,6 +1549,8 @@ namespace evk::ai {
             seq_len,
             embed_dim,
             rotary_base,
+            position_scale,
+            position_offset,
         });
 
         const uint32_t WORKGROUP_SIZE = 256u;
@@ -1222,7 +1578,7 @@ namespace evk::ai {
     }
 
     // Zero out a tensor on GPU
-    void zero(Tensor& tensor) {
+    void zero(Tensor& tensor, bool barrier) {
         uint32_t totalElements = tensor.shape.count();
 
         auto& cmd = evk::ai::GetCmd();
@@ -1235,7 +1591,9 @@ namespace evk::ai {
         const uint32_t WORKGROUP_SIZE = 256u;
         uint32_t groupsX = (totalElements + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.dispatch(groupsX, 1, 1);
-        cmd.barrier();
+        if (barrier) {
+            cmd.barrier();
+        }
     }
 
     // Sum across batch dimension: out[i] += sum_b(input[b, i])
@@ -1278,7 +1636,7 @@ namespace evk::ai {
 
         // One workgroup per row
         cmd.dispatch(outerCount, 1, 1);
-        cmd.barrier();
+        cmd.computeBarrier();
     }
 
     // RMS Normalization backward
@@ -1304,6 +1662,6 @@ namespace evk::ai {
 
         // One workgroup per row
         cmd.dispatch(outerCount, 1, 1);
-        cmd.barrier();
+        cmd.computeBarrier();
     }
 }

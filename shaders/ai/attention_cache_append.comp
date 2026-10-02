@@ -1,0 +1,22 @@
+#include "../common/evk.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+PUSH(BufferFp16 key; BufferFp16 value; BufferFp16 keyCache; BufferFp16 valueCache;
+     uint batch; uint capacity; uint width; uint position; float rotaryBase;)
+COMPUTE(256, 1, 1)
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= batch * width / 2u) return;
+    uint b = i / (width / 2u), pair = i % (width / 2u);
+    uint src = b * width + pair * 2u;
+    uint dst = (b * capacity + position % capacity) * width + pair * 2u;
+    float angle = float(position) * pow(rotaryBase, -2.0 * float(pair) / float(width));
+    float c = cos(angle), s = sin(angle);
+    float x = float(key.x[src]), y = float(key.x[src + 1u]);
+    keyCache.x[dst] = float16_t(x * c - y * s);
+    keyCache.x[dst + 1u] = float16_t(x * s + y * c);
+    valueCache.x[dst] = value.x[src];
+    valueCache.x[dst + 1u] = value.x[src + 1u];
+}

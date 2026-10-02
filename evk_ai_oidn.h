@@ -1,8 +1,7 @@
 #pragma once
 
-#include "evk_ai.h"
+#include "evk_ai_ir.h"
 
-#include <memory>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -20,34 +19,15 @@ struct CpuTimings {
 class Model {
 public:
     explicit Model(const std::string& weights_path);
-    ~Model();
 
-    bool loaded() const { return !parameters_.empty(); }
     uint32_t input_channels() const { return input_channels_; }
 
-    Tensor& build(Graph& graph, Tensor& input) const;
-    void convert_from_rgba(evk::Image& color, Tensor& output, uint32_t width,
-                           uint32_t height, uint32_t padded_width,
-                           uint32_t padded_height) const;
-    void convert_from_rgba(evk::Image& color, evk::Image& albedo,
-                           evk::Image& normal, Tensor& output, uint32_t width,
-                           uint32_t height, uint32_t padded_width,
-                           uint32_t padded_height) const;
-    void convert_to_rgb(Tensor& input, evk::Buffer& output, uint32_t width,
-                        uint32_t height, uint32_t padded_width) const;
-    void convert_to_rgba(Tensor& input, evk::Image& output, uint32_t width,
-                         uint32_t height, uint32_t padded_width) const;
+    evk::ai::Graph build_ir(uint32_t width, uint32_t height) const;
+    const evk::ai::DataStore& data() const { return data_; }
 
 private:
-    struct Kernels;
-
-    void load(const std::string& weights_path);
-    Tensor& parameter(const std::string& name) const;
-    Tensor& packed_parameter(const std::string& name) const;
-
-    std::unordered_map<std::string, std::unique_ptr<Tensor>> parameters_;
-    std::unordered_map<std::string, std::unique_ptr<Tensor>> packed_parameters_;
-    std::unique_ptr<Kernels> kernels_;
+    std::unordered_map<std::string, evk::ai::DataId> data_ids_;
+    evk::ai::DataStore data_;
     uint32_t input_channels_ = 0;
 };
 
@@ -59,7 +39,7 @@ public:
 
     uint32_t width() const { return width_; }
     uint32_t height() const { return height_; }
-    bool uses_auxiliary_inputs() const { return model_.input_channels() == 9u; }
+    bool uses_auxiliary_inputs() const { return input_channels_ == 9u; }
 
     void denoise(std::span<const float> color_rgb, std::span<float> output_rgb,
                  bool profile = false);
@@ -82,6 +62,7 @@ public:
 
     const std::vector<evk::TimestampEntry>& timings() const { return timings_; }
     const CpuTimings& cpu_timings() const { return cpu_timings_; }
+    const evk::ai::Plan& plan() const { return executable_.plan(); }
 
 private:
     void denoise_cpu(std::span<const float> color_rgb,
@@ -93,10 +74,8 @@ private:
     uint32_t height_ = 0;
     uint32_t padded_width_ = 0;
     uint32_t padded_height_ = 0;
-    Model model_;
-    Graph graph_;
-    Tensor* input_ = nullptr;
-    Tensor* output_ = nullptr;
+    uint32_t input_channels_ = 0;
+    evk::ai::Executable executable_;
     evk::Buffer output_gpu_;
     evk::Buffer output_cpu_;
     std::vector<evk::TimestampEntry> timings_;

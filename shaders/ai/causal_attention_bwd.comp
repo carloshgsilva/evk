@@ -1,0 +1,71 @@
+#include "../common/evk.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+CONSTANT(0) uint N = 16u;
+CONSTANT(1) uint D = 16u;
+CONSTANT(2) uint tileWidth = 64u;
+CONSTANT(3) uint window = 0u;
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+PUSH(
+    BufferFp16 q;
+    BufferFp16 k;
+    BufferFp16 probabilities;
+    BufferFp16 gradOutput;
+    BufferFp16 gradScores;
+    BufferFp16 gradQ;
+    BufferFp16 gradK;
+    BufferFp16 gradV;
+)
+
+COMPUTE(32, 1, 1)
+void main() {
+    uint row = gl_WorkGroupID.y * 16u;
+    uint feature = gl_WorkGroupID.x * tileWidth;
+    // Three disjoint grids: dQ = dS K, dK = dS^T Q, dV = P^T dO.
+    uint mode = gl_WorkGroupID.z % 3u;
+    uint batch = gl_WorkGroupID.z / 3u;
+    uint vectorBase = batch * N * D;
+    uint scoreBase = batch * N * N;
+    BufferFp16 lhs = mode == 2u ? probabilities : gradScores;
+    BufferFp16 rhs = mode == 0u ? k : (mode == 1u ? q : gradOutput);
+    BufferFp16 outputBuffer = mode == 0u ? gradQ : (mode == 1u ? gradK : gradV);
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> result[tileWidth / 16u];
+    [[unroll]] for (uint f = 0u; f < tileWidth / 16u; ++f)
+        result[f] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    uint begin = mode == 0u ? 0u : row;
+    uint end = mode == 0u ? row + 16u : N;
+    if (window != 0u) {
+        if (mode == 0u)
+            begin = row < window ? 0u : ((row - window + 1u) / 16u) * 16u;
+        else
+            end = min(N, ((row + 15u + window + 15u) / 16u) * 16u);
+    }
+    for (uint col = begin; col < end; col += 16u) {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> weights;
+        if (mode == 0u)
+            coopMatLoad(weights, lhs.x, scoreBase + row * N + col, N,
+                        gl_CooperativeMatrixLayoutRowMajor);
+        else
+            coopMatLoad(weights, lhs.x, scoreBase + col * N + row, N,
+                        gl_CooperativeMatrixLayoutColumnMajor);
+        [[unroll]] for (uint f = 0u; f < tileWidth / 16u; ++f) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> values;
+            coopMatLoad(values, rhs.x, vectorBase + col * D + feature + f * 16u, D,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            result[f] = coopMatMulAdd(weights, values, result[f]);
+        }
+    }
+    [[unroll]] for (uint f = 0u; f < tileWidth / 16u; ++f) {
+        uint index = vectorBase + row * D + feature + f * 16u;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> previous;
+        coopMatLoad(previous, outputBuffer.x, index, D, gl_CooperativeMatrixLayoutRowMajor);
+        result[f] += previous;
+        coopMatStore(result[f], outputBuffer.x, index, D, gl_CooperativeMatrixLayoutRowMajor);
+    }
+}

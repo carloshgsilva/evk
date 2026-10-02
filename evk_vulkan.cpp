@@ -2137,6 +2137,24 @@ namespace evk {
         };
         vkCmdPipelineBarrier2(cb->cmd, &dependency);
     }
+
+    void Cmd::computeBarrier() {
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        VkMemoryBarrier2 barrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT |
+                             VK_ACCESS_2_SHADER_WRITE_BIT,
+        };
+        VkDependencyInfo dependency = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &barrier,
+        };
+        vkCmdPipelineBarrier2(cb->cmd, &dependency);
+    }
     
     void Cmd::fill(Buffer dst, uint32_t data, uint64_t size, uint64_t offset) {
         CommandBufferData* cb = (CommandBufferData*)_internal;

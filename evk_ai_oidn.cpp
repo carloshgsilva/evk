@@ -7,15 +7,10 @@
 #include <fstream>
 #include <limits>
 #include <stdexcept>
-#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace evk::ai::oidn {
-namespace detail {
-std::vector<uint8_t> load_embedded_shader(std::string_view name);
-}
-
 namespace {
 
 struct ArchiveTensor {
@@ -24,15 +19,6 @@ struct ArchiveTensor {
     char data_type = 0;
     uint64_t offset = 0;
 };
-
-struct ImageInputs {
-    evk::RID color;
-    evk::RID albedo;
-    evk::RID normal;
-    evk::RID unused = 0;
-};
-
-static_assert(sizeof(ImageInputs) == 16u);
 
 uint32_t round_up_image_dimension(uint32_t value) {
     if (value == 0 || value > std::numeric_limits<uint32_t>::max() - 15u) {
@@ -45,46 +31,37 @@ bool has_storage(evk::ImageUsage usage) {
     return (uint32_t(usage) & uint32_t(evk::ImageUsage::Storage)) != 0u;
 }
 
-bool is_supported_image_format(evk::Format format) {
-    return format == evk::Format::RGBA8Unorm ||
-           format == evk::Format::RGBA16Sfloat;
-}
-
-bool is_supported_normal_format(evk::Format format) {
-    return format == evk::Format::RGBA8Snorm ||
-           format == evk::Format::RGBA16Snorm ||
-           format == evk::Format::RGBA16Sfloat ||
-           format == evk::Format::RGBA32Sfloat;
-}
-
-void validate_rgba_image(evk::Image& image, uint32_t width, uint32_t height,
-                         const char* role) {
+const evk::ImageDesc& validate_image(evk::Image& image, uint32_t width,
+                                     uint32_t height, const char* role) {
     const evk::ImageDesc& desc = evk::GetDesc(image);
-    if (!has_storage(desc.usage)) {
-        throw std::runtime_error(std::string("OIDN ") + role +
-                                 " image requires Storage usage");
-    }
     if (desc.extent.width != width || desc.extent.height != height ||
         desc.extent.depth != 1u) {
         throw std::runtime_error(std::string("OIDN ") + role +
                                  " image dimensions do not match the denoiser");
     }
-    if (!is_supported_image_format(desc.format)) {
+    if (!has_storage(desc.usage)) {
+        throw std::runtime_error(std::string("OIDN ") + role +
+                                 " image requires Storage usage");
+    }
+    return desc;
+}
+
+void validate_rgba_image(evk::Image& image, uint32_t width, uint32_t height,
+                         const char* role) {
+    evk::Format format = validate_image(image, width, height, role).format;
+    if (format != evk::Format::RGBA8Unorm &&
+        format != evk::Format::RGBA16Sfloat) {
         throw std::runtime_error(std::string("OIDN ") + role +
             " image must use RGBA8Unorm or RGBA16Sfloat");
     }
 }
 
 void validate_normal_image(evk::Image& image, uint32_t width, uint32_t height) {
-    const evk::ImageDesc& desc = evk::GetDesc(image);
-    if (desc.extent.width != width || desc.extent.height != height ||
-        desc.extent.depth != 1u) {
-        throw std::runtime_error("OIDN normal image dimensions do not match the denoiser");
-    }
-    if (!has_storage(desc.usage)) {
-        throw std::runtime_error("OIDN normal image requires Storage usage");
-    }
-    if (!is_supported_normal_format(desc.format)) {
+    evk::Format format = validate_image(image, width, height, "normal").format;
+    if (format != evk::Format::RGBA8Snorm &&
+        format != evk::Format::RGBA16Snorm &&
+        format != evk::Format::RGBA16Sfloat &&
+        format != evk::Format::RGBA32Sfloat) {
         throw std::runtime_error(
             "OIDN normal image must use RGBA8Snorm, RGBA16Snorm, "
             "RGBA16Sfloat, or RGBA32Sfloat");
@@ -189,1001 +166,144 @@ std::vector<ArchiveTensor> parse_table(const std::vector<uint8_t>& bytes) {
     return tensors;
 }
 
-std::unique_ptr<Tensor> pack_bias(const std::string& name, Tensor& source) {
-    uint32_t channels = source.shape[0];
-    uint32_t packed_channels = name == "dec_conv0.bias"
-        ? 8u : (channels + 15u) & ~15u;
-    auto packed = std::make_unique<Tensor>(Shape({16u, packed_channels}));
-    float16_t* destination = packed->cpu();
-    float16_t* source_data = source.cpu();
-    std::fill(destination, destination + packed->shape.count(), float16_t(0.0f));
-    for (uint32_t row = 0; row < 16u; ++row) {
-        std::copy(source_data, source_data + channels,
-                  destination + row * packed_channels);
-    }
-    packed->cpu_upload(false);
-    return packed;
-}
-
-uint32_t collapsed_tap(uint32_t phase, uint32_t kernel_index) {
-    if (phase == 0u) return kernel_index == 0u ? 0u : 1u;
-    return kernel_index == 2u ? 1u : 0u;
-}
-
-uint32_t decoder_skip_channels(const std::string& name, uint32_t input_channels) {
-    if (name == "dec_conv1a.weight") {
-        if (input_channels == 35u || input_channels == 41u) {
-            return input_channels - 32u;
-        }
-        if (input_channels == 67u || input_channels == 73u) {
-            return input_channels - 64u;
-        }
-        return 0u;
-    }
-    if (name == "dec_conv2a.weight") return 32u;
-    if (name == "dec_conv3a.weight") return input_channels == 96u ? 32u : 48u;
-    if (name == "dec_conv4a.weight") return input_channels == 64u ? 32u : 64u;
-    return 0u;
-}
-
-std::unique_ptr<Tensor> pack_weight(const std::string& name, Tensor& source) {
-    uint32_t output_channels = source.shape[0];
-    uint32_t input_channels = source.shape[1];
-    uint32_t kernel_height = source.shape[2];
-    uint32_t kernel_width = source.shape[3];
-    uint32_t kernel_elements = kernel_height * kernel_width;
-
-    bool compact_rgb_input = name == "enc_conv0.weight" && input_channels == 3u;
-    bool compact_rgb_output = name == "dec_conv0.weight";
-    uint32_t skip_channels = decoder_skip_channels(name, input_channels);
-    bool compact_rgb_skip = name == "dec_conv1a.weight" && skip_channels == 3u;
-    bool collapse_phase = skip_channels != 0u;
-
-    uint32_t low_channels = 0u;
-    if (collapse_phase) {
-        if (input_channels <= skip_channels) {
-            throw std::runtime_error("unsupported collapsed phase channel count");
-        }
-        low_channels = input_channels - skip_channels;
-        if ((low_channels % 16u) != 0u) {
-            throw std::runtime_error("unsupported collapsed phase channel count");
-        }
-    }
-
-    uint32_t packed_output_channels = compact_rgb_output
-        ? 8u : (output_channels + 15u) & ~15u;
-    uint32_t padded_k = ((input_channels + 15u) / 16u) * kernel_elements * 16u;
-    uint32_t packed_k = padded_k;
-    if (compact_rgb_input) {
-        packed_k = kernel_elements * 8u;
-    } else if (compact_rgb_skip) {
-        packed_k = low_channels / 16u * kernel_elements * 16u +
-                   kernel_elements * 8u;
-    }
-    uint32_t phase_k = low_channels / 16u * 4u * 16u;
-    auto packed = std::make_unique<Tensor>(
-        Shape({packed_k + 4u * phase_k, packed_output_channels}));
-    float16_t* destination = packed->cpu();
-    float16_t* source_data = source.cpu();
-    std::fill(destination, destination + packed->shape.count(), float16_t(0.0f));
-
-    for (uint32_t output_channel = 0; output_channel < output_channels;
-         ++output_channel) {
-        for (uint32_t input_channel = 0; input_channel < input_channels;
-             ++input_channel) {
-            for (uint32_t kernel_y = 0; kernel_y < kernel_height; ++kernel_y) {
-                for (uint32_t kernel_x = 0; kernel_x < kernel_width; ++kernel_x) {
-                    uint32_t kernel_offset = kernel_y * kernel_width + kernel_x;
-                    uint32_t k;
-                    if (compact_rgb_input) {
-                        k = kernel_offset * 8u + input_channel;
-                    } else if (compact_rgb_skip && input_channel >= low_channels) {
-                        k = low_channels / 16u * kernel_elements * 16u +
-                            kernel_offset * 8u + input_channel - low_channels;
-                    } else {
-                        k = ((input_channel / 16u) * kernel_elements + kernel_offset) *
-                                16u +
-                            input_channel % 16u;
-                    }
-                    uint32_t source_index =
-                        ((output_channel * input_channels + input_channel) *
-                             kernel_height +
-                         kernel_y) * kernel_width + kernel_x;
-                    destination[k * packed_output_channels + output_channel] =
-                        source_data[source_index];
-                }
-            }
-        }
-    }
-
-    if (collapse_phase) {
-        for (uint32_t phase_y = 0u; phase_y < 2u; ++phase_y) {
-            for (uint32_t phase_x = 0u; phase_x < 2u; ++phase_x) {
-                uint32_t phase = phase_y * 2u + phase_x;
-                for (uint32_t output_channel = 0u;
-                     output_channel < output_channels; ++output_channel) {
-                    for (uint32_t input_channel = 0u;
-                         input_channel < low_channels; ++input_channel) {
-                        for (uint32_t tap_y = 0u; tap_y < 2u; ++tap_y) {
-                            for (uint32_t tap_x = 0u; tap_x < 2u; ++tap_x) {
-                                float sum = 0.0f;
-                                for (uint32_t kernel_y = 0u; kernel_y < 3u;
-                                     ++kernel_y) {
-                                    if (collapsed_tap(phase_y, kernel_y) != tap_y) {
-                                        continue;
-                                    }
-                                    for (uint32_t kernel_x = 0u; kernel_x < 3u;
-                                         ++kernel_x) {
-                                        if (collapsed_tap(phase_x, kernel_x) != tap_x) {
-                                            continue;
-                                        }
-                                        uint32_t source_index =
-                                            ((output_channel * input_channels +
-                                              input_channel) * kernel_height +
-                                             kernel_y) * kernel_width + kernel_x;
-                                        sum += float(source_data[source_index]);
-                                        // Fast decoder weights must match the
-                                        // runtime FP16 fragment-add order.
-                                        if (!compact_rgb_skip) {
-                                            sum = float(float16_t(sum));
-                                        }
-                                    }
-                                }
-                                uint32_t tap = tap_y * 2u + tap_x;
-                                uint32_t k =
-                                    (input_channel / 16u * 4u + tap) * 16u +
-                                    input_channel % 16u;
-                                destination[(packed_k + phase * phase_k + k) *
-                                                packed_output_channels +
-                                            output_channel] = float16_t(sum);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    packed->cpu_upload(false);
-    return packed;
-}
-
 } // namespace
 
-struct Model::Kernels {
-    evk::Pipeline conv;
-    evk::Pipeline narrow_conv;
-    evk::Pipeline tail_conv;
-    evk::Pipeline narrow_tail_conv;
-    evk::Pipeline phase_concat_conv;
-    evk::Pipeline narrow_phase_concat_conv;
-    evk::Pipeline prepacked_phase_concat_conv;
-    evk::Pipeline phase_tail_concat_conv;
-    evk::Pipeline narrow_phase_tail_concat_conv;
-    evk::Pipeline prepacked_phase_tail_concat_conv;
-    evk::Pipeline conv_final;
-    evk::Pipeline conv_final_rows;
-    evk::Pipeline max_pool;
-    evk::Pipeline conv_pool;
-    evk::Pipeline balanced_conv_pool_32_48;
-    evk::Pipeline balanced_conv_pool_48_64;
-    evk::Pipeline balanced_conv_pool_64_80;
-    evk::Pipeline conv_32_rows;
-    evk::Pipeline conv_64_32_rows;
-    evk::Pipeline conv_64_64_rows;
-    evk::Pipeline from_rgba_image;
-    evk::Pipeline to_rgb;
-    evk::Pipeline to_rgba_image;
-    evk::Pipeline fast_conv_3_32;
-    evk::Pipeline fast_conv_32_32;
-    evk::Pipeline fast_conv_64_64;
-    evk::Pipeline fast_conv_64_32;
-    evk::Pipeline balanced_conv_32_48;
-    evk::Pipeline balanced_conv_48_64;
-    evk::Pipeline balanced_conv_64_80;
-    evk::Pipeline balanced_conv_80_96;
-    evk::Pipeline balanced_conv_96_96;
-    evk::Pipeline balanced_conv_112_112;
-    evk::Pipeline balanced_conv_96_96_rows96;
-    evk::Pipeline balanced_conv_112_112_rows80;
-    evk::Pipeline fast_phase_32_32_64;
-    evk::Pipeline fast_phase_64_32_64;
-    evk::Pipeline fast_phase_32_3_32;
-    evk::Pipeline fast_phase_32_32_64_tail;
-    evk::Pipeline fast_phase_64_32_64_tail;
-    evk::Pipeline fast_phase_32_3_32_tail;
-    evk::Pipeline balanced_phase_96_64_112;
-    evk::Pipeline balanced_phase_112_48_96_rows80;
-    evk::Pipeline balanced_phase_96_32_64_rows96;
-    evk::Pipeline balanced_phase_64_3_64_rows96;
-    evk::Pipeline balanced_phase_112_48_96_rows80_tail;
-    evk::Pipeline balanced_phase_96_32_64_rows96_tail;
-    evk::Pipeline balanced_phase_64_3_64_rows96_tail;
-
-    Kernels() {
-        if (!evk::GetFeatures().coopmat) {
-            throw std::runtime_error("OIDN GPU inference requires cooperative matrix support");
-        }
-        conv = create("oidn_conv");
-        narrow_conv = evk::CreatePipeline({
-            .name = "oidn_narrow_conv",
-            .CS = detail::load_embedded_shader("oidn_conv_narrow"),
-        });
-        tail_conv = create_tail("oidn_tail_conv", "oidn_conv");
-        narrow_tail_conv = create_tail("oidn_narrow_tail_conv", "oidn_conv_narrow");
-        phase_concat_conv = create("oidn_concat_phase");
-        narrow_phase_concat_conv = create("oidn_concat_phase_narrow");
-        prepacked_phase_concat_conv = create("oidn_concat_phase_prepacked");
-        phase_tail_concat_conv = create_phase_tail(
-            "oidn_phase_tail_concat_conv", "oidn_concat_phase");
-        narrow_phase_tail_concat_conv = create_phase_tail(
-            "oidn_narrow_phase_tail_concat_conv", "oidn_concat_phase_narrow");
-        prepacked_phase_tail_concat_conv = create_phase_tail(
-            "oidn_prepacked_phase_tail_concat_conv", "oidn_concat_phase_prepacked");
-        conv_final = create("oidn_conv_output_8");
-        conv_final_rows = create("oidn_conv_output_8_rows");
-        max_pool = create("oidn_max_pool");
-        conv_pool = create("oidn_conv_pool");
-        balanced_conv_pool_32_48 = create_conv_pool(
-            "oidn_balanced_conv_pool_32_48", 32u, 48u);
-        balanced_conv_pool_48_64 = create_conv_pool(
-            "oidn_balanced_conv_pool_48_64", 48u, 64u);
-        balanced_conv_pool_64_80 = create_conv_pool(
-            "oidn_balanced_conv_pool_64_80", 64u, 80u);
-        conv_32_rows = create("oidn_conv_32_rows");
-        conv_64_32_rows = create_decoder_rows("oidn_conv_64_32_rows", 32u);
-        conv_64_64_rows = create_decoder_rows("oidn_conv_64_64_rows", 64u);
-        from_rgba_image = create("oidn_from_rgba_image");
-        to_rgb = create("oidn_to_rgb");
-        to_rgba_image = create("oidn_to_rgba_image");
-        fast_conv_3_32 = create_regular(
-            "oidn_fast_conv_3_32", 3u, 32u, "oidn_conv_input_8");
-        fast_conv_32_32 = create_regular("oidn_fast_conv_32_32", 32u, 32u);
-        fast_conv_64_64 = create_regular("oidn_fast_conv_64_64", 64u, 64u);
-        fast_conv_64_32 = create_regular("oidn_fast_conv_64_32", 64u, 32u);
-        balanced_conv_32_48 = create_regular("oidn_balanced_conv_32_48", 32u, 48u);
-        balanced_conv_48_64 = create_regular("oidn_balanced_conv_48_64", 48u, 64u);
-        balanced_conv_64_80 = create_regular("oidn_balanced_conv_64_80", 64u, 80u);
-        balanced_conv_80_96 = create_regular("oidn_balanced_conv_80_96", 80u, 96u);
-        balanced_conv_96_96 = create_regular("oidn_balanced_conv_96_96", 96u, 96u);
-        balanced_conv_112_112 = create_regular(
-            "oidn_balanced_conv_112_112", 112u, 112u);
-        balanced_conv_96_96_rows96 = create_regular(
-            "oidn_balanced_conv_96_96_rows96", 96u, 96u,
-            "oidn_conv_wide_rows96");
-        balanced_conv_112_112_rows80 = create_regular(
-            "oidn_balanced_conv_112_112_rows80", 112u, 112u,
-            "oidn_conv_wide_rows80");
-        fast_phase_32_32_64 = create_phase(
-            "oidn_fast_phase_32_32_64", "oidn_concat_phase_collapsed", 32u, 64u, 64u);
-        fast_phase_64_32_64 = create_phase(
-            "oidn_fast_phase_64_32_64", "oidn_concat_phase_collapsed", 64u, 96u, 64u);
-        fast_phase_32_3_32 = create_phase(
-            "oidn_fast_phase_32_3_32", "oidn_concat_phase_prepacked", 32u, 35u, 32u);
-        fast_phase_32_32_64_tail = create_phase(
-            "oidn_fast_phase_32_32_64_tail", "oidn_concat_phase_collapsed",
-            32u, 64u, 64u, true);
-        fast_phase_64_32_64_tail = create_phase(
-            "oidn_fast_phase_64_32_64_tail", "oidn_concat_phase_collapsed",
-            64u, 96u, 64u, true);
-        fast_phase_32_3_32_tail = create_phase(
-            "oidn_fast_phase_32_3_32_tail", "oidn_concat_phase_prepacked",
-            32u, 35u, 32u, true);
-        balanced_phase_96_64_112 = create_phase(
-            "oidn_balanced_phase_96_64_112", "oidn_concat_phase_collapsed_wide",
-            96u, 160u, 112u, true);
-        balanced_phase_112_48_96_rows80 = create_phase(
-            "oidn_balanced_phase_112_48_96_rows80",
-            "oidn_concat_phase_wide_rows80", 112u, 160u, 96u);
-        balanced_phase_96_32_64_rows96 = create_phase(
-            "oidn_balanced_phase_96_32_64_rows96", "oidn_concat_phase_rows96",
-            96u, 128u, 64u);
-        balanced_phase_64_3_64_rows96 = create_phase(
-            "oidn_balanced_phase_64_3_64_rows96",
-            "oidn_concat_phase_prepacked_rows96", 64u, 67u, 64u);
-        balanced_phase_112_48_96_rows80_tail = create_phase(
-            "oidn_balanced_phase_112_48_96_rows80_tail",
-            "oidn_concat_phase_wide_rows80", 112u, 160u, 96u, true);
-        balanced_phase_96_32_64_rows96_tail = create_phase(
-            "oidn_balanced_phase_96_32_64_rows96_tail",
-            "oidn_concat_phase_rows96", 96u, 128u, 64u, true);
-        balanced_phase_64_3_64_rows96_tail = create_phase(
-            "oidn_balanced_phase_64_3_64_rows96_tail",
-            "oidn_concat_phase_prepacked_rows96", 64u, 67u, 64u, true);
-    }
-
-    static evk::Pipeline create(const char* name) {
-        return evk::CreatePipeline({
-            .name = name,
-            .CS = detail::load_embedded_shader(name),
-        });
-    }
-
-    static evk::Pipeline create_tail(const char* name, const char* shader) {
-        return evk::CreatePipeline({
-            .name = name,
-            .CS = detail::load_embedded_shader(shader),
-            .constants = evk::Constant{0u, 0u, 0u, 0u, 1u},
-        });
-    }
-
-    static evk::Pipeline create_phase_tail(const char* name, const char* shader) {
-        return evk::CreatePipeline({
-            .name = name,
-            .CS = detail::load_embedded_shader(shader),
-            .constants = evk::Constant{0u, 0u, 0u, 1u},
-        });
-    }
-
-    static evk::Pipeline create_regular(const char* name, uint32_t input_channels,
-                                        uint32_t output_channels,
-                                        const char* shader = nullptr) {
-        if (!shader) {
-            shader = output_channels <= 64u ? "oidn_conv_narrow" : "oidn_conv";
-        }
-        return evk::CreatePipeline({
-            .name = name,
-            .CS = detail::load_embedded_shader(shader),
-            .constants = evk::Constant{
-                0u, input_channels, output_channels,
-                (input_channels + 15u) / 16u},
-        });
-    }
-
-    static evk::Pipeline create_decoder_rows(const char* name,
-                                             uint32_t output_channels) {
-        return evk::CreatePipeline({
-            .name = name,
-            .CS = detail::load_embedded_shader("oidn_conv_decoder_rows128"),
-            .constants = evk::Constant{64u, output_channels, 4u},
-        });
-    }
-
-    static evk::Pipeline create_conv_pool(const char* name,
-                                          uint32_t input_channels,
-                                          uint32_t output_channels) {
-        uint32_t channels_per_workgroup = output_channels == 48u ? 48u : 64u;
-        return evk::CreatePipeline({
-            .name = name,
-            .CS = detail::load_embedded_shader("oidn_conv_pool_balanced"),
-            .constants = evk::Constant{
-                input_channels, output_channels, input_channels / 16u,
-                channels_per_workgroup, channels_per_workgroup * 4u},
-        });
-    }
-
-    static evk::Pipeline create_phase(const char* name, const char* shader,
-                                      uint32_t low_channels, uint32_t input_channels,
-                                      uint32_t output_channels, bool tail = false) {
-        return evk::CreatePipeline({
-            .name = name,
-            .CS = detail::load_embedded_shader(shader),
-            .constants = evk::Constant{
-                low_channels / 16u,
-                (input_channels + 15u) / 16u,
-                output_channels,
-                uint32_t(tail)},
-        });
-    }
-
-    void convolution_rows(const evk::Pipeline& pipeline, evk::Buffer& input,
-                          Tensor& weight, Tensor& bias, Tensor& output,
-                          uint32_t width, uint32_t height) const {
-        auto& cmd = evk::ai::GetCmd();
-        cmd.bind(pipeline);
-        cmd.push(evk::Constant{
-            input.GetReference(),
-            weight.buffer.GetReference(),
-            bias.buffer.GetReference(),
-            output.buffer.GetReference(),
-            width,
-            height,
-        });
-        cmd.dispatch((width + 63u) / 64u, height / 4u, 1u);
-        cmd.barrier();
-    }
-
-    void decoder_convolution_rows(const evk::Pipeline& pipeline, evk::Buffer& input,
-                                  Tensor& weight, Tensor& bias, Tensor& output,
-                                  uint32_t width, uint32_t height,
-                                  uint32_t output_rows) const {
-        auto& cmd = evk::ai::GetCmd();
-        cmd.bind(pipeline);
-        cmd.push(evk::Constant{
-            input.GetReference(),
-            weight.buffer.GetReference(),
-            bias.buffer.GetReference(),
-            output.buffer.GetReference(),
-            width,
-            height,
-        });
-        cmd.dispatch((width + 127u) / 128u, height / output_rows, 1u);
-        cmd.barrier();
-    }
-
-    void convolution(Tensor& input, Tensor& weight, Tensor& bias, Tensor& output,
-                     bool activation) const {
-        uint32_t height = input.shape[1];
-        uint32_t width = input.shape[2];
-        uint32_t input_channels = input.shape[3];
-        uint32_t output_channels = output.shape[3];
-        uint32_t padded_k = weight.shape[0];
-        auto& cmd = evk::ai::GetCmd();
-
-        if (!activation) {
-            if (input_channels == 32u && output_channels == 8u &&
-                (height % 4u) == 0u) {
-                convolution_rows(conv_final_rows, input.buffer, weight, bias,
-                                 output, width, height);
-                return;
-            }
-            cmd.bind(conv_final);
-            cmd.push(evk::Constant{
-                input.buffer.GetReference(),
-                input.buffer.GetReference(),
-                weight.buffer.GetReference(),
-                bias.buffer.GetReference(),
-                output.buffer.GetReference(),
-                width,
-                height,
-                input_channels,
-                output_channels,
-                padded_k,
-                width,
-                input_channels,
-                0u,
-            });
-            cmd.dispatch((width + 63u) / 64u, 1u, height);
-            cmd.barrier();
-            return;
-        }
-
-        cooperative_convolution(input.buffer, weight, bias, output,
-                                width, height, input_channels);
-    }
-
-    void concat_convolution(Tensor& low_resolution, Tensor& skip, Tensor& weight,
-                            Tensor& bias, Tensor& output) const {
-        uint32_t output_channels = output.shape[3];
-        bool rows96 = output_channels == 64u &&
-            ((low_resolution.shape[3] == 96u && skip.shape[3] == 32u) ||
-             (low_resolution.shape[3] == 64u && skip.shape[3] == 3u));
-        bool rows80 = low_resolution.shape[3] == 112u &&
-                      skip.shape[3] == 48u && output_channels == 96u;
-        uint32_t rows = rows96 ? 96u : (rows80 ? 80u : 64u);
-        // Each matrix row writes 16 pixels with a stride of two.
-        bool phase_tail = (skip.shape[2] % 32u) != 0u;
-        auto choose = [phase_tail](const evk::Pipeline& regular,
-                                   const evk::Pipeline& tail)
-            -> const evk::Pipeline& {
-            return phase_tail ? tail : regular;
-        };
-
-        const evk::Pipeline* pipeline;
-        if (low_resolution.shape[3] == 32u && skip.shape[3] == 3u) {
-            pipeline = &choose(fast_phase_32_3_32, fast_phase_32_3_32_tail);
-        } else if (low_resolution.shape[3] == 32u && skip.shape[3] == 32u &&
-                   output_channels == 64u) {
-            pipeline = &choose(fast_phase_32_32_64, fast_phase_32_32_64_tail);
-        } else if (low_resolution.shape[3] == 64u && skip.shape[3] == 32u &&
-                   output_channels == 64u) {
-            pipeline = &choose(fast_phase_64_32_64, fast_phase_64_32_64_tail);
-        } else if (low_resolution.shape[3] == 96u && skip.shape[3] == 64u &&
-                   output_channels == 112u) {
-            pipeline = &balanced_phase_96_64_112;
-        } else if (low_resolution.shape[3] == 112u && skip.shape[3] == 48u &&
-                   output_channels == 96u) {
-            pipeline = &choose(balanced_phase_112_48_96_rows80,
-                               balanced_phase_112_48_96_rows80_tail);
-        } else if (low_resolution.shape[3] == 96u && skip.shape[3] == 32u &&
-                   output_channels == 64u) {
-            pipeline = &choose(balanced_phase_96_32_64_rows96,
-                               balanced_phase_96_32_64_rows96_tail);
-        } else if (low_resolution.shape[3] == 64u && skip.shape[3] == 3u &&
-                   output_channels == 64u) {
-            pipeline = &choose(balanced_phase_64_3_64_rows96,
-                               balanced_phase_64_3_64_rows96_tail);
-        } else if (skip.shape[3] == 3u) {
-            pipeline = &choose(prepacked_phase_concat_conv,
-                               prepacked_phase_tail_concat_conv);
-        } else if (output_channels <= 64u) {
-            pipeline = &choose(narrow_phase_concat_conv,
-                               narrow_phase_tail_concat_conv);
-        } else {
-            pipeline = &choose(phase_concat_conv, phase_tail_concat_conv);
-        }
-
-        auto& cmd = evk::ai::GetCmd();
-        cmd.bind(*pipeline);
-        cmd.push(evk::Constant{
-            low_resolution.buffer.GetReference(),
-            skip.buffer.GetReference(),
-            weight.buffer.GetReference(),
-            bias.buffer.GetReference(),
-            output.buffer.GetReference(),
-            skip.shape[2],
-            skip.shape[1],
-            low_resolution.shape[3] + skip.shape[3],
-            output_channels,
-            ((low_resolution.shape[3] + skip.shape[3] + 15u) / 16u) * 9u * 16u,
-            low_resolution.shape[2],
-            low_resolution.shape[3],
-            skip.shape[3],
-        });
-        uint32_t phase_pixels = (skip.shape[2] + 1u) / 2u;
-        cmd.dispatch((phase_pixels + rows - 1u) / rows, skip.shape[1], 2u);
-        cmd.barrier();
-    }
-
-    void cooperative_convolution(evk::Buffer& input, Tensor& weight,
-                                 Tensor& bias, Tensor& output,
-                                 uint32_t width, uint32_t height,
-                                 uint32_t input_channels) const {
-        uint32_t output_channels = output.shape[3];
-        uint32_t padded_k = ((input_channels + 15u) / 16u) * 9u * 16u;
-        bool tail = (width % 16u) != 0u;
-        auto& cmd = evk::ai::GetCmd();
-        if (!tail && input_channels == 64u && output_channels == 32u &&
-            (height % 4u) == 0u) {
-            decoder_convolution_rows(conv_64_32_rows, input, weight, bias, output,
-                                     width, height, 4u);
-            return;
-        }
-        if (!tail && input_channels == 64u && output_channels == 64u &&
-            (height % 2u) == 0u) {
-            decoder_convolution_rows(conv_64_64_rows, input, weight, bias, output,
-                                     width, height, 2u);
-            return;
-        }
-        if (!tail && input_channels == 32u && output_channels == 32u &&
-            (height % 4u) == 0u) {
-            convolution_rows(conv_32_rows, input, weight, bias, output,
-                             width, height);
-            return;
-        }
-        bool narrow = output_channels <= 64u;
-        const evk::Pipeline* specialized = nullptr;
-        uint32_t rows = 64u;
-        if (!tail) {
-            if (input_channels == 3u && output_channels == 32u) {
-                specialized = &fast_conv_3_32;
-            } else if (input_channels == 32u && output_channels == 32u) {
-                specialized = &fast_conv_32_32;
-            } else if (input_channels == 64u && output_channels == 64u) {
-                specialized = &fast_conv_64_64;
-            } else if (input_channels == 64u && output_channels == 32u) {
-                specialized = &fast_conv_64_32;
-            } else if (input_channels == 32u && output_channels == 48u) {
-                specialized = &balanced_conv_32_48;
-            } else if (input_channels == 48u && output_channels == 64u) {
-                specialized = &balanced_conv_48_64;
-            } else if (input_channels == 64u && output_channels == 80u) {
-                specialized = &balanced_conv_64_80;
-            } else if (input_channels == 80u && output_channels == 96u) {
-                specialized = &balanced_conv_80_96;
-            } else if (input_channels == 96u && output_channels == 96u) {
-                if ((width % 96u) == 0u) {
-                    specialized = &balanced_conv_96_96_rows96;
-                    rows = 96u;
-                } else {
-                    specialized = &balanced_conv_96_96;
-                }
-            } else if (input_channels == 112u && output_channels == 112u) {
-                if ((width % 80u) == 0u) {
-                    specialized = &balanced_conv_112_112_rows80;
-                    rows = 80u;
-                } else {
-                    specialized = &balanced_conv_112_112;
-                }
-            }
-        }
-        if (tail) {
-            cmd.bind(narrow ? narrow_tail_conv : tail_conv);
-        } else if (specialized) {
-            cmd.bind(*specialized);
-        } else if (narrow) {
-            cmd.bind(narrow_conv);
-        } else {
-            cmd.bind(conv);
-        }
-        cmd.push(evk::Constant{
-            input.GetReference(),
-            input.GetReference(),
-            weight.buffer.GetReference(),
-            bias.buffer.GetReference(),
-            output.buffer.GetReference(),
-            width,
-            height,
-            input_channels,
-            output_channels,
-            padded_k,
-            width,
-            input_channels,
-            0u,
-        });
-        uint32_t channels_per_workgroup = narrow ? 64u : 128u;
-        cmd.dispatch((width + rows - 1u) / rows,
-                     (output_channels + channels_per_workgroup - 1u) /
-                         channels_per_workgroup,
-                     height);
-        cmd.barrier();
-    }
-
-    void pooling(Tensor& input, Tensor& output) const {
-        auto& cmd = evk::ai::GetCmd();
-        cmd.bind(max_pool);
-        cmd.push(evk::Constant{
-            input.buffer.GetReference(),
-            output.buffer.GetReference(),
-            output.shape[2],
-            output.shape[1],
-            output.shape[3],
-        });
-        cmd.dispatch((output.shape.count() + 255u) / 256u, 1u, 1u);
-        cmd.barrier();
-    }
-
-    void convolution_pooling(Tensor& input, Tensor& weight, Tensor& bias,
-                             Tensor& output) const {
-        auto& cmd = evk::ai::GetCmd();
-        const evk::Pipeline* pipeline = &conv_pool;
-        if (input.shape[3] == 32u && output.shape[3] == 48u) {
-            pipeline = &balanced_conv_pool_32_48;
-        } else if (input.shape[3] == 48u && output.shape[3] == 64u) {
-            pipeline = &balanced_conv_pool_48_64;
-        } else if (input.shape[3] == 64u && output.shape[3] == 80u) {
-            pipeline = &balanced_conv_pool_64_80;
-        }
-        cmd.bind(*pipeline);
-        cmd.push(evk::Constant{
-            input.buffer.GetReference(),
-            weight.buffer.GetReference(),
-            bias.buffer.GetReference(),
-            output.buffer.GetReference(),
-            input.shape[2],
-            input.shape[1],
-        });
-        bool balanced = output.shape[3] != 32u;
-        cmd.dispatch((input.shape[2] + 63u) / 64u,
-                     input.shape[1] / (balanced ? 2u : 4u),
-                     balanced ? (output.shape[3] +
-                         (output.shape[3] == 64u ? 63u : 47u)) /
-                         (output.shape[3] == 64u ? 64u : 48u) : 1u);
-        cmd.barrier();
-    }
-
-    void convert_from_rgba(evk::Image& color, Tensor& output, uint32_t width,
-                           uint32_t height, uint32_t padded_width,
-                           uint32_t padded_height) const {
-        auto& cmd = evk::ai::GetCmd();
-        cmd.bind(from_rgba_image);
-        cmd.push(evk::Constant{
-            ImageInputs{color.GetRID(), color.GetRID(), color.GetRID()},
-            output.buffer.GetReference(),
-            width,
-            height,
-            padded_width,
-            padded_height,
-            3u,
-        });
-        uint32_t pixels = padded_width * padded_height;
-        cmd.dispatch((pixels + 255u) / 256u, 1u, 1u);
-        cmd.barrier();
-    }
-
-    void convert_from_rgba(evk::Image& color, evk::Image& albedo,
-                           evk::Image& normal, Tensor& output, uint32_t width,
-                           uint32_t height, uint32_t padded_width,
-                           uint32_t padded_height) const {
-        auto& cmd = evk::ai::GetCmd();
-        cmd.bind(from_rgba_image);
-        cmd.push(evk::Constant{
-            ImageInputs{color.GetRID(), albedo.GetRID(), normal.GetRID()},
-            output.buffer.GetReference(),
-            width,
-            height,
-            padded_width,
-            padded_height,
-            9u,
-        });
-        uint32_t pixels = padded_width * padded_height;
-        cmd.dispatch((pixels + 255u) / 256u, 1u, 1u);
-        cmd.barrier();
-    }
-
-    void convert_to_rgb(Tensor& input, evk::Buffer& output, uint32_t width,
-                        uint32_t height, uint32_t padded_width) const {
-        auto& cmd = evk::ai::GetCmd();
-        cmd.bind(to_rgb);
-        cmd.push(evk::Constant{
-            input.buffer.GetReference(),
-            output.GetReference(),
-            width,
-            height,
-            padded_width,
-            input.shape[3],
-        });
-        uint32_t elements = width * height * 3u;
-        cmd.dispatch((elements + 255u) / 256u, 1u, 1u);
-        cmd.barrier();
-    }
-
-    void convert_to_rgba(Tensor& input, evk::Image& output, uint32_t width,
-                         uint32_t height, uint32_t padded_width) const {
-        auto& cmd = evk::ai::GetCmd();
-        cmd.bind(to_rgba_image);
-        cmd.push(evk::Constant{
-            input.buffer.GetReference(),
-            output.GetRID(),
-            width,
-            height,
-            padded_width,
-            input.shape[3],
-        });
-        uint32_t pixels = width * height;
-        cmd.dispatch((pixels + 255u) / 256u, 1u, 1u);
-        cmd.barrier();
-    }
-};
 
 Model::Model(const std::string& weights_path) {
-    kernels_ = std::make_unique<Kernels>();
-    load(weights_path);
-}
-
-Model::~Model() = default;
-
-void Model::load(const std::string& weights_path) {
     std::vector<uint8_t> bytes = read_file(weights_path);
     std::vector<ArchiveTensor> archive_tensors = parse_table(bytes);
 
-    std::unordered_map<std::string, std::unique_ptr<Tensor>> parameters;
-    parameters.reserve(archive_tensors.size());
+    data_ids_.reserve(archive_tensors.size());
+    data_.values.reserve(archive_tensors.size());
 
     for (const ArchiveTensor& source : archive_tensors) {
-        auto tensor = std::make_unique<Tensor>(source.shape);
-        float16_t* destination = tensor->cpu();
         uint32_t element_count = source.shape.count();
+        std::vector<float16_t> values(element_count);
 
         if (source.data_type == 'h') {
-            std::memcpy(destination, bytes.data() + source.offset,
+            std::memcpy(values.data(), bytes.data() + source.offset,
                         size_t(element_count) * sizeof(float16_t));
         } else {
             const uint8_t* source_data = bytes.data() + source.offset;
             for (uint32_t i = 0; i < element_count; ++i) {
                 float value;
                 std::memcpy(&value, source_data + size_t(i) * sizeof(float), sizeof(float));
-                destination[i] = float16_t(value);
+                values[i] = float16_t(value);
             }
         }
-        tensor->cpu_upload(false);
 
-        auto [it, inserted] = parameters.emplace(source.name, std::move(tensor));
-        if (!inserted) {
+        evk::ai::DataId data_id = data_.add({
+            .desc = evk::ai::TensorDesc{source.shape},
+            .values = std::move(values),
+        });
+        if (!data_ids_.emplace(source.name, data_id).second) {
             throw std::runtime_error("duplicate tensor in OIDN weights: " + source.name);
         }
     }
 
-    if (parameters.empty()) {
+    if (data_ids_.empty()) {
         throw std::runtime_error("OIDN weights archive is empty");
     }
-    SubmitCmd(true);
-    parameters_ = std::move(parameters);
 
-    std::unordered_map<std::string, std::unique_ptr<Tensor>> packed_parameters;
-    for (const auto& [name, source] : parameters_) {
-        std::unique_ptr<Tensor> packed;
-        if (name.ends_with(".bias")) {
-            packed = pack_bias(name, *source);
-        } else if (name.ends_with(".weight")) {
-            packed = pack_weight(name, *source);
-        }
-        if (packed) packed_parameters.emplace(name, std::move(packed));
-    }
-    SubmitCmd(true);
-    packed_parameters_ = std::move(packed_parameters);
-
-    uint32_t input_channels = parameters_.contains("enc_conv0.weight")
-        ? parameter("enc_conv0.weight").shape[1] : 0u;
-    bool supported_inputs = input_channels == 3u || input_channels == 9u;
-
-    // The balanced and fast RT LDR models share this topology and differ only
-    // in their internal channel counts and optional auxiliary inputs.
-    bool balanced_model = parameters_.contains("dec_conv4a.weight") &&
-                          parameter("dec_conv4a.weight").shape[0] == 112u &&
-                          parameters_.contains("dec_conv1a.weight") &&
-                          parameter("dec_conv1a.weight").shape[1] ==
-                              64u + input_channels;
-    bool fast_model = parameters_.contains("dec_conv4a.weight") &&
-                      parameter("dec_conv4a.weight").shape[0] == 64u &&
-                      parameters_.contains("dec_conv1a.weight") &&
-                      parameter("dec_conv1a.weight").shape[1] ==
-                          32u + input_channels;
-    if (!parameters_.contains("enc_conv0.weight") ||
-        parameter("enc_conv0.weight").shape[0] != 32u ||
-        !supported_inputs ||
-        (!balanced_model && !fast_model)) {
-        parameters_.clear();
+    if (!data_ids_.contains("enc_conv0.weight") ||
+        !data_ids_.contains("dec_conv4a.weight") ||
+        !data_ids_.contains("dec_conv1a.weight")) {
         throw std::runtime_error("weights are not a supported RT LDR OIDN model");
     }
-    input_channels_ = input_channels;
-}
+    const Shape& input = data_.get(data_ids_.at("enc_conv0.weight")).desc.shape;
+    const Shape& decoder4 = data_.get(data_ids_.at("dec_conv4a.weight")).desc.shape;
+    const Shape& decoder1 = data_.get(data_ids_.at("dec_conv1a.weight")).desc.shape;
+    input_channels_ = input[1];
 
-Tensor& Model::parameter(const std::string& name) const {
-    auto it = parameters_.find(name);
-    if (it == parameters_.end()) {
-        throw std::runtime_error("missing tensor in OIDN weights: " + name);
+    bool decoder_channels_supported =
+        (decoder4[0] == 64u && decoder1[1] == 32u + input_channels_) ||
+        (decoder4[0] == 112u && decoder1[1] == 64u + input_channels_);
+    if (input[0] != 32u || (input_channels_ != 3u && input_channels_ != 9u) ||
+        !decoder_channels_supported) {
+        throw std::runtime_error("weights are not a supported RT LDR OIDN model");
     }
-    return *it->second;
 }
 
-Tensor& Model::packed_parameter(const std::string& name) const {
-    auto it = packed_parameters_.find(name);
-    if (it == packed_parameters_.end()) {
-        throw std::runtime_error("missing packed tensor in OIDN weights: " + name);
-    }
-    return *it->second;
-}
-
-void Model::convert_to_rgb(Tensor& input, evk::Buffer& output, uint32_t width,
-                           uint32_t height, uint32_t padded_width) const {
-    kernels_->convert_to_rgb(input, output, width, height, padded_width);
-}
-
-void Model::convert_from_rgba(evk::Image& input, Tensor& output, uint32_t width,
-                              uint32_t height, uint32_t padded_width,
-                              uint32_t padded_height) const {
-    kernels_->convert_from_rgba(input, output, width, height,
-                                padded_width, padded_height);
-}
-
-void Model::convert_from_rgba(evk::Image& color, evk::Image& albedo,
-                              evk::Image& normal, Tensor& output,
-                              uint32_t width, uint32_t height,
-                              uint32_t padded_width,
-                              uint32_t padded_height) const {
-    kernels_->convert_from_rgba(color, albedo, normal, output, width, height,
-                                padded_width, padded_height);
-}
-
-void Model::convert_to_rgba(Tensor& input, evk::Image& output, uint32_t width,
-                            uint32_t height, uint32_t padded_width) const {
-    kernels_->convert_to_rgba(input, output, width, height, padded_width);
-}
-
-Tensor& Model::build(Graph& graph, Tensor& input) const {
-    if (!loaded()) {
-        throw std::runtime_error("OIDN model is not loaded");
-    }
-    if (input.shape.rank() != 4 || input.shape[0] != 1u ||
-        input.shape[3] != input_channels_) {
-        throw std::runtime_error("OIDN input channel count does not match the weights");
-    }
-    if ((input.shape[1] % 16u) != 0u || (input.shape[2] % 16u) != 0u) {
-        throw std::runtime_error("OIDN input height and width must be multiples of 16");
+evk::ai::Graph Model::build_ir(uint32_t width, uint32_t height) const {
+    namespace ai = evk::ai;
+    if (width == 0u || height == 0u || (width % 16u) != 0u ||
+        (height % 16u) != 0u) {
+        throw std::runtime_error("OIDN IR dimensions must be positive multiples of 16");
     }
 
-    auto conv = [this, &graph](const char* name, Tensor& value, bool activation = true) -> Tensor& {
-        std::string weight_name = std::string(name) + ".weight";
-        std::string bias_name = std::string(name) + ".bias";
-        Tensor& weight = packed_parameter(weight_name);
-        Tensor& bias = packed_parameter(bias_name);
-        uint32_t output_channels = parameter(bias_name).shape[0];
-        uint32_t storage_channels = activation ? output_channels : 8u;
-        Tensor& output = graph.tensor(Shape({
-            value.shape[0], value.shape[1], value.shape[2], storage_channels
-        }));
-        output.name = std::string(name) + ".conv2d";
-        output.forward_fn = [this, &value, &weight,
-                             &bias, &output, activation]() {
-            kernels_->convolution(value, weight, bias, output, activation);
-        };
-        return output;
-    };
+    ai::Graph graph;
+    ai::ValueId input = graph.input(
+        {Shape({1u, input_channels_, height, width})}, "input");
 
-    auto concat_conv = [this, &graph](const char* name, Tensor& low_resolution,
-                                      Tensor& skip) -> Tensor& {
-        if (low_resolution.shape[1] * 2u != skip.shape[1] ||
-            low_resolution.shape[2] * 2u != skip.shape[2]) {
-            throw std::runtime_error("OIDN concat-convolution spatial dimensions do not match");
+    auto constant = [this, &graph](const std::string& name) {
+        auto id = data_ids_.find(name);
+        if (id == data_ids_.end()) {
+            throw std::runtime_error("missing tensor data in OIDN weights: " + name);
         }
-        std::string weight_name = std::string(name) + ".weight";
-        std::string bias_name = std::string(name) + ".bias";
-        Tensor& weight = packed_parameter(weight_name);
-        Tensor& bias = packed_parameter(bias_name);
-        uint32_t output_channels = parameter(bias_name).shape[0];
-        if (parameter(weight_name).shape[1] !=
-            low_resolution.shape[3] + skip.shape[3]) {
-            throw std::runtime_error("OIDN concat-convolution channel count does not match");
-        }
-        Tensor& output = graph.tensor(Shape({
-            skip.shape[0], skip.shape[1], skip.shape[2], output_channels
-        }));
-        output.name = std::string(name) + ".conv2d";
-        output.forward_fn = [this, &low_resolution, &skip, &weight,
-                             &bias, &output]() {
-            kernels_->concat_convolution(low_resolution, skip, weight, bias, output);
-        };
-        return output;
+        return graph.constant(id->second, data_.get(id->second).desc, name);
     };
 
-    auto pool = [this, &graph](const char* name, Tensor& value) -> Tensor& {
-        Tensor& output = graph.tensor(Shape({
-            value.shape[0], value.shape[1] / 2u, value.shape[2] / 2u, value.shape[3]
-        }));
-        output.name = name;
-        output.forward_fn = [this, &value, &output]() {
-            kernels_->pooling(value, output);
-        };
-        return output;
+    auto conv = [&graph, &constant](const char* name, ai::ValueId value,
+                                    bool activation = true) {
+        std::string prefix(name);
+        ai::ValueId weight = constant(prefix + ".weight");
+        ai::ValueId bias = constant(prefix + ".bias");
+        ai::ValueId output = graph.conv2d(
+            value, weight, bias, ai::Conv2D{.pad_y = 1u, .pad_x = 1u},
+            prefix + ".conv2d");
+        return activation ? graph.relu(output, prefix + ".relu") : output;
     };
 
-    auto conv_pool = [this, &graph, &conv, &pool](const char* conv_name,
-                                                  const char* pool_name,
-                                                  Tensor& value) -> Tensor& {
-        std::string bias_name = std::string(conv_name) + ".bias";
-        uint32_t output_channels = parameter(bias_name).shape[0];
-        bool supported =
-            (value.shape[3] == 32u && output_channels == 32u) ||
-            (value.shape[3] == 32u && output_channels == 48u) ||
-            (value.shape[3] == 48u && output_channels == 64u) ||
-            (value.shape[3] == 64u && output_channels == 80u);
-        if (!supported || (value.shape[1] % 4u) != 0u) {
-            return pool(pool_name, conv(conv_name, value));
-        }
-
-        Tensor& weight = packed_parameter(std::string(conv_name) + ".weight");
-        Tensor& bias = packed_parameter(bias_name);
-        Tensor& output = graph.tensor(Shape({
-            value.shape[0], value.shape[1] / 2u, value.shape[2] / 2u,
-            output_channels
-        }));
-        output.name = std::string(conv_name) + ".conv2d";
-        output.forward_fn = [this, &value, &weight, &bias, &output]() {
-            kernels_->convolution_pooling(value, weight, bias, output);
-        };
-        return output;
+    auto conv_pool = [&graph, &conv](const char* name, ai::ValueId value) {
+        ai::ValueId convolved = conv(name, value);
+        return graph.max_pool2d(convolved, {}, std::string(name) + ".pool");
     };
 
-    Tensor* x = &conv("enc_conv0", input);
-    Tensor& pool1 = conv_pool("enc_conv1", "pool1", *x);
-    Tensor& pool2 = conv_pool("enc_conv2", "pool2", pool1);
-    Tensor& pool3 = conv_pool("enc_conv3", "pool3", pool2);
-    Tensor& pool4 = conv_pool("enc_conv4", "pool4", pool3);
+    auto concat_conv = [&graph, &conv](const char* name, ai::ValueId low_resolution,
+                                       ai::ValueId skip) {
+        ai::ValueId upsampled = graph.upsample2d(
+            low_resolution, {}, std::string(name) + ".upsample");
+        ai::ValueId joined = graph.concat(
+            upsampled, skip, 1, std::string(name) + ".concat");
+        return conv(name, joined);
+    };
 
-    x = &conv("enc_conv5a", pool4);
-    x = &conv("enc_conv5b", *x);
+    ai::ValueId x = conv("enc_conv0", input);
+    ai::ValueId pool1 = conv_pool("enc_conv1", x);
+    ai::ValueId pool2 = conv_pool("enc_conv2", pool1);
+    ai::ValueId pool3 = conv_pool("enc_conv3", pool2);
+    ai::ValueId pool4 = conv_pool("enc_conv4", pool3);
 
-    x = &concat_conv("dec_conv4a", *x, pool3);
-    x = &conv("dec_conv4b", *x);
-
-    x = &concat_conv("dec_conv3a", *x, pool2);
-    x = &conv("dec_conv3b", *x);
-
-    x = &concat_conv("dec_conv2a", *x, pool1);
-    x = &conv("dec_conv2b", *x);
-
-    x = &concat_conv("dec_conv1a", *x, input);
-    x = &conv("dec_conv1b", *x);
-    return conv("dec_conv0", *x, false);
+    x = conv("enc_conv5a", pool4);
+    x = conv("enc_conv5b", x);
+    x = concat_conv("dec_conv4a", x, pool3);
+    x = conv("dec_conv4b", x);
+    x = concat_conv("dec_conv3a", x, pool2);
+    x = conv("dec_conv3b", x);
+    x = concat_conv("dec_conv2a", x, pool1);
+    x = conv("dec_conv2b", x);
+    x = concat_conv("dec_conv1a", x, input);
+    x = conv("dec_conv1b", x);
+    x = conv("dec_conv0", x, false);
+    graph.add_output(x);
+    return graph;
 }
 
 Denoiser::Denoiser(const std::string& weights_path, uint32_t width, uint32_t height)
     : width_(width),
       height_(height),
       padded_width_(round_up_image_dimension(width)),
-      padded_height_(round_up_image_dimension(height)),
-      model_(weights_path) {
+      padded_height_(round_up_image_dimension(height)) {
+    Model model(weights_path);
+    input_channels_ = model.input_channels();
     uint64_t padded_values = uint64_t(padded_width_) * padded_height_ *
-                             model_.input_channels();
+                             input_channels_;
     if (padded_values > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("OIDN image dimensions are too large");
     }
 
-    input_ = &graph_.tensor(Shape({
-        1u, padded_height_, padded_width_, model_.input_channels()
-    }));
-    output_ = &model_.build(graph_, *input_);
+    evk::ai::Graph graph = model.build_ir(padded_width_, padded_height_);
+    executable_ = evk::ai::compile(graph, model.data());
     uint64_t output_size = uint64_t(width_) * height_ * 3u * sizeof(float);
     output_gpu_ = evk::CreateBuffer({
         .size = output_size,
@@ -1236,18 +356,19 @@ void Denoiser::denoise_cpu(std::span<const float> color_rgb,
             "OIDN albedo and normal must contain width * height * 3 values");
     }
 
-    float16_t* input_data = input_->cpu();
-    uint32_t padded_spatial = padded_width_ * padded_height_;
-    uint32_t input_channels = model_.input_channels();
-    std::fill(input_data, input_data + size_t(padded_spatial) * input_channels,
+    Tensor& input = executable_.input();
+    float16_t* input_data = input.cpu();
+    uint32_t input_channels = input_channels_;
+    std::fill(input_data,
+              input_data + size_t(padded_width_) * padded_height_ * input_channels,
               float16_t(0.0f));
     for (uint32_t y = 0; y < height_; ++y) {
         for (uint32_t x = 0; x < width_; ++x) {
-            uint32_t source_pixel = y * width_ + x;
-            uint32_t padded_pixel = y * padded_width_ + x;
-            size_t input_index = size_t(padded_pixel) * input_channels;
+            size_t source_pixel = size_t(y) * width_ + x;
+            size_t padded_pixel = size_t(y) * padded_width_ + x;
+            size_t input_index = padded_pixel * input_channels;
             for (uint32_t channel = 0; channel < 3u; ++channel) {
-                size_t source_index = size_t(source_pixel) * 3u + channel;
+                size_t source_index = source_pixel * 3u + channel;
                 float value = color_rgb[source_index];
                 if (!(value >= 0.0f)) value = 0.0f;
                 input_data[input_index + channel] =
@@ -1269,9 +390,9 @@ void Denoiser::denoise_cpu(std::span<const float> color_rgb,
     }
 
     auto input_pack_end = Clock::now();
-    input_->cpu_upload(false);
+    input.cpu_upload(false);
     auto graph_begin = Clock::now();
-    graph_.eval(false, true, true, profile);
+    executable_.eval(true, true, profile);
     auto graph_end = Clock::now();
     if (profile) {
         timings_ = evk::CmdTimestamps();
@@ -1279,7 +400,7 @@ void Denoiser::denoise_cpu(std::span<const float> color_rgb,
         timings_.clear();
     }
     auto download_begin = Clock::now();
-    model_.convert_to_rgb(*output_, output_gpu_, width_, height_, padded_width_);
+    executable_.to_rgb(output_gpu_, width_, height_, padded_width_);
     auto& download_cmd = evk::ai::GetCmd();
     download_cmd.copy(output_gpu_, output_cpu_, value_count * sizeof(float));
     evk::ai::SubmitCmd(true);
@@ -1307,10 +428,10 @@ void Denoiser::denoise(evk::Cmd& cmd, evk::Image& input_rgba,
 
     evk::ai::WithCmd(cmd, [&]() {
         cmd.barrier();
-        model_.convert_from_rgba(input_rgba, *input_, width_, height_,
-                                 padded_width_, padded_height_);
-        graph_.eval(false, false, false, false);
-        model_.convert_to_rgba(*output_, output_rgba, width_, height_, padded_width_);
+        executable_.from_rgba(input_rgba, width_, height_,
+                              padded_width_, padded_height_);
+        executable_.eval(false, false, false);
+        executable_.to_rgba(output_rgba, width_, height_, padded_width_);
     });
 }
 
@@ -1328,10 +449,10 @@ void Denoiser::denoise(evk::Cmd& cmd, evk::Image& color_rgba,
 
     evk::ai::WithCmd(cmd, [&]() {
         cmd.barrier();
-        model_.convert_from_rgba(color_rgba, albedo_rgba, normal_rgba, *input_,
-                                 width_, height_, padded_width_, padded_height_);
-        graph_.eval(false, false, false, false);
-        model_.convert_to_rgba(*output_, output_rgba, width_, height_, padded_width_);
+        executable_.from_rgba(color_rgba, albedo_rgba, normal_rgba,
+                              width_, height_, padded_width_, padded_height_);
+        executable_.eval(false, false, false);
+        executable_.to_rgba(output_rgba, width_, height_, padded_width_);
     });
 }
 

@@ -1,0 +1,23 @@
+#include "../common/evk.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+PUSH(BufferFp16 inputBuffer; BufferFp16 outputBuffer; BufferFp16 gradInput;
+     uint width; uint count; uint backward;)
+COMPUTE(256, 1, 1)
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+    uint j = (i / width) * (2u * width) + i % width;
+    float gate = float(inputBuffer.x[j]);
+    float value = float(inputBuffer.x[j + width]);
+    float sigmoid = 1.0 / (1.0 + exp(-gate));
+    if (backward == 0u) {
+        outputBuffer.x[i] = float16_t(gate * sigmoid * value);
+    } else {
+        float grad = float(outputBuffer.x[i]);
+        gradInput.x[j] += float16_t(grad * value * sigmoid * (1.0 + gate * (1.0 - sigmoid)));
+        gradInput.x[j + width] += float16_t(grad * gate * sigmoid);
+    }
+}

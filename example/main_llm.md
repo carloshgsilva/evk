@@ -1,71 +1,81 @@
-## `main_llm.cpp` - Conditional causal autoregressive mesh completion (cross-entropy)
+# Mesh language-model comparison
 
-This demo trains a conditional token autoregressive mesh completion model instead of flow matching.
+`main_llm.cpp` compares two eight-layer autoregressive models on procedural
+mesh completion:
 
-### Objective
-- Condition on the first 2 mesh triangles and autoregressively complete the remaining 10 triangles.
-- Train with next-token prediction and cross-entropy.
-- Use explicit sequence markers:
-  - `BOS` (beginning of sequence)
-  - `EOS` (end of sequence)
+- causal softmax Transformer attention, the quality baseline;
+- Gated DeltaNet, the constant-memory recurrent alternative.
 
-### Tokenization
-Coordinates are quantized into **128 bins**:
-- Coordinate range: `[-1.32, 1.32]`
-- Tokens:
-  - `0` = PAD / IGNORE
-  - `1` = BOS
-  - `2` = EOS
-  - `3..130` = coordinate bins (128 values)
+Both models use a 256-wide token representation, RoPE, residual MLP blocks,
+FP16 parameters, activations, optimizer state, and inference state. FP32 is used
+only for temporary accumulation inside compute shaders.
 
-Vocabulary is padded to a tile-friendly size (`144`) for GPU matmul constraints.
+## Dataset and objective
 
-### Sequence layout
-For each mesh:
-- 12 cube triangles in canonical face order
-- 9 coordinate values per triangle
-- coordinate token count = `12 * 9 = 108`
+Each example is a randomly rotated and translated cube or subdivided
+tetrahedron. The first two triangles are supplied as conditioning tokens and the
+model autoregressively completes the remaining ten triangles. Training uses
+next-token cross entropy. Validation reports cross entropy and completion MSE
+over generated, non-conditioning coordinates.
 
-Sequence (active part):
-- `BOS` + 108 coord tokens + `EOS` = 110 tokens
+Only `*_mesh_val_evolution.obj` is produced for mesh visualization. Each
+validation checkpoint appends five generated meshes to the file.
 
-Sequence tensor length is padded to `160` (multiple of 16) for compute kernel alignment.
+## Softmax attention
 
-Conditioning and supervision:
-- The first 2 triangles are copied into the input sequence as a fixed prefix (`18` coordinate tokens).
-- Cross-entropy is masked over that prefix.
-- The model is supervised only on the remaining 10 triangles plus `EOS`.
+The baseline uses eight standard causal self-attention blocks with RoPE and a
+512-wide feed-forward path. It has 4,268,032 trainable parameters. Its equivalent
+FP16 K/V cache grows linearly with sequence length.
 
-### Model
-- Embedding lookup for token IDs
-- Rotary position encoding (RoPE) applied to attention `q` and `k`
-- Stack of causal attention blocks (RMSNorm + attention + GELU FFN + residual)
-- Output projection to vocabulary logits
-- Loss: cross entropy (`target=0` positions ignored)
+## Gated DeltaNet
 
-### Training and metrics
-The run prints:
-- `train_ce`: training cross-entropy
-- `val_ce`: validation cross-entropy over the predicted completion region
-- `val_completion_mse`: greedy-decoded coordinate MSE on the 10 predicted triangles only
+The Gated DeltaNet also uses eight residual blocks and exactly 4,268,032
+trainable parameters. Each layer has 16 sixteen-dimensional heads and a 496-wide
+feed-forward path. The recurrent update is:
 
-### Outputs
-After training, the demo exports:
-- `output/mesh_target.obj` - reference validation mesh for seed 0
-- `output/mesh_pred.obj` - completion for validation seed 0, conditioned on its first 2 triangles
-- `output/mesh_pred_seed0.obj`
-- `output/mesh_pred_seed1.obj`
-- `output/mesh_pred_seed2.obj`
+```text
+S'[t] = alpha[t] * S[t - 1]
+e[t]  = v[t] - k[t]^T * S'[t]
+S[t]  = S'[t] + beta[t] * k[t] * e[t]^T
+o[t]  = q[t]^T * S[t]
+```
 
-`mesh_pred*.obj` files are paired completions: each uses the first 2 triangles from its matching validation target and predicts the remaining 10.
+Q and K are L2-normalized and receive RoPE before the state update. Across all
+eight layers, recurrent state occupies 64 KiB of FP16 storage per sequence and
+does not grow with context length.
 
-`output/mesh_val_evolution.obj` keeps the full target mesh in the first column of each row and appends conditioned completion samples over training so target/prediction comparisons stay meaningful.
+Training uses an exact reverse state-gradient scan to supply FP16 boundaries
+for parallel 16-token backward chunks, including the key-dependent delta
+correction. Decode uses the same recurrence, with FP16 state storage.
 
-### Run
-Use:
+## Running
 
 ```bat
 .\run.bat --llm
+.\run.bat --llm --llm-model attention
+.\run.bat --llm --llm-model gated-delta
+.\run.bat --llm --llm-model compare
+.\run.bat --llm --llm-model compare --llm-steps 20000 --llm-log-interval 250
 ```
 
-This configures/builds the project and runs the LLM demo.
+`compare` and `all` run both retained models. The default budget is 20,000
+updates.
+
+`--llm-gdn-heads` accepts 8, 16, 32, or 64
+(head dimensions 32, 16, 8, or 4). `--llm-gdn-hidden` sets the FFN width,
+a positive multiple of 16. Defaults are 16 heads and FFN width 496.
+`--llm-seed` sets parameter initialization (default 42), not the data stream.
+`--llm-output` selects a separate output directory; files there are overwritten.
+For example, this tests dimension 16 at the baseline parameter count:
+
+```bat
+.\run.bat --llm --llm-model gated-delta --llm-gdn-heads 16 --llm-gdn-hidden 496 --llm-output output/gdn16
+```
+
+Outputs are written under `output/` by default:
+
+- `attention_training_curve.csv`
+- `attention_mesh_val_evolution.obj`
+- `gated_delta_training_curve.csv`
+- `gated_delta_mesh_val_evolution.obj`
+- `llm_comparison.csv`
