@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "evk.h"
+#include "evk_metal_blit.h"
 #include "evk_metal_shader.h"
 
 namespace evk {
@@ -107,6 +108,7 @@ struct MetalBuffer : Resource {
 struct MetalImage : Resource {
     ImageDesc desc;
     id<MTLTexture> texture = nil;
+    id<MTLTexture> blitTexture = nil;
     ~MetalImage();
 };
 struct MetalPipeline : Resource {
@@ -154,6 +156,10 @@ struct State {
     id<MTLBuffer> argumentBuffer = nil;
     id<MTLSamplerState> nearest = nil;
     id<MTLSamplerState> linear = nil;
+    id<MTLLibrary> blitLibrary = nil;
+    id<MTLDepthStencilState> blitDepth = nil;
+    id<MTLDepthStencilState> blitColorDepth = nil;
+    std::array<std::array<id<MTLRenderPipelineState>, 3>, uint32_t(Format::D32Sfloat) + 1> blitPipelines;
     CAMetalLayer* layer = nil;
     NSView* view = nil;
     Features features;
@@ -329,6 +335,51 @@ void ResizeLayer() {
     state.layer.drawableSize = CGSizeMake(std::max(1.0, size.width * scale), std::max(1.0, size.height * scale));
 }
 
+uint32_t BlitType(Format format) {
+    if (Depth(format)) return 3;
+    if (UInt(format)) return 1;
+    if (format == Format::RGBA32Sint) return 2;
+    return 0;
+}
+void PrepareBlitPipelines(Format format) {
+    auto& state = S();
+    auto& pipelines = state.blitPipelines[uint32_t(format)];
+    if (pipelines[0]) return;
+    NSError* error = nil;
+    if (!state.blitLibrary) {
+        MTLCompileOptions* options = [MTLCompileOptions new];
+        options.languageVersion = MTLLanguageVersion3_0;
+        options.preserveInvariance = YES;
+        NSString* source = [[NSString alloc] initWithUTF8String:metal::BLIT_SHADER];
+        state.blitLibrary = [state.device newLibraryWithSource:source options:options error:&error];
+        Require(state.blitLibrary != nil, "Cannot compile blit shaders: %s", error.localizedDescription.UTF8String);
+        MTLDepthStencilDescriptor* depth = [MTLDepthStencilDescriptor new];
+        depth.depthCompareFunction = MTLCompareFunctionAlways;
+        depth.depthWriteEnabled = YES;
+        state.blitDepth = [state.device newDepthStencilStateWithDescriptor:depth];
+        depth.depthWriteEnabled = NO;
+        state.blitColorDepth = [state.device newDepthStencilStateWithDescriptor:depth];
+    }
+    const char* types[] = {"float", "uint", "int", "depth"};
+    const char* dimensions[] = {"2d", "array", "3d"};
+    uint32_t count = Depth(format) ? 2 : 3;
+    for (uint32_t dimension = 0; dimension < count; ++dimension) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "blit_%s_%s", types[BlitType(format)], dimensions[dimension]);
+        MTLRenderPipelineDescriptor* pipeline = [MTLRenderPipelineDescriptor new];
+        pipeline.vertexFunction = [state.blitLibrary newFunctionWithName:@"blit_vertex"];
+        pipeline.fragmentFunction = [state.blitLibrary newFunctionWithName:[[NSString alloc] initWithUTF8String:name]];
+        if (Depth(format)) {
+            pipeline.depthAttachmentPixelFormat = PixelFormat(format);
+            if (format == Format::D24UnormS8Uint) pipeline.stencilAttachmentPixelFormat = PixelFormat(format);
+        } else {
+            pipeline.colorAttachments[0].pixelFormat = PixelFormat(format);
+        }
+        pipelines[dimension] = [state.device newRenderPipelineStateWithDescriptor:pipeline error:&error];
+        Require(pipelines[dimension] != nil, "Cannot create blit pipeline: %s", error.localizedDescription.UTF8String);
+    }
+}
+
 id<MTLFunction> Function(const std::vector<uint8_t>& bytes, const ConstantRaw& constants, metal::ShaderInfo& info) {
     char hash[17];
     std::snprintf(hash, sizeof(hash), "%016llx", (unsigned long long)metal::ShaderHash(bytes));
@@ -426,11 +477,19 @@ Image CreateImage(const ImageDesc& desc) {
         }
         texture.storageMode = MTLStorageModePrivate;
         texture.usage = MTLTextureUsageRenderTarget;
-        if (Has(desc.usage, ImageUsage::Sampled)) texture.usage |= MTLTextureUsageShaderRead;
+        if (Has(desc.usage, ImageUsage::Sampled) || Has(desc.usage, ImageUsage::TransferSrc)) texture.usage |= MTLTextureUsageShaderRead;
         if (Has(desc.usage, ImageUsage::Storage)) texture.usage |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        if (desc.isCube && Has(desc.usage, ImageUsage::TransferSrc)) texture.usage |= MTLTextureUsagePixelFormatView;
         image->texture = [S().device newTextureWithDescriptor:texture];
         Require(image->texture != nil, "Cannot allocate texture %s", desc.name.c_str());
         image->texture.label = [[NSString alloc] initWithUTF8String:desc.name.c_str()];
+        image->blitTexture = image->texture;
+        if (desc.isCube && Has(desc.usage, ImageUsage::TransferSrc)) {
+            image->blitTexture = [image->texture newTextureViewWithPixelFormat:texture.pixelFormat textureType:MTLTextureType2DArray
+                levels:NSMakeRange(0, desc.mipCount) slices:NSMakeRange(0, desc.layerCount)];
+            Require(image->blitTexture != nil, "Cannot create cube blit view");
+        }
+        if (Has(desc.usage, ImageUsage::TransferDst) && desc.sampleCount == SampleCount::One) PrepareBlitPipelines(desc.format);
         AddResource(image->texture, Has(desc.usage, ImageUsage::Storage));
         if (Has(desc.usage, ImageUsage::Sampled) || Has(desc.usage, ImageUsage::Storage)) {
             image->resourceid = S().images.Allocate();
@@ -727,15 +786,8 @@ void Cmd::copy(Buffer& src, Image& dst, const std::vector<ImageRegion>& regions)
         offset += uint64_t(region.width) * region.height * region.depth * bytes;
     }
 }
-void Cmd::blit(Image& src, Image& dst, ImageRegion from, ImageRegion to, Filter) {
-    Require(from.width == to.width && from.height == to.height && from.depth == to.depth && GetDesc(src).format == GetDesc(dst).format, "Scaled/format-converting blit is not implemented yet");
-    auto& cmd = C(*this); Blit(cmd);
-    [cmd.blit copyFromTexture:I(src).texture sourceSlice:from.layer sourceLevel:from.mip sourceOrigin:MTLOriginMake(from.x, from.y, from.z)
-        sourceSize:MTLSizeMake(from.width, from.height, from.depth) toTexture:I(dst).texture destinationSlice:to.layer destinationLevel:to.mip destinationOrigin:MTLOriginMake(to.x, to.y, to.z)];
-}
-
 namespace {
-void BeginRender(Cmd& api, Image* attachments, ClearValue* clears, int count, Image* resolves, bool loadDepth, uint32_t mip, uint32_t layer) {
+void BeginRender(Cmd& api, Image* attachments, ClearValue* clears, int count, Image* resolves, bool loadDepth, uint32_t mip, uint32_t layer, bool loadColor = false) {
     auto& cmd = C(api);
     Require(!cmd.render && count > 0 && count <= MAX_ATTACHMENTS_COUNT, "Invalid render pass");
     EndEncoder(cmd);
@@ -770,7 +822,7 @@ void BeginRender(Cmd& api, Image* attachments, ClearValue* clears, int count, Im
             attachment.level = mip;
             attachment.slice = desc.extent.depth > 1 ? 0 : layer;
             attachment.depthPlane = desc.extent.depth > 1 ? layer : 0;
-            attachment.loadAction = action; attachment.storeAction = store;
+            attachment.loadAction = loadColor ? MTLLoadActionLoad : action; attachment.storeAction = store;
             if (clears) {
                 auto& value = clears[index].color;
                 attachment.clearColor = UInt(desc.format) ? MTLClearColorMake(value.uint32[0], value.uint32[1], value.uint32[2], value.uint32[3])
@@ -800,6 +852,64 @@ void BeginRender(Cmd& api, Image* attachments, ClearValue* clears, int count, Im
         Residency(cmd.render);
     }
 }
+
+Extent BlitRegion(const ImageDesc& desc, ImageRegion& region) {
+    Require(region.mip >= 0 && uint32_t(region.mip) < desc.mipCount && region.layer >= 0 && uint32_t(region.layer) < desc.layerCount,
+        "Blit subresource is out of bounds");
+    Extent extent = {std::max(1u, desc.extent.width >> region.mip), std::max(1u, desc.extent.height >> region.mip), std::max(1u, desc.extent.depth >> region.mip)};
+    if (region.width == 0) region.width = extent.width;
+    if (region.height == 0) region.height = extent.height;
+    if (region.depth == 0) region.depth = extent.depth;
+    auto valid = [](int offset, int size, uint32_t limit) {
+        int64_t end = int64_t(offset) + size;
+        return std::min(int64_t(offset), end) >= 0 && std::max(int64_t(offset), end) <= limit;
+    };
+    Require(valid(region.x, region.width, extent.width) && valid(region.y, region.height, extent.height) && valid(region.z, region.depth, extent.depth),
+        "Blit region is out of bounds");
+    return extent;
+}
+}
+void Cmd::blit(Image& src, Image& dst, ImageRegion from, ImageRegion to, Filter filter) {
+    const auto& source = GetDesc(src);
+    const auto& target = GetDesc(dst);
+    auto extent = BlitRegion(source, from);
+    BlitRegion(target, to);
+    Require(source.sampleCount == SampleCount::One && target.sampleCount == SampleCount::One && Has(source.usage, ImageUsage::TransferSrc)
+        && Has(target.usage, ImageUsage::TransferDst), "Blit requires single-sample transfer textures");
+    Require(BlitType(source.format) == BlitType(target.format), "Blit formats have incompatible numeric types");
+    Require(BlitType(source.format) == 0 || filter == Filter::Nearest, "Integer/depth blits require nearest filtering");
+    Require(!Depth(source.format) || source.format == target.format, "Depth blit formats must match");
+    auto& cmd = C(*this);
+    if (source.format == target.format && from.width > 0 && from.height > 0 && from.depth > 0
+        && from.width == to.width && from.height == to.height && from.depth == to.depth) {
+        Blit(cmd);
+        [cmd.blit copyFromTexture:I(src).texture sourceSlice:from.layer sourceLevel:from.mip sourceOrigin:MTLOriginMake(from.x, from.y, from.z)
+            sourceSize:MTLSizeMake(from.width, from.height, from.depth) toTexture:I(dst).texture destinationSlice:to.layer destinationLevel:to.mip destinationOrigin:MTLOriginMake(to.x, to.y, to.z)];
+        return;
+    }
+    uint32_t dimension = source.extent.depth > 1 ? 2 : source.layerCount > 1 ? 1 : 0;
+    auto pipeline = S().blitPipelines[uint32_t(target.format)][dimension];
+    Require(pipeline != nil, "Blit pipeline was not prepared");
+    struct alignas(16) Params { float origin[4]; float scale[4]; uint32_t mip; uint32_t layer; } params = {};
+    params.scale[0] = float(from.width) / to.width / extent.width;
+    params.scale[1] = float(from.height) / to.height / extent.height;
+    params.origin[0] = float(from.x) / extent.width - to.x * params.scale[0];
+    params.origin[1] = float(from.y) / extent.height - to.y * params.scale[1];
+    params.mip = from.mip; params.layer = from.layer;
+    int firstPlane = std::min(to.z, to.z + to.depth);
+    int lastPlane = std::max(to.z, to.z + to.depth);
+    for (int plane = firstPlane; plane < lastPlane; ++plane) {
+        params.origin[2] = (from.z + (plane + 0.5f - to.z) * float(from.depth) / to.depth) / extent.depth;
+        BeginRender(*this, &dst, nullptr, 1, nullptr, true, to.mip, target.extent.depth > 1 ? plane : to.layer, true);
+        [cmd.render setRenderPipelineState:pipeline];
+        [cmd.render setDepthStencilState:Depth(target.format) ? S().blitDepth : S().blitColorDepth];
+        [cmd.render setScissorRect:MTLScissorRect{NSUInteger(std::min(to.x, to.x + to.width)), NSUInteger(std::min(to.y, to.y + to.height)), NSUInteger(std::abs(to.width)), NSUInteger(std::abs(to.height))}];
+        [cmd.render setFragmentTexture:I(src).blitTexture atIndex:0];
+        [cmd.render setFragmentSamplerState:filter == Filter::Nearest ? S().nearest : S().linear atIndex:0];
+        [cmd.render setFragmentBytes:&params length:sizeof(params) atIndex:0];
+        [cmd.render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        endRender();
+    }
 }
 void Cmd::beginRender(Image* attachments, ClearValue* clears, int count, Image* resolves, bool loadDepth) {
     BeginRender(*this, attachments, clears, count, resolves, loadDepth, 0, 0);

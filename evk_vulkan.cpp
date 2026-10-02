@@ -2258,14 +2258,15 @@ namespace evk {
         EVK_ASSERT(dst, "dst = null");
 
         VkImageCopy copy = {};
-        copy.extent = {GetDesc(src).extent.width, GetDesc(src).extent.height, GetDesc(src).extent.depth};
+        const auto& source = GetDesc(src);
+        copy.extent = {std::max(1u, source.extent.width >> srcMip), std::max(1u, source.extent.height >> srcMip), std::max(1u, source.extent.depth >> srcMip)};
         copy.srcOffset = {0, 0, 0};
-        copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.srcSubresource.aspectMask = DoesFormatHaveDepth(source.format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
         copy.srcSubresource.mipLevel = srcMip;
         copy.srcSubresource.baseArrayLayer = srcLayer;
         copy.srcSubresource.layerCount = layerCount;
         copy.dstOffset = {0, 0, 0};
-        copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.dstSubresource.aspectMask = copy.srcSubresource.aspectMask;
         copy.dstSubresource.mipLevel = dstMip;
         copy.dstSubresource.baseArrayLayer = dstLayer;
         copy.dstSubresource.layerCount = layerCount;
@@ -2281,12 +2282,12 @@ namespace evk {
         copy.bufferOffset = 0;
         copy.bufferRowLength = 0;
         copy.bufferImageHeight = 0;
-        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.aspectMask = DoesFormatHaveDepth(GetDesc(dst).format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
         copy.imageSubresource.mipLevel = mip;
         copy.imageSubresource.baseArrayLayer = layer;
         copy.imageSubresource.layerCount = 1;
         copy.imageOffset = {0, 0, 0};
-        copy.imageExtent = {extent.width >> mip, extent.height >> mip, extent.depth >> mip};
+        copy.imageExtent = {std::max(1u, extent.width >> mip), std::max(1u, extent.height >> mip), std::max(1u, extent.depth >> mip)};
 
         vkCmdCopyBufferToImage(cb->cmd, ToInternal(src).buffer, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }
@@ -2350,12 +2351,12 @@ namespace evk {
         copy.bufferOffset = copyOffset;
         copy.bufferRowLength = 0;
         copy.bufferImageHeight = 0;
-        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.aspectMask = DoesFormatHaveDepth(GetDesc(dst).format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
         copy.imageSubresource.mipLevel = mip;
         copy.imageSubresource.baseArrayLayer = layer;
         copy.imageSubresource.layerCount = 1;
         copy.imageOffset = {0, 0, 0};
-        copy.imageExtent = {extent.width >> mip, extent.height >> mip, extent.depth >> mip};
+        copy.imageExtent = {std::max(1u, extent.width >> mip), std::max(1u, extent.height >> mip), std::max(1u, extent.depth >> mip)};
 
         cb->stagingOffset += size;
 
