@@ -199,7 +199,108 @@ void benchmark_graph_matmul_broadcast() {
     printf(" BATCH = %u, SIZE = %u, TILE = %u\n", BATCH, SIZE, TILE);
 }
 
-void bench() {
+// Median GPU duration; uploads, pipeline creation and queue waits are excluded.
+template<class Fn>
+double attention_gpu_ms(Fn operation, std::function<void()> prepare = {}) {
+    for (int i = 0; i < 3; ++i) {
+        if (prepare) prepare();
+        operation(); evk::ai::SubmitCmd(true);
+    }
+    std::vector<double> samples;
+    for (int i = 0; i < 9; ++i) {
+        if (prepare) prepare();
+        evk::ai::GetCmd().timestamp("attention", operation);
+        evk::ai::SubmitCmd(true);
+        const auto& timing = evk::CmdTimestamps().back();
+        samples.push_back(timing.end - timing.start);
+    }
+    std::sort(samples.begin(), samples.end());
+    return samples[samples.size() / 2];
+}
+
+void benchmark_attention(uint32_t max_context = 16384u) {
+    printf("attention_kernel,implementation,batch,length,width,forward_ms,backward_ms,combined_ms,workspace_bytes\n");
+    // Keep both graphs resident and alternate sample order to reduce clock/order bias.
+    // This increases benchmark peak allocation, not either kernel's reported workspace.
+    for (uint32_t d : {64u, 256u})
+        for (uint32_t n : {256u, 512u, 1024u, 2048u, 4096u, 8192u, 16384u}) {
+            if (n > max_context) continue;
+            Graph graphs[2];
+            Tensor* tensors[2][4];
+            for (uint32_t impl = 0u; impl < 2u; ++impl) {
+                Graph& graph = graphs[impl];
+                Tensor& q = graph.tensor({1u, n, d});
+                Tensor& k = graph.tensor(q.shape);
+                Tensor& v = graph.tensor(q.shape);
+                Tensor& out = graph.causal_attention(q, k, v, 0.0f, 0u,
+                    impl ? AttentionKernel::Tiled : AttentionKernel::Materialized);
+                tensors[impl][0] = &q; tensors[impl][1] = &k;
+                tensors[impl][2] = &v; tensors[impl][3] = &out;
+                for (Tensor* tensor : {&q, &k, &v, &out.grad()}) {
+                    for (uint32_t i = 0; i < tensor->shape.count(); ++i)
+                        tensor->cpu()[i] = float16_t(std::sin(float(i * 13u + (tensor == &k ? 7u : 0u))) * 0.1f);
+                    tensor->cpu_upload();
+                }
+            }
+            double medians[2][3];
+            for (uint32_t pass = 0u; pass < 3u; ++pass) {
+                std::vector<double> samples[2];
+                for (int sample = -3; sample < 31; ++sample)
+                    for (uint32_t order = 0u; order < 2u; ++order) {
+                        uint32_t impl = order ^ (uint32_t(sample + 3) & 1u);
+                        Tensor& out = *tensors[impl][3];
+                        if (pass != 0u)
+                            for (const auto& tensor : graphs[impl].nodes)
+                                if (tensor.get() != &out) tensor->grad().fill(0.0f);
+                        auto operation = [&] {
+                            if (pass != 1u) out.forward_fn();
+                            if (pass != 0u) out.backward_fn();
+                        };
+                        if (sample < 0) operation();
+                        else evk::ai::GetCmd().timestamp("attention", operation);
+                        evk::ai::SubmitCmd(true);
+                        if (sample >= 0) {
+                            const auto& timing = evk::CmdTimestamps().back();
+                            double ms = timing.end - timing.start;
+                            samples[impl].push_back(ms);
+                            printf("attention_sample,%s,%u,%u,%u,%d,%.6f\n",
+                                impl ? "tiled" : "legacy", n, d, pass, sample, ms);
+                        }
+                    }
+                for (uint32_t impl = 0u; impl < 2u; ++impl) {
+                    std::sort(samples[impl].begin(), samples[impl].end());
+                    medians[impl][pass] = samples[impl][samples[impl].size() / 2u];
+                }
+            }
+            for (uint32_t impl = 0u; impl < 2u; ++impl) {
+                Graph& graph = graphs[impl];
+                uint64_t bytes = 0;
+                for (const auto& workspace : graph.workspaces)
+                    bytes += uint64_t(workspace->shape.count()) * sizeof(float16_t);
+                for (const auto& scratch : graph.scratch)
+                    if (scratch.tensor) bytes += uint64_t(scratch.capacity) * sizeof(float16_t);
+                for (const auto& tensor : graph.nodes)
+                    if (std::find(std::begin(tensors[impl]), std::end(tensors[impl]), tensor.get()) == std::end(tensors[impl]))
+                        bytes += uint64_t(tensor->shape.count()) * sizeof(float16_t) * (tensor->grad_tensor ? 2u : 1u);
+                printf("attention_kernel,%s,1,%u,%u,%.6f,%.6f,%.6f,%llu\n",
+                    impl ? "tiled" : "legacy", n, d, medians[impl][0], medians[impl][1], medians[impl][2],
+                    static_cast<unsigned long long>(bytes));
+            }
+            fflush(stdout);
+        }
+    printf("attention_decode,length,width,decode_ms,cache_bytes\n");
+    for (uint32_t d : {64u, 256u})
+        for (uint32_t n : {256u, 512u, 1024u, 2048u, 4096u, 8192u, 16384u}) {
+            Tensor q({1u, 1u, d}), k({1u, n, d}), v({1u, n, d}), out(q.shape);
+            q.fill(0.1f); k.fill(0.2f); v.fill(0.3f);
+            double ms = attention_gpu_ms([&] { evk::ai::cached_attention(q, k, v, out, n - 1u); });
+            printf("attention_decode,%u,%u,%.6f,%llu\n", n, d, ms,
+                static_cast<unsigned long long>(uint64_t(n) * d * 4u));
+        }
+}
+
+void bench(bool attention = false, uint32_t max_context = 16384u) {
+    if (attention) { benchmark_attention(max_context); return; }
     // benchmark_matmul();
     // benchmark_matmul_broadcast();
     benchmark_cross_entropy_loss();

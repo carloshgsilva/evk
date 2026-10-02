@@ -15,12 +15,18 @@ int main(int argc, char** argv) {
     // Parse command-line flags: --test, --bench, --llm
     bool do_test = false;
     bool do_bench = false;
+    bool attention_bench = false;
+    uint32_t attention_context = 16384u;
     bool do_llm = false;
     bool do_oidn = false;
     const char* oidn_weights = "oidn-weights/rt_ldr_small.tza";
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--test") == 0) do_test = true;
         else if (strcmp(argv[i], "--bench") == 0) do_bench = true;
+        else if (strcmp(argv[i], "--bench-attention") == 0) { do_bench = true; attention_bench = true; }
+        else if (strcmp(argv[i], "--bench-attention-long") == 0) {
+            do_bench = true; attention_bench = true; attention_context = 16384u;
+        }
         else if (strcmp(argv[i], "--llm") == 0) do_llm = true;
         else if (strcmp(argv[i], "--oidn") == 0) do_oidn = true;
         else if (strcmp(argv[i], "--oidn-weights") == 0 && i + 1 < argc) {
@@ -63,7 +69,7 @@ int main(int argc, char** argv) {
 
     // Run benchmarks if requested
     if (do_bench) {
-        bench();
+        bench(attention_bench, attention_context);
     }
 
     // Run LLM demo if requested

@@ -454,6 +454,62 @@ void test_cross_entropy_loss() {
     }
 }
 
+void test_cross_entropy_precision(uint32_t positions, uint32_t vocab, uint32_t ignore_every) {
+    printf("test_cross_entropy_precision(positions=%u, vocab=%u)\n", positions, vocab);
+    Tensor logits({positions, vocab}), targets({positions}), grad(logits.shape), loss({1});
+    Tensor workspace({3u * (positions + 1u)});
+    uint32_t valid = 0;
+    for (uint32_t i = 0; i < logits.shape.count(); ++i)
+        logits.cpu()[i] = float16_t(std::sin(float(i) * 0.17f) * 4.0f);
+    for (uint32_t row = 0; row < positions; ++row) {
+        uint16_t target = uint16_t(1u + row % (vocab - 1u));
+        if (ignore_every && row % ignore_every == 0u) target = 0u;
+        else if (ignore_every && row % 17u == 0u) target = uint16_t(vocab);
+        targets.cpu()[row].value = target;
+        valid += target != 0u && target < vocab;
+    }
+    logits.cpu_upload(); targets.cpu_upload();
+    std::vector<double> timings;
+    for (uint32_t trial = 0; trial < 4; ++trial) {
+        evk::ai::GetCmd().timestamp("cross_entropy_precision", [&] {
+            evk::ai::cross_entropy_loss(logits, targets, grad, loss, trial % 2u ? &workspace : nullptr);
+        });
+        grad.cpu_download(false); loss.cpu_download(false);
+        if (trial % 2u) workspace.cpu_download(false);
+        evk::ai::SubmitCmd(true);
+        if (trial % 2u) {
+            float count = float(workspace.cpu()[0]) * 256.0f + float(workspace.cpu()[1]) + float(workspace.cpu()[2]) / 65536.0f;
+            TEST(count == float(valid));
+        }
+        const auto& time = evk::CmdTimestamps().back();
+        if (trial) timings.push_back(time.end - time.start);
+    }
+    std::sort(timings.begin(), timings.end());
+    double expected_loss = 0.0;
+    bool gradients = true;
+    uint64_t fingerprint = 1469598103934665603ull;
+    for (uint32_t row = 0; row < positions; ++row) {
+        uint16_t target = targets.cpu()[row].value;
+        bool active = target != 0u && target < vocab;
+        double maximum = -1e30, sum = 0.0;
+        for (uint32_t j = 0; j < vocab; ++j)
+            maximum = (std::max)(maximum, double(float(logits.cpu()[row * vocab + j])));
+        for (uint32_t j = 0; j < vocab; ++j)
+            sum += std::exp(double(float(logits.cpu()[row * vocab + j])) - maximum);
+        if (active) expected_loss += (maximum + std::log(sum) - float(logits.cpu()[row * vocab + target])) / valid;
+        for (uint32_t j = 0; j < vocab; ++j) {
+            uint32_t i = row * vocab + j;
+            double expected = active ? (std::exp(double(float(logits.cpu()[i])) - maximum) / sum - double(j == target)) / valid : 0.0;
+            gradients &= std::abs(double(float(grad.cpu()[i])) - expected) <= 1.2e-7 + 1e-3 * std::abs(expected);
+            fingerprint = (fingerprint ^ grad.cpu()[i].value) * 1099511628211ull;
+        }
+    }
+    TEST(gradients);
+    TEST(std::abs(float(loss.cpu()[0]) - expected_loss) < 5e-3);
+    printf("  valid=%u loss=%.9g gradient_fingerprint=%llu gpu_ms=%.6f\n", valid,
+        float(loss.cpu()[0]), static_cast<unsigned long long>(fingerprint), timings[1]);
+}
+
 void test_flash_attention_backward() {
     printf("test_flash_attention_backward()\n");
 
@@ -2066,19 +2122,18 @@ void test_ai_generic_fallback() {
     TEST(approx_eq(float(executable.output(1).cpu()[1]), 3.0f));
 }
 
-template <uint32_t N, uint32_t D>
+template <uint32_t N, uint32_t D, uint32_t B = 2u>
 void test_causal_attention_reference(float gradient_scale = 1.0f, float input_scale = 1.5f,
-                                     uint32_t window = 0) {
-    printf("test_causal_attention_reference(N=%u, D=%u, gradient_scale=%g)\n", N, D,
-           gradient_scale);
-    constexpr uint32_t B = 2u;
+                                     uint32_t window = 0, bool tiled = false, bool cpu_only = false) {
+    printf("test_causal_attention_reference(N=%u, D=%u, gradient_scale=%g, tiled=%d)\n", N, D,
+           gradient_scale, tiled);
     const float gradient_initial = gradient_scale < 1.0f ? 0.0f : 0.03125f;
     const float scale = 0.7f / std::sqrt(float(D));
     Graph graph;
     Tensor &q = graph.tensor({B, N, D});
     Tensor &k = graph.tensor({B, N, D});
     Tensor &v = graph.tensor({B, N, D});
-    Tensor &out = graph.causal_attention(q, k, v, scale, window);
+    Tensor &out = graph.causal_attention(q, k, v, scale, window, tiled ? AttentionKernel::Tiled : AttentionKernel::Materialized);
     uint32_t random = 57u;
     for (Tensor *tensor : {&q, &k, &v, &out.grad()}) {
         for (uint32_t i = 0; i < tensor->shape.count(); ++i) {
@@ -2199,8 +2254,16 @@ void test_causal_attention_reference(float gradient_scale = 1.0f, float input_sc
         TEST(finite_difference);
     }
 
+    Tensor reference({B, N, D});
+    if constexpr (N % 16u != 0u || D % 16u != 0u) {
+        // Legacy TensorCore matmul does not support these shapes. Check against
+        // the independent CPU reference and retain the initial output for causality.
+        TEST(cpu_forward);
+        TEST(cpu_backward);
+        std::copy_n(out.cpu(), out.shape.count(), reference.cpu());
+    } else {
     // The old unfused path is an independent FP16 integration reference.
-    Tensor scores({B, N, N}), probs({B, N, N}), reference({B, N, D});
+    Tensor scores({B, N, N}), probs({B, N, N});
     evk::ai::matmul(q, k, scores, false, true, false, 16, 16);
     evk::ai::apply_causal_mask(scores, window);
     evk::ai::softmax(scores, probs, scale);
@@ -2221,6 +2284,7 @@ void test_causal_attention_reference(float gradient_scale = 1.0f, float input_sc
     bool unfused_forward = true, unfused_backward = true;
     float cpu_error = 0.0f, baseline_cpu_error = 0.0f;
     float cpu_gradient_error = 0.0f, baseline_cpu_gradient_error = 0.0f;
+    float backward_difference[3] = {};
     float gradient_tolerance = (std::max)(1.2e-7f, 5e-4f * gradient_scale);
     for (uint32_t i = 0; i < expected.size(); ++i) {
         cpu_error = (std::max)(cpu_error, std::abs(float(out.cpu()[i]) - expected[i]));
@@ -2240,9 +2304,39 @@ void test_causal_attention_reference(float gradient_scale = 1.0f, float input_sc
             approx_eq(float(k.grad().cpu()[i]), float(ref_k.cpu()[i]), gradient_tolerance);
         unfused_backward &=
             approx_eq(float(v.grad().cpu()[i]), float(ref_v.cpu()[i]), gradient_tolerance);
+        backward_difference[0] = (std::max)(backward_difference[0], std::abs(float(q.grad().cpu()[i]) - float(ref_q.cpu()[i])));
+        backward_difference[1] = (std::max)(backward_difference[1], std::abs(float(k.grad().cpu()[i]) - float(ref_k.cpu()[i])));
+        backward_difference[2] = (std::max)(backward_difference[2], std::abs(float(v.grad().cpu()[i]) - float(ref_v.cpu()[i])));
     }
-    TEST(unfused_forward);
-    TEST(unfused_backward);
+    if (!unfused_forward)
+        printf("forward CPU max error: tiled %.9g, legacy %.9g; backward CPU max: tiled %.9g, legacy %.9g (tolerance %.9g)\n",
+            cpu_error, baseline_cpu_error, cpu_gradient_error, baseline_cpu_gradient_error, gradient_tolerance);
+    // The extra high-magnitude case targets CPU accuracy, not legacy FP16 sum error.
+    if (cpu_only) { TEST(cpu_forward); }
+    else { TEST(unfused_forward); }
+    if (!unfused_backward)
+        printf("backward difference dQ/dK/dV: %.9g %.9g %.9g; CPU max tiled %.9g legacy %.9g\n",
+            backward_difference[0], backward_difference[1], backward_difference[2], cpu_gradient_error, baseline_cpu_gradient_error);
+    if (tiled && (N > 1024u || cpu_only)) {
+        // Long reductions use FP32 shader accumulators. Require the original
+        // tolerance against CPU math, not agreement with legacy FP16 sum error.
+        if (cpu_gradient_error > gradient_tolerance) {
+            for (uint32_t source = 0; source < 3u; ++source) {
+                Tensor& gradient = source == 0u ? q.grad() : (source == 1u ? k.grad() : v.grad());
+                const auto& expected_gradient = source == 0u ? dq : (source == 1u ? dk : dv);
+                uint32_t worst = 0u;
+                for (uint32_t i = 1u; i < expected_gradient.size(); ++i)
+                    if (std::abs(float(gradient.cpu()[i]) - expected_gradient[i]) >
+                        std::abs(float(gradient.cpu()[worst]) - expected_gradient[worst])) worst = i;
+                printf("gradient %u worst index %u: GPU %.9g CPU %.9g nearest_half %.9g\n",
+                    source, worst, float(gradient.cpu()[worst]), expected_gradient[worst],
+                    float(float16_t(expected_gradient[worst])));
+            }
+        }
+        TEST(cpu_gradient_error <= gradient_tolerance);
+    } else {
+        TEST(unfused_backward);
+    }
     TEST(cpu_error <= baseline_cpu_error + 5e-4f);
     TEST(cpu_gradient_error <= baseline_cpu_gradient_error + gradient_tolerance);
     if (input_scale <= 1.5f && gradient_scale == 1.0f) {
@@ -2254,20 +2348,40 @@ void test_causal_attention_reference(float gradient_scale = 1.0f, float input_sc
         Tensor shared_grad({B, N, D}), shared_reference({B, N, D}), workspace({B, N, N});
         shared_grad.fill(gradient_initial);
         shared_reference.fill(gradient_initial);
-        evk::ai::causal_attention_backward(q, k, v, probs, out.grad(), shared_grad, shared_grad,
-                                           shared_grad, workspace, scale, window);
+        if (tiled)
+            evk::ai::causal_attention_tiled_backward(q, k, v, out, *graph.workspaces.front(), out.grad(),
+                shared_grad, shared_grad, shared_grad, scale, window);
+        else
+            evk::ai::causal_attention_backward(q, k, v, probs, out.grad(), shared_grad, shared_grad,
+                                               shared_grad, workspace, scale, window);
         evk::ai::matmul(probs, out.grad(), shared_reference, true, false, true, 16, 16);
         evk::ai::matmul(scores.grad(), k, shared_reference, false, false, true, 16, 16);
         evk::ai::matmul(scores.grad(), q, shared_reference, true, false, true, 16, 16);
         shared_grad.cpu_download(false);
         shared_reference.cpu_download();
         bool aliased_accumulation = true;
-        for (uint32_t i = 0; i < expected.size(); ++i)
-            aliased_accumulation &=
-                approx_eq(float(shared_grad.cpu()[i]), float(shared_reference.cpu()[i]), 5e-4f);
+        float alias_error = 0.0f, alias_actual = 0.0f, alias_expected = 0.0f;
+        for (uint32_t i = 0; i < expected.size(); ++i) {
+            float expected_alias = float(shared_reference.cpu()[i]);
+            if (cpu_only) {
+                expected_alias = float(float16_t(dq[i]));
+                expected_alias = float(float16_t(expected_alias + dk[i] - gradient_initial));
+                expected_alias = float(float16_t(expected_alias + dv[i] - gradient_initial));
+            }
+            float error = std::abs(float(shared_grad.cpu()[i]) - expected_alias);
+            if (error > alias_error) {
+                alias_error = error;
+                alias_actual = float(shared_grad.cpu()[i]);
+                alias_expected = expected_alias;
+            }
+            aliased_accumulation &= approx_eq(float(shared_grad.cpu()[i]), expected_alias, 5e-4f);
+        }
+        if (!aliased_accumulation) printf("alias maximum error %.9g: GPU %.9g CPU %.9g\n", alias_error, alias_actual, alias_expected);
         TEST(aliased_accumulation);
     }
 
+    }
+    if (cpu_only) std::copy_n(out.cpu(), out.shape.count(), reference.cpu());
     for (uint32_t b = 0; b < B; ++b)
         for (uint32_t f = 0; f < D; ++f) {
             k.cpu()[(b * N + N - 1u) * D + f] = float16_t(3.0f);
@@ -2287,26 +2401,38 @@ void test_causal_attention_reference(float gradient_scale = 1.0f, float input_sc
     TEST(causal);
 }
 
-void test_causal_attention_mask_sentinel() {
+template<uint32_t N = 16, uint32_t D = 16>
+void test_causal_attention_mask_sentinel(bool tiled = false) {
+    printf("test_causal_attention_mask_sentinel(N=%u, D=%u, tiled=%d)\n", N, D, tiled);
     Graph graph;
-    Tensor &q = graph.tensor({1, 16, 16});
-    Tensor &k = graph.tensor({1, 16, 16});
-    Tensor &v = graph.tensor({1, 16, 16}).fill(1.0f);
-    std::fill_n(q.cpu(), 256, float16_t(0.0f));
-    std::fill_n(k.cpu(), 256, float16_t(0.0f));
-    for (uint32_t row = 0; row < 16; ++row) {
-        q.cpu()[row * 16] = float16_t(65504.0f);
-        k.cpu()[row * 16] = float16_t(-1.0f);
+    Tensor &q = graph.tensor({1, N, D});
+    Tensor &k = graph.tensor({1, N, D});
+    Tensor &v = graph.tensor({1, N, D}).fill(1.0f);
+    std::fill_n(q.cpu(), N * D, float16_t(0.0f));
+    std::fill_n(k.cpu(), N * D, float16_t(0.0f));
+    for (uint32_t row = 0; row < N; ++row) {
+        q.cpu()[row * D] = float16_t(65504.0f);
+        k.cpu()[row * D] = float16_t(-1.0f);
     }
     q.cpu_upload();
     k.cpu_upload();
-    Tensor &out = graph.causal_attention(q, k, v);
+    Tensor &out = graph.causal_attention(q, k, v, 0.0f, 0u, tiled ? AttentionKernel::Tiled : AttentionKernel::Materialized);
     graph.eval();
     out.cpu_download();
     bool all_masked_zero = true;
-    for (uint32_t i = 0; i < 256; ++i)
+    for (uint32_t i = 0; i < N * D; ++i)
         all_masked_zero &= float(out.cpu()[i]) == 0.0f;
     TEST(all_masked_zero);
+    out.grad().fill(1.0f);
+    for (Tensor* tensor : {&q, &k, &v}) tensor->grad().fill(0.125f);
+    out.backward_fn();
+    bool all_masked_gradients = true;
+    for (Tensor* tensor : {&q, &k, &v}) {
+        tensor->grad().cpu_download();
+        for (uint32_t i = 0; i < N * D; ++i)
+            all_masked_gradients &= float(tensor->grad().cpu()[i]) == 0.125f;
+    }
+    TEST(all_masked_gradients);
     // Invalid visible logits must remain visible as NaNs, not be silently masked.
     q.cpu()[0] = float16_t(std::nanf(""));
     q.cpu_upload();
@@ -2504,48 +2630,65 @@ void test_matmul_rope_workspace(bool normalize = false, uint8_t tile_n = 16) {
     TEST(equivalent);
 }
 
-void test_shared_attention_gradients() {
-    printf("test_shared_attention_gradients()\n");
+void test_shared_attention_gradients(bool tiled = false, uint32_t length = 16u) {
+    printf("test_shared_attention_gradients(tiled=%d, length=%u)\n", tiled, length);
     Graph graph;
-    Tensor& q = graph.tensor({1, 16, 16});
+    Tensor& q = graph.tensor({1u, length, 16u});
+    Tensor& other_q = graph.tensor(q.shape);
     Tensor& k = graph.tensor(q.shape);
     Tensor& v = graph.tensor(q.shape);
-    for (Tensor* input : {&q, &k, &v}) {
+    for (Tensor* input : {&q, &other_q, &k, &v}) {
         for (uint32_t i = 0; i < input->shape.count(); ++i)
-            input->cpu()[i] = float16_t(std::sin(float(i)) * 0.5f);
+            input->cpu()[i] = float16_t(std::sin(float(i) + (input == &other_q ? 1.3f : 0.0f)) * 0.5f);
         input->cpu_upload();
     }
     Tensor& weight = graph.tensor(q.shape).fill(0.125f);
-    Tensor& a = graph.causal_attention(q, k, v);
+    Tensor& other_weight = graph.tensor(q.shape).fill(0.0625f);
+    AttentionKernel kernel = tiled ? AttentionKernel::Tiled : AttentionKernel::Materialized;
+    Tensor& a = graph.causal_attention(q, k, v, 0.0f, 0u, kernel);
     Tensor& seed = graph.tensor({1});
     seed.backward_fn = [&]() { evk::ai::add(a.grad(), weight, a.grad()); };
     graph.eval(true);
-    std::vector<float> single;
-    for (Tensor* input : {&q, &k, &v}) {
+    std::vector<float> expected;
+    for (Tensor* input : {&q, &other_q, &k, &v}) {
         input->grad().cpu_download();
         for (uint32_t i = 0; i < input->shape.count(); ++i)
-            single.push_back(float(input->grad().cpu()[i]));
+            expected.push_back(float(input->grad().cpu()[i]));
     }
+
     seed.backward_fn = nullptr;
-    Tensor& b = graph.causal_attention(q, k, v);
-    graph.tensor({1}).backward_fn = [&]() {
+    Tensor& b = graph.causal_attention(other_q, k, v, 0.0f, 0u, kernel);
+    Tensor& combined_seed = graph.tensor({1});
+    combined_seed.backward_fn = [&]() { evk::ai::add(b.grad(), other_weight, b.grad()); };
+    graph.eval(true);
+    uint32_t index = 0;
+    for (Tensor* input : {&q, &other_q, &k, &v}) {
+        input->grad().cpu_download();
+        for (uint32_t i = 0; i < input->shape.count(); ++i)
+            expected[index++] += float(input->grad().cpu()[i]);
+    }
+
+    // Distinct queries/upstream gradients catch accidental reuse of another
+    // consumer's normalizer as well as lost shared K/V gradient contributions.
+    combined_seed.backward_fn = [&]() {
         evk::ai::add(a.grad(), weight, a.grad());
-        evk::ai::add(b.grad(), weight, b.grad());
+        evk::ai::add(b.grad(), other_weight, b.grad());
     };
     graph.eval(true);
     bool shared_gradient_sum = true;
-    uint32_t index = 0;
-    for (Tensor* input : {&q, &k, &v}) {
+    index = 0;
+    for (Tensor* input : {&q, &other_q, &k, &v}) {
         input->grad().cpu_download();
         for (uint32_t i = 0; i < input->shape.count(); ++i)
-            shared_gradient_sum &= approx_eq(float(input->grad().cpu()[i]), 2.0f * single[index++], 5e-4f);
+            shared_gradient_sum &= approx_eq(float(input->grad().cpu()[i]), expected[index++], 5e-4f);
     }
     TEST(shared_gradient_sum);
 }
 
-void test_attention_cache(uint32_t window) {
-    printf("test_attention_cache(window=%u)\n", window);
-    constexpr uint32_t B = 2, N = 48, D = 64;
+template<uint32_t N = 48>
+void test_attention_cache(uint32_t window, bool tiled = false) {
+    printf("test_attention_cache(N=%u, window=%u, tiled=%d)\n", N, window, tiled);
+    constexpr uint32_t B = 2, D = 64;
     Graph graph;
     Tensor& q = graph.tensor({B, N, D});
     Tensor& k = graph.tensor({B, N, D});
@@ -2557,7 +2700,7 @@ void test_attention_cache(uint32_t window) {
     }
     Tensor& qr = graph.rope(q);
     Tensor& kr = graph.rope(k);
-    Tensor& output = graph.causal_attention(qr, kr, v, 0.0f, window);
+    Tensor& output = graph.causal_attention(qr, kr, v, 0.0f, window, tiled ? AttentionKernel::Tiled : AttentionKernel::Materialized);
     graph.eval();
     output.cpu_download();
     uint32_t capacity = window ? window : N;
@@ -2648,7 +2791,191 @@ void test_causal_depthwise_conv(uint32_t kernel) {
     TEST(recurrent);
 }
 
+template<uint32_t D = 64>
+void test_cached_attention_long(uint32_t capacity) {
+    printf("test_cached_attention_long(capacity=%u, width=%u)\n", capacity, D);
+    Tensor q({1, 1, D}), k({1, capacity, D}), v(k.shape), out(q.shape);
+    for (uint32_t d = 0; d < D; ++d) q.cpu()[d] = float16_t(std::cos(float(d)) * 0.5f);
+    for (uint32_t i = 0; i < k.shape.count(); ++i) {
+        k.cpu()[i] = float16_t(std::sin(float(i) * 0.013f));
+        v.cpu()[i] = float16_t(std::cos(float(i) * 0.017f));
+    }
+    q.cpu_upload(); k.cpu_upload(); v.cpu_upload();
+    bool reference = true;
+    for (uint32_t position : {0u, 31u, 32u, 255u, capacity / 2u, capacity + 3u}) {
+        uint32_t count = (std::min)(position + 1u, capacity), start = (position + 1u - count) % capacity;
+        std::vector<double> scores(count), expected(D, 0.0);
+        double maximum = -1e30, denominator = 0;
+        for (uint32_t t = 0; t < count; ++t) {
+            uint32_t slot = (start + t) % capacity;
+            double dot = 0;
+            for (uint32_t d = 0; d < D; ++d)
+                dot += double(float(q.cpu()[d])) * float(k.cpu()[slot * D + d]);
+            scores[t] = dot / std::sqrt(double(D));
+            maximum = (std::max)(maximum, scores[t]);
+        }
+        for (uint32_t t = 0; t < count; ++t) {
+            double p = std::exp(scores[t] - maximum);
+            denominator += p;
+            for (uint32_t d = 0; d < D; ++d)
+                expected[d] += p * float(v.cpu()[((start + t) % capacity) * D + d]);
+        }
+        evk::ai::cached_attention(q, k, v, out, position);
+        out.cpu_download();
+        for (uint32_t d = 0; d < D; ++d)
+            reference &= approx_eq(float(out.cpu()[d]), float(expected[d] / denominator), 0.002f);
+    }
+    TEST(reference);
+}
+
+void test_tiled_attention_dispatch_boundary() {
+    printf("test_tiled_attention_dispatch_boundary()\n");
+    Graph graph;
+    Tensor& q = graph.tensor({2, 65537, 1}).fill(0.5f);
+    Tensor& k = graph.tensor(q.shape).fill(0.25f);
+    Tensor& v = graph.tensor(q.shape).fill(0.75f);
+    Tensor& out = graph.causal_attention(q, k, v, 1.0f, 1u);
+    for (Tensor* input : {&q, &k, &v}) input->grad().fill(0.03125f);
+    out.grad().fill(0.125f);
+    out.forward_fn();
+    out.backward_fn();
+    bool equivalent = true;
+    out.cpu_download();
+    for (Tensor* input : {&q, &k, &v}) input->grad().cpu_download();
+    for (uint32_t i = 0; i < out.shape.count(); ++i) {
+        equivalent &= float(out.cpu()[i]) == 0.75f;
+        equivalent &= float(q.grad().cpu()[i]) == 0.03125f;
+        equivalent &= float(k.grad().cpu()[i]) == 0.03125f;
+        equivalent &= float(v.grad().cpu()[i]) == 0.15625f;
+    }
+    TEST(equivalent);
+}
+
+template<uint32_t D = 16u>
+void test_long_attention_accumulation() {
+    printf("test_long_attention_accumulation(D=%u)\n", D);
+    Graph graph;
+    constexpr uint32_t n = 16384u, d = D;
+    Tensor& q = graph.tensor({1u, n, d});
+    Tensor& k = graph.tensor(q.shape);
+    Tensor& v = graph.tensor(q.shape);
+    Tensor& out = graph.causal_attention(q, k, v);
+    q.fill(0.0f); k.fill(0.0f); v.fill(0.25f);
+    out.forward_fn();
+    out.cpu_download();
+    float error = 0.0f;
+    bool finite = true;
+    for (uint32_t i = 0u; i < out.shape.count(); ++i) {
+        finite &= std::isfinite(float(out.cpu()[i]));
+        error = (std::max)(error, std::abs(float(out.cpu()[i]) - 0.25f));
+    }
+    printf("  constant-value maximum error %.9g\n", error);
+    TEST(finite);
+    TEST(error < 5e-4f);
+    // Preserve the original small upstream gradient when reducing context length.
+    // Scaling it with n would make FP16 output rounding exceed the fixed tolerance.
+    constexpr float upstream = 1.0f / 131072.0f;
+    out.grad().fill(upstream);
+    q.grad().fill(0.0f); k.grad().fill(0.0f); v.grad().fill(0.0f);
+    out.backward_fn();
+    q.grad().cpu_download(false); k.grad().cpu_download(false); v.grad().cpu_download();
+    double expected = 0.0;
+    float gradient_error = 0.0f;
+    uint32_t worst_row = 0u;
+    float worst_actual = 0.0f, worst_expected = 0.0f;
+    for (uint32_t row = n; row-- > 0u;) {
+        expected += double(upstream) / double(row + 1u);
+        for (uint32_t f = 0u; f < d; ++f) {
+            uint32_t i = row * d + f;
+            finite &= std::isfinite(float(q.grad().cpu()[i])) && std::isfinite(float(k.grad().cpu()[i])) &&
+                std::isfinite(float(v.grad().cpu()[i]));
+            if (std::abs(float(v.grad().cpu()[i]) - float(expected)) > gradient_error) {
+                worst_row = row;
+                worst_actual = float(v.grad().cpu()[i]);
+                worst_expected = float(expected);
+            }
+            gradient_error = (std::max)({gradient_error, std::abs(float(q.grad().cpu()[i])),
+                std::abs(float(k.grad().cpu()[i])), std::abs(float(v.grad().cpu()[i]) - float(expected))});
+        }
+    }
+    printf("  constant-value gradient maximum error %.9g at row %u (%.9g vs %.9g)\n",
+        gradient_error, worst_row, worst_actual, worst_expected);
+    TEST(finite);
+    TEST(gradient_error < 1.2e-7f);
+}
+
+void test_attention_kernel_selection() {
+    printf("test_attention_kernel_selection()\n");
+    for (uint32_t d : {16u, 64u, 256u})
+    for (uint32_t n : {19u, 112u, 256u, 512u, 1024u, 1040u, 2048u})
+    for (uint32_t window : {0u, 1u}) {
+        Graph graph;
+        Tensor& q = graph.tensor({1, n, d}).fill(0.5f);
+        Tensor& k = graph.tensor(q.shape).fill(0.125f);
+        Tensor& v = graph.tensor(q.shape).fill(0.25f);
+        Tensor& out = graph.causal_attention(q, k, v, 1.0f, window);
+        bool quadratic = false;
+        for (const auto& tensor : graph.nodes)
+            if (tensor.get() != &q && tensor.get() != &k && tensor.get() != &v && tensor.get() != &out)
+                quadratic |= tensor->shape == Shape({1, n, n});
+        for (const auto& tensor : graph.workspaces)
+            quadratic |= tensor->shape == Shape({1, n, n});
+        bool expected_quadratic = n % 16u == 0u && n < (d <= 64u ? 1024u : 2048u);
+        TEST(quadratic == expected_quadratic);
+        // Only the one-token window is exactly representable here. Full-attention
+        // numerical accuracy is checked by the CPU-reference tests above.
+        if (window == 0u) continue;
+        out.forward_fn();
+        out.cpu_download();
+        bool correct = true;
+        for (uint32_t i = 0; i < out.shape.count(); ++i) correct &= float(out.cpu()[i]) == 0.25f;
+        TEST(correct);
+    }
+}
+
 void run_ai_kernel_tests() {
+    test_causal_attention_reference<16, 16>(1.0f, 1.5f, 0u, true);
+    test_causal_attention_reference<256, 64>(1e-4f, 1.5f, 0u, true, true);
+    test_causal_attention_reference<256, 256, 1>(1e-4f, 1.5f, 0u, true, true);
+    test_causal_attention_reference<256, 64, 1>(1e-4f, 1.5f, 0u, true, true);
+    test_causal_attention_reference<256, 64, 1>(1.0f, 1.5f, 0u, true, true);
+    test_causal_attention_reference<256, 64, 1>(1e-4f, 6.0f, 7u, true, true);
+    test_causal_attention_reference<256, 256, 1>(1.0f, 1.5f, 0u, true, true);
+    test_causal_attention_reference<256, 256, 1>(1e-4f, 6.0f, 7u, true, true);
+    test_causal_attention_reference<512, 256, 1>(1e-4f, 6.0f, 7u, true, true);
+    test_causal_attention_reference<1024, 256, 1>(1e-4f, 1.5f, 0u, true, true);
+    test_causal_attention_reference<1040, 64>(1e-4f, 6.0f, 0u, true, true);
+    test_cross_entropy_precision(1792u, 144u, 13u);
+    test_cross_entropy_precision(4099u, 17u, 13u);
+    test_cross_entropy_precision(4100u, 17u, 13u);
+    test_cross_entropy_precision(65537u, 2u, 0u);
+    test_cross_entropy_precision(19u, 17u, 1u);
+    test_attention_kernel_selection();
+    test_long_attention_accumulation();
+    test_long_attention_accumulation<256u>();
+    test_causal_attention_mask_sentinel<16>(true);
+    test_causal_attention_mask_sentinel<256, 256>(true);
+    test_causal_attention_mask_sentinel<256, 64>(true);
+    test_causal_attention_mask_sentinel<1040>(true);
+    test_causal_attention_mask_sentinel<19>(true);
+    test_tiled_attention_dispatch_boundary();
+    test_causal_attention_reference<19, 17>(1.0f, 1.5f, 0u, true);
+    test_causal_attention_reference<19, 17>(1e-4f, 6.0f, 7u, true);
+    test_causal_attention_reference<112, 256>(1.0f, 1.5f, 0u, true);
+    test_causal_attention_reference<32, 64>(1.0f, 1.5f, 7u, true);
+    test_causal_attention_reference<112, 256>(1e-4f, 1.5f, 0u, true);
+    test_causal_attention_reference<112, 256>(1e-4f, 6.0f, 0u, true);
+    test_causal_attention_reference<1040, 16>(1.0f, 1.5f, 0u, true);
+    test_causal_attention_reference<1040, 64>(1.0f, 1.5f, 0u, true);
+    test_causal_attention_reference<32, 512>(1e-4f, 6.0f, 0u, true);
+    test_attention_cache<272>(0u, true);
+    test_attention_cache<272>(257u, true);
+    test_shared_attention_gradients(true);
+    test_shared_attention_gradients(true, 1040u);
+    test_attention_cache<1040>(0u, true);
+    for (uint32_t capacity : {257u, 4096u, 16384u}) test_cached_attention_long(capacity);
+    test_cached_attention_long<17>(257u);
+    test_cached_attention_long<256>(16384u);
     for (uint32_t kernel : {1u, 3u, 4u, 12u}) test_causal_depthwise_conv(kernel);
     test_swiglu_ffn_workspace();
     test_swiglu_ffn_workspace(true);

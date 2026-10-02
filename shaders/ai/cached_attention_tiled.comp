@@ -1,0 +1,77 @@
+#include "../common/evk.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+CONSTANT(0) uint capacity = 112u;
+CONSTANT(1) uint width = 256u;
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+PUSH(BufferFp16 query; BufferFp16 keyCache; BufferFp16 valueCache; BufferFp16 outputBuffer;
+     uint position;)
+shared float16_t scores[256];
+shared float16_t partial[8u * width];
+shared float16_t logsum[16];
+// Eight key partitions, each with fixed tile scratch and register accumulation.
+// Their normalized outputs and log-normalizers are merged within the workgroup.
+COMPUTE(256, 1, 1)
+void main() {
+    uint lane = gl_SubgroupInvocationID, warp = gl_SubgroupID, b = gl_WorkGroupID.x;
+    uint count = min(position + 1u, capacity);
+    uint start = (position + 1u - count) % capacity;
+    uint chunk = ((count + 255u) / 256u) * 32u;
+    float maximum = -3.402823466e+38, denominator = 0.0;
+    float result[(width + 31u) / 32u];
+    for (uint f = 0u; f < (width + 31u) / 32u; ++f) result[f] = 0.0;
+    for (uint local_tile = 0u; local_tile < chunk; local_tile += 32u) {
+        uint tile = warp * chunk + local_tile;
+        uint size = tile < count ? min(32u, count - tile) : 0u;
+        for (uint t = 0u; t < size; ++t) {
+            uint slot = (start + tile + t) % capacity;
+            float dot = 0.0;
+            for (uint f = lane; f < width; f += 32u)
+                dot += float(query.x[b * width + f]) * float(keyCache.x[(b * capacity + slot) * width + f]);
+            dot = subgroupAdd(dot);
+            if (lane == 0u) scores[warp * 32u + t] = float16_t(dot);
+        }
+        barrier();
+        float score = lane < size ? float(scores[warp * 32u + lane]) * inversesqrt(float(width)) : -3.402823466e+38;
+        float next_maximum = max(maximum, subgroupMax(score));
+        float rescale = exp(maximum - next_maximum);
+        float probability = lane < size ? exp(score - next_maximum) : 0.0;
+        denominator = denominator * rescale + subgroupAdd(probability);
+        scores[warp * 32u + lane] = float16_t(probability);
+        barrier();
+        for (uint f = lane; f < width; f += 32u) {
+            float sum = result[f / 32u] * rescale;
+            for (uint t = 0u; t < size; ++t) {
+                uint slot = (start + tile + t) % capacity;
+                sum += float(scores[warp * 32u + t]) * float(valueCache.x[(b * capacity + slot) * width + f]);
+            }
+            result[f / 32u] = sum;
+        }
+        maximum = next_maximum;
+        barrier();
+    }
+    for (uint f = lane; f < width; f += 32u)
+        partial[warp * width + f] = float16_t(denominator > 0.0 ? result[f / 32u] / denominator : 0.0);
+    if (lane == 0u) {
+        float lse = denominator > 0.0 ? maximum + log(denominator) : -65504.0;
+        // Explicit truncation prevents a cast roundtrip losing the residual.
+        float high = uintBitsToFloat(floatBitsToUint(lse) & 0xffffe000u);
+        if (abs(lse) < 0.00006103515625) high = 0.0;
+        logsum[warp * 2u] = float16_t(high);
+        logsum[warp * 2u + 1u] = float16_t(lse - high);
+    }
+    barrier();
+    float lse = lane < 8u ? float(logsum[lane * 2u]) + float(logsum[lane * 2u + 1u]) : -65504.0;
+    float global_max = subgroupMax(lse);
+    float weight = lane < 8u ? exp(lse - global_max) : 0.0;
+    float weight_sum = subgroupAdd(weight);
+    for (uint f = gl_LocalInvocationID.x; f < width; f += 256u) {
+        float value = 0.0;
+        for (uint w = 0u; w < 8u; ++w) {
+            float part_lse = float(logsum[w * 2u]) + float(logsum[w * 2u + 1u]);
+            value += exp(part_lse - global_max) * float(partial[w * width + f]);
+        }
+        outputBuffer.x[b * width + f] = float16_t(value / weight_sum);
+    }
+}

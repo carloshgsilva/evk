@@ -96,6 +96,7 @@ namespace evk::ai {
         evk::Pipeline rms_norm_bwd;
         evk::Pipeline matmul_weight_bwd;
         evk::Buffer cross_entropy_accum;
+        uint32_t cross_entropy_capacity = 0;
         evk::Buffer flash_scratch;
         uint64_t flash_scratch_elems = 0;
     };
@@ -178,6 +179,7 @@ namespace evk::ai {
     static std::unordered_map<uint64_t, evk::Pipeline> flash_configs;
     static std::unordered_map<uint64_t, evk::Pipeline> causal_attention_configs;
     static std::unordered_map<uint64_t, evk::Pipeline> cached_attention_configs;
+    static std::unordered_map<uint64_t, evk::Pipeline> tiled_attention_configs;
 
     static uint32_t causal_attention_tile_width(uint32_t d) {
         return d % 64u == 0u ? 64u : 16u;
@@ -321,6 +323,7 @@ namespace evk::ai {
         pipelines->matmul_weight_bwd =
             create_named_compute_pipeline("matmul_weight_bwd");
         pipelines->cross_entropy_accum = {};
+        pipelines->cross_entropy_capacity = 0;
         pipelines->flash_scratch = {};
         pipelines->flash_scratch_elems = 0;
     }
@@ -331,6 +334,7 @@ namespace evk::ai {
         flash_configs.clear();
         causal_attention_configs.clear();
         cached_attention_configs.clear();
+        tiled_attention_configs.clear();
     }
 
     void matmul(Tensor& a, Tensor& b, Tensor& c, bool transpose_a, bool transpose_b,
@@ -494,6 +498,53 @@ namespace evk::ai {
         cmd.computeBarrier();
     }
 
+    static void dispatch_tiled_attention(Tensor& q, Tensor& k, Tensor& v, Tensor& stats,
+        Tensor& output, Tensor& dy, Tensor& dq, Tensor& dk, Tensor& dv,
+        float scale, uint32_t window, uint32_t stage) {
+        assert(q.shape.rank() == 3u && q.shape == k.shape && q.shape == v.shape);
+        uint32_t b = q.shape[0], n = q.shape[1], d = q.shape[2];
+        uint32_t splits = tiled_attention_splits(b, n, d);
+        assert(stats.shape == Shape({b, n, 9u + (splits > 1u ? 3u * splits * d : 0u)}));
+        bool cooperative = (stage == 0u || stage >= 4u) && n % 16u == 0u && d % 16u == 0u && evk::GetFeatures().coopmat;
+        const char* shader = cooperative ? (stage == 0u ? "causal_attention_tiled_fwd" : "causal_attention_tiled_bwd") : "causal_attention_tiled";
+        uint32_t wide_accumulation = n > 128u ? 1u : 0u;
+        uint32_t partitions = cooperative && stage >= 5u ? splits : 1u;
+        uint32_t aliased = stage == 7u && (dq.buffer.GetReference() == dk.buffer.GetReference() ||
+            dq.buffer.GetReference() == dv.buffer.GetReference() || dk.buffer.GetReference() == dv.buffer.GetReference());
+        auto& pipeline = tiled_attention_configs[hash_combine(d, stage, cooperative, wide_accumulation, partitions, aliased)];
+        if (!pipeline) pipeline = evk::CreatePipeline({
+            .name = shader, .CS = detail::load_embedded_shader(shader),
+            .constants = evk::Constant{d, stage, wide_accumulation, partitions, aliased},
+        });
+        auto& cmd = GetCmd();
+        cmd.bind(pipeline);
+        cmd.push(evk::Constant{q.buffer.GetReference(), k.buffer.GetReference(), v.buffer.GetReference(),
+            output.buffer.GetReference(), stats.buffer.GetReference(), dy.buffer.GetReference(),
+            dq.buffer.GetReference(), dk.buffer.GetReference(), dv.buffer.GetReference(), n, window, scale});
+        cmd.dispatch(cooperative ? n / 16u : (std::min)(n, 65535u), b,
+            cooperative ? (stage == 7u ? 1u : partitions * (stage == 8u ? 2u : 1u)) : (n + 65534u) / 65535u);
+        cmd.computeBarrier();
+    }
+
+    void causal_attention_tiled(Tensor& q, Tensor& k, Tensor& v, Tensor& stats,
+                                Tensor& output, float scale, uint32_t window) {
+        assert(output.shape == q.shape);
+        dispatch_tiled_attention(q, k, v, stats, output, output, output, output, output, scale, window, 0u);
+    }
+
+    void causal_attention_tiled_backward(Tensor& q, Tensor& k, Tensor& v, Tensor& output, Tensor& stats,
+        Tensor& grad_output, Tensor& grad_q, Tensor& grad_k, Tensor& grad_v, float scale, uint32_t window) {
+        assert(output.shape == q.shape);
+        assert(q.shape == grad_output.shape && q.shape == grad_q.shape && q.shape == grad_k.shape && q.shape == grad_v.shape);
+        bool cooperative = q.shape[1] % 16u == 0u && q.shape[2] % 16u == 0u && evk::GetFeatures().coopmat;
+        uint32_t last_stage = cooperative && tiled_attention_splits(q.shape[0], q.shape[1], q.shape[2]) > 1u ?
+            7u : (cooperative ? 6u : 2u);
+        if (last_stage == 7u)
+            dispatch_tiled_attention(q, k, v, stats, output, grad_output, grad_q, grad_k, grad_v, scale, window, 8u);
+        for (uint32_t stage = last_stage == 7u ? 7u : (cooperative ? 4u : 1u); stage <= last_stage; ++stage)
+            dispatch_tiled_attention(q, k, v, stats, output, grad_output, grad_q, grad_k, grad_v, scale, window, stage);
+    }
+
     void attention_cache_append(Tensor& k, Tensor& v, Tensor& key_cache, Tensor& value_cache,
                                 uint32_t position, float rope_base) {
         assert(k.shape == v.shape && key_cache.shape == value_cache.shape);
@@ -514,10 +565,11 @@ namespace evk::ai {
         assert(q.shape == output.shape && key_cache.shape == value_cache.shape);
         assert(q.shape.rank() == 3u && q.shape[0] == 1u && key_cache.shape.rank() == 3u);
         uint32_t b = key_cache.shape[0], c = key_cache.shape[1], d = key_cache.shape[2];
-        assert(c > 0u && c <= 16384u && d > 0u && q.shape[1] == b && q.shape[2] == d);
+        assert(c > 0u && d > 0u && q.shape[1] == b && q.shape[2] == d);
         auto& pipeline = cached_attention_configs[hash_combine(c, d)];
+        const char* shader = c <= 256u ? "cached_attention" : "cached_attention_tiled";
         if (!pipeline) pipeline = evk::CreatePipeline({
-            .name = "cached_attention", .CS = detail::load_embedded_shader("cached_attention"),
+            .name = shader, .CS = detail::load_embedded_shader(shader),
             .constants = evk::Constant{c, d},
         });
         auto& cmd = GetCmd();
@@ -1155,7 +1207,7 @@ namespace evk::ai {
         cmd.computeBarrier();
     }
 
-    void cross_entropy_loss(Tensor& logits, Tensor& targets, Tensor& grad, Tensor& result) {
+    void cross_entropy_loss(Tensor& logits, Tensor& targets, Tensor& grad, Tensor& result, Tensor* workspace) {
         assert(logits.shape.rank() == 2);
         assert(targets.shape.rank() == 1);
         assert(result.shape.rank() == 1 && result.shape[0] == 1);
@@ -1165,51 +1217,50 @@ namespace evk::ai {
         assert(targets.shape[0] == totalPositions);
         assert(grad.shape[0] == totalPositions && grad.shape[1] == vocabSize);
 
-        // Allocate scratch for loss/count accumulation (float[2])
-        if (!pipelines->cross_entropy_accum) {
+        assert(totalPositions < UINT32_MAX / 3u);
+        uint32_t elements = 3u * (totalPositions + 1u);
+        assert(!workspace || workspace->shape.count() >= elements);
+        // Graph callers reuse graph scratch; direct calls retain a reusable FP16 buffer.
+        if (!workspace && pipelines->cross_entropy_capacity < elements) {
             pipelines->cross_entropy_accum = evk::CreateBuffer({
-                .size = sizeof(float) * 2,
-                .usage = evk::BufferUsage::Storage | evk::BufferUsage::TransferDst,
+                .size = uint64_t(elements) * sizeof(float16_t),
+                .usage = evk::BufferUsage::Storage,
             });
+            pipelines->cross_entropy_capacity = elements;
         }
+        uint64_t accum = workspace ? workspace->buffer.GetReference() : pipelines->cross_entropy_accum.GetReference();
 
         auto& cmd = evk::ai::GetCmd();
-        // Reset accumulators using GPU fill (uint32 pattern)
-        cmd.fill(pipelines->cross_entropy_accum, 0u, sizeof(float) * 2);
-        cmd.barrier();
-
-        const uint32_t WORKGROUP_SIZE = 256u;
-
         // Pass 1: count valid targets to derive global scaling
-        uint32_t countGroups = (totalPositions + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
         cmd.bind(pipelines->cross_entropy_count);
         cmd.push(evk::Constant{
             targets.buffer.GetReference(),
-            pipelines->cross_entropy_accum.GetReference(),
+            accum,
             totalPositions,
             vocabSize,
         });
-        cmd.dispatch(countGroups, 1, 1);
+        cmd.dispatch(1u, 1u, 1u);
         cmd.computeBarrier();
 
-        // Pass 2: Compute logits softmax, unscaled grad, accumulate unscaled loss
+        // Pass 2: compute scaled gradients and per-row mean-loss terms.
         cmd.bind(pipelines->cross_entropy);
         cmd.push(evk::Constant{
             logits.buffer.GetReference(),
             targets.buffer.GetReference(),
             grad.buffer.GetReference(),
-            pipelines->cross_entropy_accum.GetReference(),
+            accum,
             vocabSize,
             totalPositions,
         });
-        cmd.dispatch(totalPositions, 1, 1);
+        cmd.dispatch((std::min)(totalPositions, 65535u), 1u, (totalPositions + 65534u) / 65535u);
         cmd.computeBarrier();
 
         // Pass 3: Write mean loss
         cmd.bind(pipelines->cross_entropy_scale);
         cmd.push(evk::Constant{
             result.buffer.GetReference(),
-            pipelines->cross_entropy_accum.GetReference(),
+            accum,
+            totalPositions,
         });
         cmd.dispatch(1u, 1, 1);
         cmd.computeBarrier();
