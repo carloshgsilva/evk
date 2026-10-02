@@ -405,7 +405,13 @@ namespace evk {
         viewci.components.g = VK_COMPONENT_SWIZZLE_G;
         viewci.components.b = VK_COMPONENT_SWIZZLE_B;
         viewci.components.a = VK_COMPONENT_SWIZZLE_A;
-        viewci.viewType = state->desc.isCube ? VK_IMAGE_VIEW_TYPE_CUBE : (state->desc.extent.depth == 1 ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_3D);
+        if (state->desc.isCube) {
+            viewci.viewType = state->desc.layerCount == 6 ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+        } else if (state->desc.extent.depth > 1) {
+            viewci.viewType = VK_IMAGE_VIEW_TYPE_3D;
+        } else {
+            viewci.viewType = state->desc.layerCount == 1 ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        }
         viewci.subresourceRange.aspectMask = aspects;
         viewci.subresourceRange.baseMipLevel = 0;
         viewci.subresourceRange.levelCount = state->desc.mipCount;
@@ -2359,11 +2365,13 @@ namespace evk {
     void Cmd::clear(Image image, ClearValue value) {
         CommandBufferData* cb = (CommandBufferData*)_internal;
         EVK_ASSERT(cb->insideRenderPass == false, "can't be used inside a render pass.");
-        barrier(image, ImageLayout::Undefined, ImageLayout::TransferDst);
         const ImageDesc& desc = GetDesc(image);
+        barrier(image, ImageLayout::Undefined, ImageLayout::TransferDst, 0, desc.mipCount, 0, desc.layerCount);
         if (DoesFormatHaveDepth(desc.format)) {
             VkClearDepthStencilValue vkValue = {.depth = value.depthStencil.depth, .stencil = value.depthStencil.stencil};
-            VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, .baseMipLevel = 0, .levelCount = desc.mipCount, .baseArrayLayer = 0, .layerCount = desc.layerCount};
+            VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (desc.format == Format::D24UnormS8Uint) aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            VkImageSubresourceRange range = {.aspectMask = aspects, .baseMipLevel = 0, .levelCount = desc.mipCount, .baseArrayLayer = 0, .layerCount = desc.layerCount};
             vkCmdClearDepthStencilImage(cb->cmd, ToInternal(image).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &vkValue, 1, &range);
         } else {
             VkClearColorValue vkValue = {.uint32 = {value.color.uint32[0], value.color.uint32[1], value.color.uint32[2], value.color.uint32[3]}};
