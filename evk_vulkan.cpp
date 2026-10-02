@@ -625,7 +625,7 @@ namespace evk {
         VkPipelineDepthStencilStateCreateInfo depthStencilInfo = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         depthStencilInfo.depthTestEnable = desc.depthTest;
         depthStencilInfo.depthWriteEnable = desc.depthWrite;
-        depthStencilInfo.depthCompareOp = VK_COMPARE_OP_LESS;
+        depthStencilInfo.depthCompareOp = static_cast<VkCompareOp>(desc.depthOp);
         depthStencilInfo.depthBoundsTestEnable = true;
         depthStencilInfo.minDepthBounds = 0.0f;
         depthStencilInfo.maxDepthBounds = 1.0f;
@@ -2336,7 +2336,7 @@ namespace evk {
         vkCmdBindIndexBuffer(cb->cmd, ToInternal(buffer).buffer, rawOffset, useHalf ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     }
     
-    void Cmd::beginRender(Image* attachments, ClearValue* clearValues, int attachmentCount, Image* resolveAttachments) {
+    void Cmd::beginRender(Image* attachments, ClearValue* clearValues, int attachmentCount, Image* resolveAttachments, bool loadDepth) {
         CommandBufferData* cb = (CommandBufferData*)_internal;
         EVK_ASSERT(cb->insideRenderPass == false, "render pass already bound!");
         EVK_ASSERT(attachments, "attachments = nullptr");
@@ -2372,7 +2372,8 @@ namespace evk {
             attach.resolveMode = VK_RESOLVE_MODE_NONE;
             attach.resolveImageView = VK_NULL_HANDLE;
             attach.resolveImageLayout = {};
-            attach.loadOp = clearValues ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attach.loadOp = loadDepth && (isDepthStencil || isStencilOnly) ? VK_ATTACHMENT_LOAD_OP_LOAD
+                : clearValues ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             attach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             if (HasFlag(desc.usage, ImageUsage::Transient)) {
                 attach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;

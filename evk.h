@@ -231,7 +231,7 @@ namespace evk {
         bool wireframe = false;
         bool frontClockwise = false;
 
-        Op depthOp = Op::Never;
+        Op depthOp = Op::Less;
         bool depthTest = false;
         bool depthWrite = false;
         SampleCount sampleCount = SampleCount::One;
@@ -421,7 +421,7 @@ namespace evk {
         void index(Buffer& buffer, bool useHalf = false, uint64_t offset = 0);
 
         // Rendering
-        void beginRender(Image* attachments, ClearValue* clearValues, int attachmentCount, Image* resolveAttachments = nullptr);
+        void beginRender(Image* attachments, ClearValue* clearValues, int attachmentCount, Image* resolveAttachments = nullptr, bool loadDepth = false);
         void endRender();
         void beginPresent();
         void beginPresent(Image* attachments, ClearValue* clearValues, int attachmentCount);
