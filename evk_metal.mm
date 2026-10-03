@@ -206,6 +206,7 @@ struct State {
     std::vector<id<MTLResource>> writes;
     std::vector<std::pair<uint64_t, Resource*>> deletions;
     std::vector<TimestampEntry> timestamps;
+    SubmissionTiming submissionTiming;
     uint64_t nextSubmission = 1;
     uint64_t completed = 0;
     uint64_t liveBytes = 0;
@@ -420,6 +421,9 @@ void ReadTimestamps(Command& cmd) {
 void Complete(Command& cmd) {
     Require(cmd.buffer.status != MTLCommandBufferStatusError, "GPU submission failed: %s", cmd.buffer.error.localizedDescription.UTF8String);
     S().completed = std::max(S().completed, cmd.submission);
+    double start = cmd.buffer.GPUStartTime, end = cmd.buffer.GPUEndTime;
+    bool valid = start > 0 && end >= start;
+    S().submissionTiming = {cmd.submission, valid ? (end - start) * 1000 : 0, valid};
     ReadTimestamps(cmd);
     cmd.pending = false;
     cmd.pipeline.release(); cmd.vertices.release(); cmd.indices.release();
@@ -812,6 +816,7 @@ MemoryBudget GetMemoryBudget() {
     return budget;
 }
 const std::vector<TimestampEntry>& CmdTimestamps() { return S().timestamps; }
+const SubmissionTiming& CmdSubmissionTiming() { return S().submissionTiming; }
 
 Cmd& CmdBegin(Queue) {
     @autoreleasepool {

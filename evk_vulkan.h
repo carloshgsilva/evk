@@ -165,6 +165,7 @@ namespace evk {
 
         // Last completed timestamps
         std::vector<TimestampEntry> lastTimestamps;
+        SubmissionTiming submissionTiming;
 
         // Swapchain
         VkSurfaceKHR surface;

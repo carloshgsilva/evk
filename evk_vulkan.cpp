@@ -1594,6 +1594,9 @@ namespace evk {
                 CHECK_VK(vkCreateFence(S.device, &fenceci, nullptr, &cb.fence));
 
                 if (S.features.timestamps) {
+                    S.lastTimestamps.reserve(PERF_QUERY_COUNT / 2);
+                    cb.timestampNames.reserve(PERF_QUERY_COUNT / 2);
+                    cb.queries.reserve(PERF_QUERY_COUNT);
                     VkQueryPoolCreateInfo queryPoolci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
                     queryPoolci.queryCount = PERF_QUERY_COUNT;
                     queryPoolci.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -1890,6 +1893,7 @@ namespace evk {
     // Helper to read timestamps from a completed command buffer and store in lastTimestamps
     static void ReadTimestampsFromCommandBuffer(CommandBufferData& cb) {
         auto& S = GetState();
+        S.submissionTiming = {cb.submissionIndex};
         
         if (!S.features.timestamps || cb.queryPool == VK_NULL_HANDLE) {
             S.lastTimestamps.clear();
@@ -2078,6 +2082,8 @@ namespace evk {
         return GetState().lastTimestamps;
     }
     
+    const SubmissionTiming& CmdSubmissionTiming() { return GetState().submissionTiming; }
+
     // Cmd class method implementations
     void Cmd::push(void* data, uint32_t size, uint32_t offset) {
         CommandBufferData* cb = (CommandBufferData*)_internal;

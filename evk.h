@@ -369,6 +369,16 @@ namespace evk {
     // Updated when CmdWait() is called or when a command buffer completes during CmdBegin()
     const std::vector<TimestampEntry>& CmdTimestamps();
 
+    struct SubmissionTiming {
+        uint64_t submission = 0;
+        double gpuMilliseconds = 0;
+        bool valid = false;
+    };
+    // Metal command-buffer execution time; unavailable backends return valid=false.
+    // Valid means the timing result is available, not that it covers every GPU operation.
+    // Updated on command completion; CPU submission and display presentation are excluded.
+    const SubmissionTiming& CmdSubmissionTiming();
+
     // Queue type for command buffer submission
     enum class Queue {
         Graphics,  // Graphics queue (also supports compute and transfer)
