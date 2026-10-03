@@ -945,6 +945,11 @@ namespace evk {
         GState = new State();
         State& S = GetState();
 
+        bool debugUtilsEnabled = desc.enableValidation;
+        for (const auto& extension : desc.instanceExtensions) {
+            if (extension == VK_EXT_DEBUG_UTILS_EXTENSION_NAME) debugUtilsEnabled = true;
+        }
+
         S.storageCount = desc.bindless.storageBufferCount;
         S.imageCount = desc.bindless.imageCount;
         S.samplerCount = desc.bindless.imageCount;
@@ -1472,7 +1477,7 @@ namespace evk {
         }
 
         // Get PFNs
-        { 
+        if (debugUtilsEnabled) {
             #define EVK_PFN(name) S.name = (PFN_##name)vkGetDeviceProcAddr(S.device, #name)
             EVK_PFN(vkCmdBeginDebugUtilsLabelEXT);
             EVK_PFN(vkCmdEndDebugUtilsLabelEXT);
