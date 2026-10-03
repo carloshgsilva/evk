@@ -1,6 +1,7 @@
 #include "evk_metal_shader.h"
 
 #include <spirv_msl.hpp>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -12,6 +13,74 @@
 #include <vector>
 
 namespace {
+class MetalCompiler : public spirv_cross::CompilerMSL {
+public:
+    using CompilerMSL::CompilerMSL;
+
+protected:
+    std::vector<uint32_t> samplerAliases;
+
+    void emit_entry_point_declarations() override {
+        CompilerMSL::emit_entry_point_declarations();
+        for (const auto& image : get_shader_resources().sampled_images) {
+            if (!has_extended_decoration(image.id, spirv_cross::SPIRVCrossDecorationOverlappingBinding)) continue;
+            if (std::find(samplerAliases.begin(), samplerAliases.end(), image.id) != samplerAliases.end()) continue;
+            samplerAliases.push_back(image.id);
+            auto base = get_extended_decoration(image.id, spirv_cross::SPIRVCrossDecorationOverlappingBinding);
+            if (get_variable_data_type(get<spirv_cross::SPIRVariable>(base)).basetype != spirv_cross::SPIRType::SampledImage) {
+                throw std::runtime_error("Overlapping sampler requires a sampled-image base binding");
+            }
+            get<spirv_cross::SPIRFunction>(ir.default_entry_point).fixup_hooks_in.push_back([this, id = image.id, base] {
+                auto* meta = ir.find_meta(base);
+                bool override = meta && meta->decoration.qualified_alias_explicit_override;
+                if (meta) meta->decoration.qualified_alias_explicit_override = false;
+                auto baseName = to_name(base, false);
+                if (meta) meta->decoration.qualified_alias_explicit_override = override;
+                statement("const device auto& ", to_sampler_expression(id), " = ", baseName, "Smplr;");
+            });
+        }
+    }
+
+    void emit_instruction(const spirv_cross::Instruction& instruction) override {
+        if (instruction.op != spv::OpRayQueryGetIntersectionTriangleVertexPositionsKHR) {
+            CompilerMSL::emit_instruction(instruction);
+            return;
+        }
+        const auto* operands = stream(instruction);
+        flush_variable_declaration(operands[2]);
+        auto query = to_expression(operands[2]);
+        bool committed = get<spirv_cross::SPIRConstant>(operands[3]).scalar_i32() != 0;
+        auto data = query + (committed ? ".get_committed_primitive_data()" : ".get_candidate_primitive_data()");
+        auto pointer = "reinterpret_cast<const device packed_float3*>(" + data + ")";
+        emit_op(operands[0], operands[1], "spvUnsafeArray<float3, 3>({float3(" + pointer + "[0]), float3(" + pointer
+            + "[1]), float3(" + pointer + "[2])})", false);
+    }
+
+    void CopyMembers(const spirv_cross::SPIRType& type, const std::string& target, const std::string& source) {
+        for (uint32_t index = 0; index < type.member_types.size(); ++index) {
+            auto member = "." + to_member_name(type, index);
+            const auto& memberType = get<spirv_cross::SPIRType>(type.member_types[index]);
+            if (memberType.basetype == spirv_cross::SPIRType::Struct && memberType.array.empty()) {
+                CopyMembers(memberType, target + member, source + member);
+            } else {
+                statement(target, member, " = ", source, member, ";");
+            }
+        }
+    }
+
+    void emit_store_statement(uint32_t target, uint32_t source) override {
+        const auto& type = expression_type(source);
+        auto* variable = maybe_get_backing_variable(target);
+        if (type.basetype != spirv_cross::SPIRType::Struct || !type.array.empty() || !variable
+            || !get_buffer_block_flags(variable->self).get(spv::DecorationVolatile)) {
+            CompilerMSL::emit_store_statement(target, source);
+            return;
+        }
+        CopyMembers(type, to_expression(target), to_unpacked_expression(source));
+        register_write(target);
+    }
+};
+
 std::vector<uint8_t> Read(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error("Cannot open " + path.string());
@@ -29,7 +98,7 @@ void Translate(const std::filesystem::path& input, const std::filesystem::path& 
     const auto bytes = Read(input);
     std::vector<uint32_t> words(bytes.size() / 4);
     std::memcpy(words.data(), bytes.data(), bytes.size());
-    spirv_cross::CompilerMSL compiler(std::move(words));
+    MetalCompiler compiler(std::move(words));
     const auto stage = compiler.get_execution_model();
     auto options = compiler.get_msl_options();
     options.msl_version = 30000;
@@ -51,7 +120,7 @@ void Translate(const std::filesystem::path& input, const std::filesystem::path& 
             : binding == 1 ? spirv_cross::SPIRType::SampledImage
             : binding == 2 ? spirv_cross::SPIRType::Image
             : spirv_cross::SPIRType::UInt64;
-        resource.count = binding == 0 ? evk::metal::BUFFER_COUNT : evk::metal::IMAGE_COUNT;
+        resource.count = binding == 0 ? evk::metal::BUFFER_COUNT : binding == 3 ? evk::metal::TLAS_COUNT : evk::metal::IMAGE_COUNT;
         resource.msl_buffer = binding == 0 ? evk::metal::STORAGE_ID : evk::metal::TLAS_ID;
         resource.msl_texture = binding == 1 ? evk::metal::TEXTURE_ID : evk::metal::IMAGE_ID;
         resource.msl_sampler = evk::metal::SAMPLER_ID;

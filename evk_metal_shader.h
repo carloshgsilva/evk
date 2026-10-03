@@ -6,6 +6,7 @@
 namespace evk::metal {
 constexpr uint32_t BUFFER_COUNT = 16384;
 constexpr uint32_t IMAGE_COUNT = 16384;
+constexpr uint32_t TLAS_COUNT = 16384;
 constexpr uint32_t STORAGE_ID = 0;
 constexpr uint32_t TEXTURE_ID = BUFFER_COUNT;
 constexpr uint32_t SAMPLER_ID = TEXTURE_ID + IMAGE_COUNT;
@@ -27,7 +28,7 @@ inline uint64_t ShaderHash(std::span<const uint8_t> bytes) {
 
 struct ShaderInfo {
     uint32_t magic = 0x4D534C31;
-    uint32_t version = 1;
+    uint32_t version = 2;
     ShaderStage stage = ShaderStage::Vertex;
     uint32_t groupX = 1;
     uint32_t groupY = 1;

@@ -15,6 +15,7 @@
 
 #include "evk.h"
 #include "evk_metal_blit.h"
+#include "evk_metal_ray.h"
 #include "evk_metal_shader.h"
 
 namespace evk {
@@ -118,6 +119,27 @@ struct MetalPipeline : Resource {
     id<MTLDepthStencilState> depth = nil;
     MTLSize group = {1, 1, 1};
 };
+struct MetalBLAS : Resource {
+    BLASDesc geometry;
+    MTLPrimitiveAccelerationStructureDescriptor* desc = nil;
+    id<MTLAccelerationStructure> acceleration = nil;
+    Buffer triangleData;
+    uint64_t scratchBytes = 0;
+    bool built = false;
+    ~MetalBLAS();
+};
+struct MetalTLAS : Resource {
+    MTLIndirectInstanceAccelerationStructureDescriptor* desc = nil;
+    id<MTLAccelerationStructure> acceleration = nil;
+    Buffer instances;
+    Buffer count;
+    std::vector<BLAS> references;
+    uint64_t scratchBytes = 0;
+    uint32_t instanceCount = 0;
+    bool allowUpdate = false;
+    bool built = false;
+    ~MetalTLAS();
+};
 
 struct Marker { const char* name = nullptr; uint32_t first = 0; uint32_t last = 0; };
 struct Command {
@@ -126,12 +148,16 @@ struct Command {
     id<MTLRenderCommandEncoder> render = nil;
     id<MTLComputeCommandEncoder> compute = nil;
     id<MTLBlitCommandEncoder> blit = nil;
+    id<MTLAccelerationStructureCommandEncoder> acceleration = nil;
     MTLRenderPassDescriptor* renderPass = nil;
     MTLComputePassDescriptor* computePass = nil;
     MTLBlitPassDescriptor* blitPass = nil;
+    MTLAccelerationStructurePassDescriptor* accelerationPass = nil;
     id<MTLCounterSampleBuffer> counters = nil;
     Buffer staging;
     uint64_t stagingOffset = 0;
+    uint64_t scratchOffset = 0;
+    uint64_t scratchBytes = 0;
     uint64_t submission = 0;
     bool recording = false;
     bool pending = false;
@@ -159,12 +185,14 @@ struct State {
     id<MTLLibrary> blitLibrary = nil;
     id<MTLDepthStencilState> blitDepth = nil;
     id<MTLDepthStencilState> blitColorDepth = nil;
+    id<MTLComputePipelineState> triangleData = nil;
     std::array<std::array<id<MTLRenderPipelineState>, 3>, uint32_t(Format::D32Sfloat) + 1> blitPipelines;
     CAMetalLayer* layer = nil;
     NSView* view = nil;
     Features features;
     Slots buffers;
     Slots images;
+    Slots tlas;
     std::array<Command, COMMAND_COUNT> commands;
     std::vector<id<MTLResource>> reads;
     std::vector<id<MTLResource>> writes;
@@ -181,6 +209,8 @@ State& S() { Require(G != nullptr, "Backend is not initialized"); return *G; }
 MetalBuffer& B(const Buffer& buffer) { Require(bool(buffer), "Invalid buffer"); return *static_cast<MetalBuffer*>(buffer.res); }
 MetalImage& I(const Image& image) { Require(bool(image), "Invalid image"); return *static_cast<MetalImage*>(image.res); }
 MetalPipeline& P(const Pipeline& pipeline) { Require(bool(pipeline), "Invalid pipeline"); return *static_cast<MetalPipeline*>(pipeline.res); }
+MetalBLAS& A(const BLAS& blas) { Require(bool(blas), "Invalid BLAS"); return *static_cast<MetalBLAS*>(blas.res); }
+MetalTLAS& T(const TLAS& tlas) { Require(bool(tlas), "Invalid TLAS"); return *static_cast<MetalTLAS*>(tlas.res); }
 Command& C(const Cmd& cmd) { Require(cmd._internal != nullptr, "Invalid command buffer"); return *static_cast<Command*>(cmd._internal); }
 
 void AddResource(id<MTLResource> resource, bool writable) {
@@ -216,6 +246,12 @@ MetalImage::~MetalImage() {
     }
     if (texture) RemoveResource(texture);
 }
+MetalBLAS::~MetalBLAS() { RemoveResource(acceleration); }
+MetalTLAS::~MetalTLAS() {
+    [S().arguments setAccelerationStructure:nil atIndex:metal::TLAS_ID + resourceid];
+    S().tlas.Release(resourceid);
+    RemoveResource(acceleration);
+}
 
 void Retire() {
     auto& list = S().deletions;
@@ -230,7 +266,9 @@ void EndEncoder(Command& cmd) {
     if (cmd.render) [cmd.render endEncoding];
     if (cmd.compute) [cmd.compute endEncoding];
     if (cmd.blit) [cmd.blit endEncoding];
+    if (cmd.acceleration) [cmd.acceleration endEncoding];
     cmd.render = nil; cmd.compute = nil; cmd.blit = nil;
+    cmd.acceleration = nil;
 }
 uint32_t EncoderSamples(Command& cmd) {
     if (!cmd.counters) return 0;
@@ -294,6 +332,50 @@ uint64_t StageUpload(Command& cmd, const void* bytes, uint64_t size) {
     std::memcpy(static_cast<uint8_t*>(cmd.staging.GetPtr()) + offset, bytes, size);
     cmd.stagingOffset = offset + size;
     return offset;
+}
+
+uint64_t Scratch(Command& cmd, uint64_t size) {
+    if (size <= cmd.scratchBytes) return cmd.scratchOffset;
+    uint64_t offset = (cmd.stagingOffset + 255) & ~uint64_t(255);
+    Require(offset <= STAGING_BYTES && size <= STAGING_BYTES - offset, "Acceleration structure scratch exceeds the command staging budget");
+    cmd.scratchOffset = offset; cmd.scratchBytes = size;
+    cmd.stagingOffset = offset + size;
+    return offset;
+}
+
+void BuildAcceleration(Command& cmd, id<MTLAccelerationStructure> acceleration, MTLAccelerationStructureDescriptor* desc, uint64_t scratchBytes, bool update) {
+    Require(!cmd.render, "Acceleration structure build inside a render pass");
+    EndEncoder(cmd);
+    uint64_t offset = Scratch(cmd, scratchBytes);
+    auto attachment = cmd.accelerationPass.sampleBufferAttachments[0];
+    if (cmd.counters) {
+        uint32_t first = EncoderSamples(cmd);
+        attachment.sampleBuffer = cmd.counters;
+        attachment.startOfEncoderSampleIndex = first;
+        attachment.endOfEncoderSampleIndex = first + 3;
+    }
+    cmd.acceleration = [cmd.buffer accelerationStructureCommandEncoderWithDescriptor:cmd.accelerationPass];
+    Require(cmd.acceleration != nil, "Cannot create acceleration structure encoder");
+    auto& state = S();
+    if (!state.reads.empty()) [cmd.acceleration useResources:state.reads.data() count:state.reads.size() usage:MTLResourceUsageRead];
+    if (!state.writes.empty()) [cmd.acceleration useResources:state.writes.data() count:state.writes.size() usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    if (update) {
+        [cmd.acceleration refitAccelerationStructure:acceleration descriptor:desc destination:acceleration scratchBuffer:B(cmd.staging).buffer scratchBufferOffset:offset];
+    } else {
+        [cmd.acceleration buildAccelerationStructure:acceleration descriptor:desc scratchBuffer:B(cmd.staging).buffer scratchBufferOffset:offset];
+    }
+    EndEncoder(cmd);
+}
+
+void PrepareTriangleDataPipeline() {
+    if (S().triangleData) return;
+    NSError* error = nil;
+    MTLCompileOptions* options = [MTLCompileOptions new];
+    options.languageVersion = MTLLanguageVersion3_0;
+    auto library = [S().device newLibraryWithSource:[[NSString alloc] initWithUTF8String:metal::TRIANGLE_DATA_SHADER] options:options error:&error];
+    Require(library != nil, "Cannot compile triangle-data shader: %s", error.localizedDescription.UTF8String);
+    S().triangleData = [S().device newComputePipelineStateWithFunction:[library newFunctionWithName:@"triangle_data"] error:&error];
+    Require(S().triangleData != nil, "Cannot create triangle-data pipeline: %s", error.localizedDescription.UTF8String);
 }
 
 void ReadTimestamps(Command& cmd) {
@@ -387,7 +469,7 @@ id<MTLFunction> Function(const std::vector<uint8_t>& bytes, const ConstantRaw& c
     std::string stem = std::string(directory ? directory : ".cache/metal/shaders") + "/" + hash;
     std::ifstream metadata(stem + ".info", std::ios::binary);
     Require(bool(metadata.read(reinterpret_cast<char*>(&info), sizeof(info))), "Missing shader metadata: %s.info", stem.c_str());
-    Require(info.magic == 0x4D534C31 && info.version == 1 && info.hash == metal::ShaderHash(bytes), "Invalid shader metadata: %s", stem.c_str());
+    Require(info.magic == 0x4D534C31 && info.version == 2 && info.hash == metal::ShaderHash(bytes), "Invalid shader metadata: %s", stem.c_str());
     NSError* error = nil;
     NSURL* url = [NSURL fileURLWithPath:[[NSString alloc] initWithUTF8String:(stem + ".metallib").c_str()]];
     id<MTLLibrary> library = [S().device newLibraryWithURL:url error:&error];
@@ -570,19 +652,21 @@ bool InitializeEVK(const EvkDesc& desc) {
         state.device = MTLCreateSystemDefaultDevice();
         Require(state.device != nil && state.device.argumentBuffersSupport == MTLArgumentBuffersTier2, "A tier-2 Metal device is required");
         state.queue = [state.device newCommandQueueWithMaxCommandBufferCount:COMMAND_COUNT];
+        state.features.raytracing = state.device.supportsRaytracing;
         state.features.maxFramebufferSampleCount = GetSupportedSampleCount(SampleCount::SixtyFour);
         state.buffers.Initialize(std::min(desc.bindless.storageBufferCount, metal::BUFFER_COUNT));
         state.images.Initialize(std::min(desc.bindless.imageCount, metal::IMAGE_COUNT));
-        state.reads.reserve(metal::BUFFER_COUNT + metal::IMAGE_COUNT + 32);
-        state.writes.reserve(metal::BUFFER_COUNT + metal::IMAGE_COUNT + 32);
-        state.deletions.reserve(metal::BUFFER_COUNT + metal::IMAGE_COUNT + 4096);
+        state.tlas.Initialize(std::min(desc.bindless.tlasCount, metal::TLAS_COUNT));
+        state.reads.reserve(metal::BUFFER_COUNT + metal::IMAGE_COUNT + metal::TLAS_COUNT + 4096);
+        state.writes.reserve(metal::BUFFER_COUNT + metal::IMAGE_COUNT + metal::TLAS_COUNT + 4096);
+        state.deletions.reserve(2 * (metal::BUFFER_COUNT + metal::IMAGE_COUNT + metal::TLAS_COUNT) + 4096);
         state.timestamps.reserve(TIMESTAMP_COUNT);
         NSMutableArray<MTLArgumentDescriptor*>* arguments = [NSMutableArray new];
-        for (uint32_t binding = 0; binding < 4; ++binding) {
+        for (uint32_t binding = 0; binding < 5; ++binding) {
             MTLArgumentDescriptor* argument = [MTLArgumentDescriptor new];
-            argument.index = binding == 0 ? metal::STORAGE_ID : binding == 1 ? metal::TEXTURE_ID : binding == 2 ? metal::SAMPLER_ID : metal::IMAGE_ID;
-            argument.arrayLength = binding == 0 ? metal::BUFFER_COUNT : metal::IMAGE_COUNT;
-            argument.dataType = binding == 0 ? MTLDataTypePointer : binding == 2 ? MTLDataTypeSampler : MTLDataTypeTexture;
+            argument.index = binding == 0 ? metal::STORAGE_ID : binding == 1 ? metal::TEXTURE_ID : binding == 2 ? metal::SAMPLER_ID : binding == 3 ? metal::IMAGE_ID : metal::TLAS_ID;
+            argument.arrayLength = binding == 0 ? metal::BUFFER_COUNT : binding == 4 ? metal::TLAS_COUNT : metal::IMAGE_COUNT;
+            argument.dataType = binding == 0 ? MTLDataTypePointer : binding == 2 ? MTLDataTypeSampler : binding == 4 ? MTLDataTypeInstanceAccelerationStructure : MTLDataTypeTexture;
             argument.textureType = MTLTextureType2D;
             argument.access = binding == 0 || binding == 3 ? MTLBindingAccessReadWrite : MTLBindingAccessReadOnly;
             [arguments addObject:argument];
@@ -610,6 +694,7 @@ bool InitializeEVK(const EvkDesc& desc) {
             cmd.renderPass = [MTLRenderPassDescriptor new];
             cmd.computePass = [MTLComputePassDescriptor new];
             cmd.blitPass = [MTLBlitPassDescriptor new];
+            cmd.accelerationPass = [MTLAccelerationStructurePassDescriptor new];
             cmd.staging = CreateBuffer({.name = "Metal command staging", .size = STAGING_BYTES, .usage = BufferUsage::TransferSrc, .memoryType = MemoryType::CPU_TO_GPU});
             if (state.features.timestamps) {
                 MTLCounterSampleBufferDescriptor* counters = [MTLCounterSampleBufferDescriptor new];
@@ -619,7 +704,7 @@ bool InitializeEVK(const EvkDesc& desc) {
                 Require(cmd.counters != nil, "Cannot create timestamp buffer: %s", error.localizedDescription.UTF8String);
             }
         }
-        std::printf("[evk] Backend Metal | %s | stage_boundary_timestamps=%d | device_ray_api=%d | ray_paths_ready=0\n", state.device.name.UTF8String, state.features.timestamps, state.device.supportsRaytracing);
+        std::printf("[evk] Backend Metal | %s | stage_boundary_timestamps=%d | ray_api=%d\n", state.device.name.UTF8String, state.features.timestamps, state.features.raytracing);
         return true;
     }
 }
@@ -667,7 +752,7 @@ Cmd& CmdBegin(Queue) {
             cmd.buffer = [S().queue commandBuffer];
             Require(cmd.buffer != nil, "Cannot create command buffer");
             cmd.recording = true;
-            cmd.stagingOffset = 0; cmd.markerCount = 0; cmd.samples = 0; cmd.push.fill(0);
+            cmd.stagingOffset = 0; cmd.scratchBytes = 0; cmd.markerCount = 0; cmd.samples = 0; cmd.push.fill(0);
             return cmd.api;
         }
         auto oldest = std::min_element(S().commands.begin(), S().commands.end(), [](const Command& a, const Command& b) { return a.submission < b.submission; });
@@ -1008,10 +1093,134 @@ void Cmd::beginPresent(Image* attachments, ClearValue* clearValues, int count) {
     }
 }
 void Cmd::endPresent() { endRender(); }
-BLAS CreateBLAS(const BLASDesc&) { Require(false, "Native acceleration structure implementation is pending"); return {}; }
-TLAS CreateTLAS(uint32_t, bool) { Require(false, "Native acceleration structure implementation is pending"); return {}; }
-void Cmd::buildBLAS(const std::vector<BLAS>&, bool) { Require(false, "Native BLAS build implementation is pending"); }
-void Cmd::buildTLAS(const TLAS&, const std::vector<BLASInstance>&, bool) { Require(false, "Native TLAS build implementation is pending"); }
+BLAS CreateBLAS(const BLASDesc& geometry) {
+    @autoreleasepool {
+        Require(S().device.supportsRaytracing, "Device does not support ray tracing");
+        auto* blas = new MetalBLAS;
+        blas->geometry = geometry;
+        MTLAccelerationStructureGeometryDescriptor* desc = nil;
+        if (geometry.geometry == GeometryType::Triangles) {
+            Require(geometry.stride >= 12 && geometry.stride % 4 == 0 && geometry.vertexCount && geometry.triangleCount
+                && GetDesc(geometry.vertices).size >= uint64_t(geometry.stride) * geometry.vertexCount
+                && GetDesc(geometry.indices).size >= uint64_t(geometry.triangleCount) * 12, "Invalid triangle BLAS input");
+            auto triangles = [MTLAccelerationStructureTriangleGeometryDescriptor new];
+            triangles.vertexBuffer = B(geometry.vertices).buffer;
+            triangles.vertexFormat = MTLAttributeFormatFloat3;
+            triangles.vertexStride = geometry.stride;
+            triangles.indexBuffer = B(geometry.indices).buffer;
+            triangles.indexType = MTLIndexTypeUInt32;
+            triangles.triangleCount = geometry.triangleCount;
+            blas->triangleData = CreateBuffer({.name = "BLAS triangle positions", .size = uint64_t(geometry.triangleCount) * 36,
+                .usage = BufferUsage::AccelerationStructure, .memoryType = MemoryType::GPU});
+            triangles.primitiveDataBuffer = B(blas->triangleData).buffer;
+            triangles.primitiveDataStride = triangles.primitiveDataElementSize = 36;
+            PrepareTriangleDataPipeline();
+            desc = triangles;
+            desc.opaque = YES;
+        } else {
+            Require(geometry.geometry == GeometryType::AABBs && geometry.stride >= sizeof(AABB) && geometry.stride % 4 == 0
+                && geometry.aabbsCount && GetDesc(geometry.aabbs).size >= uint64_t(geometry.stride) * geometry.aabbsCount, "Invalid AABB BLAS input");
+            auto boxes = [MTLAccelerationStructureBoundingBoxGeometryDescriptor new];
+            boxes.boundingBoxBuffer = B(geometry.aabbs).buffer;
+            boxes.boundingBoxStride = geometry.stride;
+            boxes.boundingBoxCount = geometry.aabbsCount;
+            desc = boxes;
+            desc.opaque = NO;
+        }
+        desc.allowDuplicateIntersectionFunctionInvocation = NO;
+        blas->desc = [MTLPrimitiveAccelerationStructureDescriptor new];
+        blas->desc.geometryDescriptors = @[desc];
+        blas->desc.usage = MTLAccelerationStructureUsageRefit;
+        auto sizes = [S().device accelerationStructureSizesWithDescriptor:blas->desc];
+        blas->scratchBytes = std::max(sizes.buildScratchBufferSize, sizes.refitScratchBufferSize);
+        blas->acceleration = [S().device newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+        Require(blas->acceleration != nil, "Cannot allocate BLAS");
+        AddResource(blas->acceleration, false);
+        return BLAS(blas);
+    }
+}
+TLAS CreateTLAS(uint32_t maxCount, bool allowUpdate) {
+    @autoreleasepool {
+        Require(S().device.supportsRaytracing && maxCount > 0, "Invalid TLAS capacity or unsupported device");
+        auto* tlas = new MetalTLAS;
+        tlas->allowUpdate = allowUpdate;
+        tlas->references.resize(maxCount);
+        tlas->instances = CreateBuffer({.name = "TLAS instances", .size = uint64_t(maxCount) * sizeof(MTLIndirectAccelerationStructureInstanceDescriptor),
+            .usage = BufferUsage::TransferDst | BufferUsage::AccelerationStructureInput, .memoryType = MemoryType::GPU});
+        tlas->count = CreateBuffer({.name = "TLAS instance count", .size = 4, .usage = BufferUsage::TransferDst, .memoryType = MemoryType::GPU});
+        tlas->desc = [MTLIndirectInstanceAccelerationStructureDescriptor new];
+        tlas->desc.instanceDescriptorBuffer = B(tlas->instances).buffer;
+        tlas->desc.instanceCountBuffer = B(tlas->count).buffer;
+        tlas->desc.maxInstanceCount = maxCount;
+        tlas->desc.instanceDescriptorStride = sizeof(MTLIndirectAccelerationStructureInstanceDescriptor);
+        tlas->desc.usage = MTLAccelerationStructureUsagePreferFastBuild;
+        if (allowUpdate) tlas->desc.usage |= MTLAccelerationStructureUsageRefit;
+        auto sizes = [S().device accelerationStructureSizesWithDescriptor:tlas->desc];
+        tlas->scratchBytes = std::max(sizes.buildScratchBufferSize, sizes.refitScratchBufferSize);
+        tlas->acceleration = [S().device newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+        Require(tlas->acceleration != nil, "Cannot allocate TLAS");
+        AddResource(tlas->acceleration, false);
+        tlas->resourceid = S().tlas.Allocate();
+        [S().arguments setAccelerationStructure:tlas->acceleration atIndex:metal::TLAS_ID + tlas->resourceid];
+        return TLAS(tlas);
+    }
+}
+void Cmd::buildBLAS(const std::vector<BLAS>& blases, bool update) {
+    @autoreleasepool {
+        auto& cmd = C(*this);
+        for (const auto& reference : blases) {
+            if (!reference) continue;
+            auto& blas = A(reference);
+            Require(!update || blas.built, "Cannot refit an unbuilt BLAS");
+            if (blas.geometry.geometry == GeometryType::Triangles) {
+                Compute(cmd);
+                uint32_t params[] = {blas.geometry.stride, blas.geometry.triangleCount};
+                [cmd.compute setComputePipelineState:S().triangleData];
+                [cmd.compute setBuffer:B(blas.geometry.vertices).buffer offset:0 atIndex:0];
+                [cmd.compute setBuffer:B(blas.geometry.indices).buffer offset:0 atIndex:1];
+                [cmd.compute setBuffer:B(blas.triangleData).buffer offset:0 atIndex:2];
+                [cmd.compute setBytes:params length:sizeof(params) atIndex:3];
+                [cmd.compute dispatchThreadgroups:MTLSizeMake((params[1] + 63) / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
+            BuildAcceleration(cmd, blas.acceleration, blas.desc, blas.scratchBytes, update);
+            blas.built = true;
+        }
+    }
+}
+void Cmd::buildTLAS(const TLAS& reference, const std::vector<BLASInstance>& instances, bool update) {
+    @autoreleasepool {
+        auto& tlas = T(reference);
+        auto& cmd = C(*this);
+        Require(instances.size() <= tlas.references.size(), "TLAS instance capacity exceeded");
+        Require(!update || (tlas.allowUpdate && tlas.built && instances.size() == tlas.instanceCount), "Invalid TLAS refit");
+        uint64_t offset = (cmd.stagingOffset + 255) & ~uint64_t(255);
+        uint64_t bytes = instances.size() * sizeof(MTLIndirectAccelerationStructureInstanceDescriptor);
+        Require(offset <= STAGING_BYTES && bytes <= STAGING_BYTES - offset, "TLAS upload exceeds the command staging budget");
+        auto* data = reinterpret_cast<MTLIndirectAccelerationStructureInstanceDescriptor*>(static_cast<uint8_t*>(cmd.staging.GetPtr()) + offset);
+        for (uint32_t index = 0; index < instances.size(); ++index) {
+            const auto& instance = instances[index];
+            auto& blas = A(instance.blas);
+            Require(blas.built, "TLAS references an unbuilt BLAS");
+            auto& desc = data[index];
+            desc = {};
+            for (uint32_t column = 0; column < 4; ++column) {
+                for (uint32_t row = 0; row < 3; ++row) desc.transformationMatrix.columns[column].elements[row] = instance.transform[row * 4 + column];
+            }
+            desc.options = MTLAccelerationStructureInstanceOptionDisableTriangleCulling;
+            desc.mask = instance.mask;
+            desc.userID = instance.customId;
+            desc.accelerationStructureID = blas.acceleration.gpuResourceID;
+            tlas.references[index] = instance.blas;
+        }
+        for (uint32_t index = uint32_t(instances.size()); index < tlas.instanceCount; ++index) tlas.references[index].release();
+        cmd.stagingOffset = offset + bytes;
+        if (bytes) copy(cmd.staging, tlas.instances, bytes, offset);
+        uint32_t count = uint32_t(instances.size());
+        copy(&count, tlas.count, sizeof(count));
+        BuildAcceleration(cmd, tlas.acceleration, tlas.desc, tlas.scratchBytes, update);
+        tlas.instanceCount = count; tlas.built = true;
+    }
+}
 void Shutdown() {
     if (!G) return;
     @autoreleasepool {

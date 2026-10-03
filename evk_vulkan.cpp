@@ -2681,7 +2681,8 @@ namespace evk {
         VkDeviceSize scratchSize = {0};
         for (auto& blasRes : blases) {
             if (!blasRes) continue;
-            scratchSize = std::max(scratchSize, ToInternal(blasRes).sizeInfo.buildScratchSize);
+            const auto& sizes = ToInternal(blasRes).sizeInfo;
+            scratchSize = std::max(scratchSize, update ? sizes.updateScratchSize : sizes.buildScratchSize);
         }
 
         if(scratchSize == 0u)
@@ -2693,12 +2694,11 @@ namespace evk {
         for (auto& blasRes : blases) {
             if (!blasRes) continue;
             Internal_BLAS& blas = ToInternal(blasRes);
+            EVK_ASSERT(!update || blas.accStructureDeviceAddress != 0, "Cannot update an unbuilt BLAS");
             blas.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
             blas.buildInfo.scratchData = {scratchBuffer.address};
             blas.buildInfo.dstAccelerationStructure = blas.accel;
-            if (update) {
-                blas.buildInfo.srcAccelerationStructure = blas.accel;
-            }
+            blas.buildInfo.srcAccelerationStructure = update ? blas.accel : VK_NULL_HANDLE;
 
             auto range = blas.ranges.data();
             S.vkCmdBuildAccelerationStructuresKHR(cb->cmd, 1, &blas.buildInfo, &range);
@@ -2722,10 +2722,6 @@ namespace evk {
             };
             blas.accStructureDeviceAddress = S.vkGetAccelerationStructureDeviceAddressKHR(S.device, &addressInfo);
 
-            // Cleanup
-            blas.aabbsBuffer = {};
-            blas.indexBuffer = {};
-            blas.vertexBuffer = {};
         }
     }
     
@@ -2740,7 +2736,7 @@ namespace evk {
         }
         Internal_TLAS& res = ToInternal(tlas);
 
-        EVK_ASSERT(blasInstances.size() < res.instances.size(), "TLAS has been created with max of %llu BLAS count but now is being built with %llu BLAS count!",
+        EVK_ASSERT(blasInstances.size() <= res.instances.size(), "TLAS has been created with max of %llu BLAS count but now is being built with %llu BLAS count!",
                     res.instances.size(), blasInstances.size());
 
         for (int i = 0; i < blasInstances.size(); i++) {
@@ -2794,10 +2790,10 @@ namespace evk {
         }
 
         AccelerationStructureScratchBuffer scratchBuffer =
-            CreateAccelerationStructureScratchBuffer("TLAS Scratch", res.sizeInfo.buildScratchSize);
+            CreateAccelerationStructureScratchBuffer("TLAS Scratch", update ? res.sizeInfo.updateScratchSize : res.sizeInfo.buildScratchSize);
 
         res.buildInfo.mode = update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-        res.buildInfo.srcAccelerationStructure = res.accel;
+        res.buildInfo.srcAccelerationStructure = update ? res.accel : VK_NULL_HANDLE;
         res.buildInfo.dstAccelerationStructure = res.accel;
         res.buildInfo.scratchData.deviceAddress = scratchBuffer.address;
 
@@ -2941,7 +2937,7 @@ namespace evk {
             VkAccelerationStructureGeometryAabbsDataKHR aabbs = {
                 .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR,
                 .data = ToInternal(desc.aabbs).deviceAddress,
-                .stride = sizeof(VkAabbPositionsKHR),
+                .stride = desc.stride,
             };
             res->geometries.push_back(VkAccelerationStructureGeometryKHR{
                 .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
@@ -2964,6 +2960,7 @@ namespace evk {
             .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
             .flags = VkBuildAccelerationStructureFlagsKHR(
                 VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR |
                 (
                     #ifdef VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR
                         VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR
