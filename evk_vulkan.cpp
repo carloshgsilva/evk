@@ -2541,9 +2541,9 @@ namespace evk {
 
         auto& extent = GetDesc(dst).extent;
 
-        EVK_ASSERT(cb->stagingOffset + size < 64'000'000, "Staging buffer out of memory");
-
-        uint64_t copyOffset = cb->stagingOffset;
+        uint64_t alignment = std::max(size_t(4), FORMAT_VK[size_t(GetDesc(dst).format)].size);
+        uint64_t copyOffset = (cb->stagingOffset + alignment - 1) / alignment * alignment;
+        EVK_ASSERT(copyOffset <= 64'000'000 && size <= 64'000'000 - copyOffset, "Staging buffer out of memory");
         uint64_t staging = uint64_t(cb->stagingBuffer.GetPtr()) + copyOffset;
         std::memcpy((void*)staging, src, size);
 
@@ -2558,7 +2558,7 @@ namespace evk {
         copy.imageOffset = {0, 0, 0};
         copy.imageExtent = {std::max(1u, extent.width >> mip), std::max(1u, extent.height >> mip), std::max(1u, extent.depth >> mip)};
 
-        cb->stagingOffset += size;
+        cb->stagingOffset = copyOffset + size;
 
         vkCmdCopyBufferToImage(cb->cmd, ToInternal(cb->stagingBuffer).buffer, ToInternal(dst).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }

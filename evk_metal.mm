@@ -701,7 +701,7 @@ Pipeline CreatePipeline(const PipelineDesc& desc) {
         Require(pipeline->render != nil, "Cannot create graphics pipeline %s: %s", desc.name.c_str(), error.localizedDescription.UTF8String);
         MTLDepthStencilDescriptor* depth = [MTLDepthStencilDescriptor new];
         depth.depthCompareFunction = desc.depthTest ? MTLCompareFunction(uint32_t(desc.depthOp)) : MTLCompareFunctionAlways;
-        depth.depthWriteEnabled = desc.depthWrite;
+        depth.depthWriteEnabled = desc.depthTest && desc.depthWrite;
         pipeline->depth = [S().device newDepthStencilStateWithDescriptor:depth];
         return Pipeline(pipeline);
     }
@@ -1103,7 +1103,7 @@ void Cmd::scissor(int32_t x, int32_t y, uint32_t width, uint32_t height) {
     cmd.scissor = {NSUInteger(x), NSUInteger(y), width, height};
     [cmd.render setScissorRect:cmd.scissor];
 }
-void Cmd::lineWidth(float) {}
+void Cmd::lineWidth(float width) { Require(width == 1.0f, "Native line primitives support width one; use triangles for wider lines"); }
 namespace {
 void DrawState(Command& cmd) {
     Require(cmd.render != nil, "Draw requires a render pass");
