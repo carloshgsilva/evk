@@ -1230,6 +1230,7 @@ namespace evk {
 
             // Query supported feature structs so we only request what is available.
             VkPhysicalDeviceFeatures2 supportedFeatures2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            VkPhysicalDeviceShaderDrawParametersFeatures supportedDrawParameters = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};
             VkPhysicalDeviceVulkan12Features supported12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
             VkPhysicalDeviceVulkan13Features supported13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
             VkPhysicalDevice16BitStorageFeatures supported16Bit = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};
@@ -1241,7 +1242,8 @@ namespace evk {
             VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR supportedRTPosFetch = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR};
             VkPhysicalDeviceCooperativeMatrixFeaturesKHR supportedCoop = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
 
-            supportedFeatures2.pNext = &supported12;
+            supportedFeatures2.pNext = &supportedDrawParameters;
+            supportedDrawParameters.pNext = &supported12;
             supported12.pNext = &supported13;
             supported13.pNext = &supported16Bit;
             supported16Bit.pNext = &supportedAtomicFloat;
@@ -1280,6 +1282,8 @@ namespace evk {
             }
             VkPhysicalDevice16BitStorageFeatures feature_16bitStorage = supported16Bit;
             add_feature(feature_16bitStorage);
+            VkPhysicalDeviceShaderDrawParametersFeatures feature_drawParameters = supportedDrawParameters;
+            add_feature(feature_drawParameters);
 
             // Vulkan 1.2 features
             VkPhysicalDeviceVulkan12Features feature_vulkan12 = supported12;

@@ -172,6 +172,7 @@ void Translate(const std::filesystem::path& input, const std::filesystem::path& 
     options.argument_buffers = true;
     options.argument_buffers_tier = spirv_cross::CompilerMSL::Options::ArgumentBuffersTier::Tier2;
     options.pad_argument_buffer_resources = true;
+    options.draw_id_buffer_index = evk::metal::DRAW_ID_BUFFER;
     compiler.set_msl_options(options);
     compiler.set_argument_buffer_device_address_space(0, true);
     auto common = compiler.get_common_options();
@@ -240,6 +241,8 @@ void Translate(const std::filesystem::path& input, const std::filesystem::path& 
     std::filesystem::create_directories(output);
     const auto stem = output / name.str();
     const std::string source = compiler.compile();
+    compiler.update_active_builtins();
+    info.usesDrawID = compiler.has_active_builtin(spv::BuiltInDrawIndex, spv::StorageClassInput);
     for (const auto& constant : compiler.get_specialization_constants()) {
         if (compiler.get_constant(constant.id).is_used_as_array_length) info.staticConstants |= 1u << constant.constant_id;
     }

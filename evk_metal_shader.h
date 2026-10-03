@@ -15,6 +15,7 @@ constexpr uint32_t TLAS_ID = IMAGE_ID + IMAGE_COUNT;
 constexpr uint32_t ARGUMENT_BUFFER = 0;
 constexpr uint32_t PUSH_BUFFER = 1;
 constexpr uint32_t VERTEX_BUFFER = 2;
+constexpr uint32_t DRAW_ID_BUFFER = 19;
 enum class ShaderStage : uint32_t { Vertex, Fragment, Compute };
 enum class ConstantType : uint32_t { Unused, Bool, Int, UInt, Float };
 
@@ -28,7 +29,7 @@ inline uint64_t ShaderHash(std::span<const uint8_t> bytes) {
 
 struct ShaderInfo {
     uint32_t magic = 0x4D534C31;
-    uint32_t version = 5;
+    uint32_t version = 6;
     ShaderStage stage = ShaderStage::Vertex;
     uint32_t groupX = 1;
     uint32_t groupY = 1;
@@ -40,5 +41,6 @@ struct ShaderInfo {
     ConstantType constantTypes[32] = {};
     uint32_t constantDefaults[32] = {};
     uint32_t staticConstants = 0;
+    uint32_t usesDrawID = 0;
 };
 }

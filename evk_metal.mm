@@ -119,6 +119,7 @@ struct MetalPipeline : Resource {
     id<MTLComputePipelineState> compute = nil;
     id<MTLDepthStencilState> depth = nil;
     MTLSize group = {1, 1, 1};
+    bool usesDrawID = false;
 };
 struct MetalBLAS : Resource {
     BLASDesc geometry;
@@ -488,7 +489,7 @@ id<MTLFunction> Function(const std::vector<uint8_t>& bytes, const ConstantRaw& c
     std::string stem = std::string(directory ? directory : ".cache/metal/shaders") + "/" + hash;
     std::ifstream metadata(stem + ".info", std::ios::binary);
     Require(bool(metadata.read(reinterpret_cast<char*>(&info), sizeof(info))), "Missing shader metadata: %s.info", stem.c_str());
-    Require(info.magic == 0x4D534C31 && info.version == 5 && info.hash == metal::ShaderHash(bytes), "Invalid shader metadata: %s", stem.c_str());
+    Require(info.magic == 0x4D534C31 && info.version == 6 && info.hash == metal::ShaderHash(bytes), "Invalid shader metadata: %s", stem.c_str());
     NSError* error = nil;
     NSURL* url = [NSURL fileURLWithPath:[[NSString alloc] initWithUTF8String:(stem + ".metallib").c_str()]];
     id<MTLLibrary> library = nil;
@@ -660,6 +661,9 @@ Pipeline CreatePipeline(const PipelineDesc& desc) {
         }
         MTLRenderPipelineDescriptor* render = [MTLRenderPipelineDescriptor new];
         render.vertexFunction = Function(desc.VS, desc.constants, info);
+        pipeline->usesDrawID = info.usesDrawID;
+        Require(!pipeline->usesDrawID || metal::VERTEX_BUFFER + desc.bindings.size() <= metal::DRAW_ID_BUFFER,
+                "Vertex bindings overlap the shader draw-ID buffer slot");
         if (!desc.FS.empty()) render.fragmentFunction = Function(desc.FS, desc.constants, info);
         render.rasterSampleCount = uint32_t(desc.sampleCount);
         MTLVertexDescriptor* vertices = [MTLVertexDescriptor new];
@@ -1114,24 +1118,36 @@ void DrawState(Command& cmd) {
     Push(cmd);
 }
 MTLPrimitiveType PrimitiveType(Command& cmd) { return P(cmd.pipeline).desc.primitive == Primitive::Triangle ? MTLPrimitiveTypeTriangle : MTLPrimitiveTypeLine; }
+void DrawID(Command& cmd, uint32_t index) {
+    if (!P(cmd.pipeline).usesDrawID) return;
+    [cmd.render setVertexBytes:&index length:sizeof(index) atIndex:metal::DRAW_ID_BUFFER];
+}
 }
 void Cmd::draw(uint32_t vertices, uint32_t instances, uint32_t first, uint32_t baseInstance) {
     auto& cmd = C(*this); DrawState(cmd);
+    DrawID(cmd, 0);
     [cmd.render drawPrimitives:PrimitiveType(cmd) vertexStart:first vertexCount:vertices instanceCount:instances baseInstance:baseInstance];
 }
 void Cmd::drawIndexed(uint32_t indices, uint32_t instances, uint32_t first, int32_t baseVertex, uint32_t baseInstance) {
     auto& cmd = C(*this); DrawState(cmd);
+    DrawID(cmd, 0);
     [cmd.render drawIndexedPrimitives:PrimitiveType(cmd) indexCount:indices indexType:cmd.halfIndices ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
         indexBuffer:B(cmd.indices).buffer indexBufferOffset:cmd.indexOffset + first * (cmd.halfIndices ? 2 : 4) instanceCount:instances baseVertex:baseVertex baseInstance:baseInstance];
 }
 void Cmd::drawIndirect(Buffer& buffer, uint64_t offset, uint32_t count, uint32_t stride) {
     auto& cmd = C(*this); DrawState(cmd);
-    for (uint32_t index = 0; index < count; ++index) [cmd.render drawPrimitives:PrimitiveType(cmd) indirectBuffer:B(buffer).buffer indirectBufferOffset:offset + index * stride];
+    for (uint32_t index = 0; index < count; ++index) {
+        DrawID(cmd, index);
+        [cmd.render drawPrimitives:PrimitiveType(cmd) indirectBuffer:B(buffer).buffer indirectBufferOffset:offset + index * stride];
+    }
 }
 void Cmd::drawIndexedIndirect(Buffer& buffer, uint64_t offset, uint32_t count, uint32_t stride) {
     auto& cmd = C(*this); DrawState(cmd);
-    for (uint32_t index = 0; index < count; ++index) [cmd.render drawIndexedPrimitives:PrimitiveType(cmd) indexType:cmd.halfIndices ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
-        indexBuffer:B(cmd.indices).buffer indexBufferOffset:cmd.indexOffset indirectBuffer:B(buffer).buffer indirectBufferOffset:offset + index * stride];
+    for (uint32_t index = 0; index < count; ++index) {
+        DrawID(cmd, index);
+        [cmd.render drawIndexedPrimitives:PrimitiveType(cmd) indexType:cmd.halfIndices ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+            indexBuffer:B(cmd.indices).buffer indexBufferOffset:cmd.indexOffset indirectBuffer:B(buffer).buffer indirectBufferOffset:offset + index * stride];
+    }
 }
 namespace {
 uint64_t FilterDrawCount(Command& cmd, Buffer& source, uint64_t offset, Buffer& count, uint64_t countOffset, uint32_t maximum, uint32_t stride, uint32_t words) {
