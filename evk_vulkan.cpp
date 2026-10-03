@@ -2007,15 +2007,16 @@ namespace evk {
 
         // If none are ready, wait for at least one submitted command buffer to complete.
         if (cmdData == nullptr) {
-            std::vector<VkFence> fences;
-            fences.reserve(S.commandBuffers.size());
+            VkFence fences[MAX_COMMAND_BUFFERS];
+            uint32_t fenceCount = 0;
             for (auto& cb : S.commandBuffers) {
                 if (cb.state == CmdState::Submitted) {
-                    fences.push_back(cb.fence);
+                    EVK_ASSERT(fenceCount < MAX_COMMAND_BUFFERS, "Command buffer limit exceeded");
+                    fences[fenceCount++] = cb.fence;
                 }
             }
-            EVK_ASSERT(!fences.empty(), "No available command buffers! (none submitted either)");
-            CHECK_VK(vkWaitForFences(S.device, (uint32_t)fences.size(), fences.data(), VK_TRUE, UINT64_MAX));
+            EVK_ASSERT(fenceCount > 0, "No available command buffers! (none submitted either)");
+            CHECK_VK(vkWaitForFences(S.device, fenceCount, fences, VK_TRUE, UINT64_MAX));
             CleanupCompletedCommandBuffers();
 
             for (auto& cb : S.commandBuffers) {
