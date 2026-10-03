@@ -16,6 +16,7 @@
 #define VMA_IMPLEMENTATION
 #include "vk_mem_alloc.h"
 #include "evk.h"
+#include <string_view>
 
 #ifndef VK_EXT_METAL_SURFACE_EXTENSION_NAME
 #define VK_EXT_METAL_SURFACE_EXTENSION_NAME "VK_EXT_metal_surface"
@@ -26,6 +27,10 @@
 #endif
 
 namespace evk {
+
+    namespace detail {
+        std::vector<uint8_t> load_embedded_shader(std::string_view name);
+    }
 
 #if EVK_DEBUG
     static VKAPI_ATTR VkBool32 VKAPI_CALL EVK_DebugUtilsCallback(
@@ -441,6 +446,43 @@ namespace evk {
             CHECK_VK(vkCreateSampler(GetState().device, &samplerci, nullptr, &state->sampler));
         }
     }
+    void InitializeDepthBlitViews(Internal_Image& image) {
+        auto& S = GetState();
+        uint32_t count = image.desc.mipCount * image.desc.layerCount;
+        image.depthBlitViews.resize(count);
+        image.depthBlitSets.resize(count);
+        VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, count};
+        VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = count;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        CHECK_VK(vkCreateDescriptorPool(S.device, &poolInfo, nullptr, &image.depthBlitPool));
+        std::vector<VkDescriptorSetLayout> layouts(count, S.depthBlitSetLayout);
+        VkDescriptorSetAllocateInfo allocation = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocation.descriptorPool = image.depthBlitPool;
+        allocation.descriptorSetCount = count;
+        allocation.pSetLayouts = layouts.data();
+        CHECK_VK(vkAllocateDescriptorSets(S.device, &allocation, image.depthBlitSets.data()));
+        for (uint32_t layer = 0; layer < image.desc.layerCount; ++layer) {
+            for (uint32_t mip = 0; mip < image.desc.mipCount; ++mip) {
+                uint32_t index = layer * image.desc.mipCount + mip;
+                VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                view.image = image.image;
+                view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                view.format = VK_FORMAT_D32_SFLOAT;
+                view.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, mip, 1, layer, 1};
+                CHECK_VK(vkCreateImageView(S.device, &view, nullptr, &image.depthBlitViews[index]));
+                VkDescriptorImageInfo sampled = {S.depthBlitSampler, image.depthBlitViews[index], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                write.dstSet = image.depthBlitSets[index];
+                write.descriptorCount = 1;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                write.pImageInfo = &sampled;
+                vkUpdateDescriptorSets(S.device, 1, &write, 0, nullptr);
+            }
+        }
+    }
+
     Image CreateImage(const ImageDesc& desc) {
         auto& S = GetState();
         Internal_Image* res = new Internal_Image();
@@ -475,6 +517,11 @@ namespace evk {
         if ((int)usage & (int)ImageUsage::Attachment) usageBits |= DoesFormatHaveDepth(desc.format) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if ((int)usage & (int)ImageUsage::Storage) usageBits |= VK_IMAGE_USAGE_STORAGE_BIT;
         if ((int)usage & (int)ImageUsage::Transient) usageBits |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+
+        bool depthBlit = S.renderDepthBlits && desc.format == Format::D32Sfloat
+            && desc.sampleCount == SampleCount::One && !HasFlag(usage, ImageUsage::Transient);
+        EVK_ASSERT(!depthBlit || desc.extent.depth == 1, "Depth blits require a 2D image");
+        if (depthBlit) usageBits |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 
         VkImageCreateInfo imageci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         imageci.imageType = desc.extent.depth == 1 ? VK_IMAGE_TYPE_2D : VK_IMAGE_TYPE_3D;
@@ -513,6 +560,7 @@ namespace evk {
 #endif
 
         InitializeImageView(res);
+        if (depthBlit) InitializeDepthBlitViews(*res);
 
         if (HasFlag(desc.usage, ImageUsage::Sampled) || HasFlag(desc.usage, ImageUsage::Storage)) {
             WriteImageDescriptors(*res);
@@ -532,7 +580,7 @@ namespace evk {
         CHECK_VK(vkCreateShaderModule(GetState().device, &shaderci, nullptr, &mod));
         return mod;
     }
-    VkPipeline createGraphicsPipeline(const PipelineDesc& desc, VkShaderModule vertexShader, VkShaderModule fragmentShader) {
+    VkPipeline createGraphicsPipeline(const PipelineDesc& desc, VkShaderModule vertexShader, VkShaderModule fragmentShader, VkPipelineLayout layout = VK_NULL_HANDLE) {
         auto& S = GetState();
 
         std::vector<VkVertexInputAttributeDescription> attributes;
@@ -719,7 +767,7 @@ namespace evk {
         createInfo.pDepthStencilState = &depthStencilInfo;
         createInfo.pColorBlendState = &colorBlendInfo;
         createInfo.pDynamicState = &dynamicStateInfo;
-        createInfo.layout = S.pipelineLayout;
+        createInfo.layout = layout ? layout : S.pipelineLayout;
         createInfo.renderPass = VK_NULL_HANDLE;
         createInfo.pNext = &renderingCreateInfo;
 
@@ -728,6 +776,45 @@ namespace evk {
 
         return pipeline;
     }
+    void InitializeDepthBlits() {
+        auto& S = GetState();
+        VkFormatProperties properties;
+        vkGetPhysicalDeviceFormatProperties(S.physicalDevice, VK_FORMAT_D32_SFLOAT, &properties);
+        constexpr auto blitFeatures = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        S.renderDepthBlits = (properties.optimalTilingFeatures & blitFeatures) != blitFeatures;
+        if (!S.renderDepthBlits) return;
+        constexpr auto renderFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        EVK_ASSERT((properties.optimalTilingFeatures & renderFeatures) == renderFeatures,
+                   "D32 depth scaling requires sampled depth attachments on this device");
+        VkDescriptorSetLayoutBinding binding = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT};
+        VkDescriptorSetLayoutCreateInfo setInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        setInfo.bindingCount = 1;
+        setInfo.pBindings = &binding;
+        CHECK_VK(vkCreateDescriptorSetLayout(S.device, &setInfo, nullptr, &S.depthBlitSetLayout));
+        VkPushConstantRange push = {VK_SHADER_STAGE_ALL, 0, 128};
+        VkPipelineLayoutCreateInfo layout = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout.setLayoutCount = 1;
+        layout.pSetLayouts = &S.depthBlitSetLayout;
+        layout.pushConstantRangeCount = 1;
+        layout.pPushConstantRanges = &push;
+        CHECK_VK(vkCreatePipelineLayout(S.device, &layout, nullptr, &S.depthBlitLayout));
+        VkSamplerCreateInfo sampler = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sampler.magFilter = sampler.minFilter = VK_FILTER_NEAREST;
+        sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        CHECK_VK(vkCreateSampler(S.device, &sampler, nullptr, &S.depthBlitSampler));
+        auto vertex = createShader(detail::load_embedded_shader("depth_blit_vertex"));
+        auto fragment = createShader(detail::load_embedded_shader("depth_blit_fragment"));
+        PipelineDesc desc;
+        desc.attachments = {Format::D32Sfloat};
+        desc.depthTest = true;
+        desc.depthWrite = true;
+        desc.depthOp = Op::Always;
+        S.depthBlitPipeline = createGraphicsPipeline(desc, vertex, fragment, S.depthBlitLayout);
+        vkDestroyShaderModule(S.device, vertex, nullptr);
+        vkDestroyShaderModule(S.device, fragment, nullptr);
+    }
+
     VkPipeline createComputePipeline(const PipelineDesc& desc, VkShaderModule computeShader) {
         VkComputePipelineCreateInfo pipelineci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
 
@@ -1479,6 +1566,8 @@ namespace evk {
             CHECK_VK(vkAllocateDescriptorSets(S.device, &descset, &S.descriptorSet));
         }
 
+        InitializeDepthBlits();
+
         // Command buffers
         {
             S.commandBuffers.resize(MAX_COMMAND_BUFFERS);
@@ -1630,6 +1719,10 @@ namespace evk {
         }
 #endif
 
+        vkDestroyPipeline(S.device, S.depthBlitPipeline, nullptr);
+        vkDestroyPipelineLayout(S.device, S.depthBlitLayout, nullptr);
+        vkDestroyDescriptorSetLayout(S.device, S.depthBlitSetLayout, nullptr);
+        vkDestroySampler(S.device, S.depthBlitSampler, nullptr);
         vkDestroyDescriptorPool(S.device, S.descriptorPool, nullptr);
         vkDestroyDescriptorSetLayout(S.device, S.descriptorSetLayout, nullptr);
         vkDestroyPipelineLayout(S.device, S.pipelineLayout, nullptr);
@@ -1911,6 +2004,8 @@ namespace evk {
         cmdData->swapchainIndex = 0;
         cmdData->presentDoneSemaphore = VK_NULL_HANDLE;
         cmdData->stagingOffset = 0;
+        cmdData->graphicsPipeline = VK_NULL_HANDLE;
+        cmdData->pushConstantBytes = 0;
         cmdData->timestampNames.clear();
         
         // Reset and begin the command buffer
@@ -1985,6 +2080,8 @@ namespace evk {
         EVK_ASSERT(size % 4 == 0, "Push constant 'size' must be aligned by 4 bytes!");
         EVK_ASSERT(offset % 4 == 0, "Push constant 'offset' must be aligned by 4 bytes!");
         EVK_ASSERT(offset + size <= 128, "Push constant offset+size must be smaller than 128 bytes!");
+        std::memcpy(cb->pushConstants + offset, data, size);
+        cb->pushConstantBytes = std::max(cb->pushConstantBytes, offset + size);
         vkCmdPushConstants(cb->cmd, GetState().pipelineLayout, VK_SHADER_STAGE_ALL, offset, size, data);
     }
     
@@ -1995,6 +2092,7 @@ namespace evk {
         EVK_ASSERT(pipeline.res != nullptr, "Null pipeline");
         EVK_ASSERT(!isGraphics || cb->insideRenderPass, "graphics pipeline bind must be inside a render pass.");
         EVK_ASSERT(!isCompute || !cb->insideRenderPass, "compute pipeline bind must be outside a render pass.");
+        if (isGraphics) cb->graphicsPipeline = ToInternal(pipeline).pipeline;
         vkCmdBindPipeline(cb->cmd, isCompute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS, ToInternal(pipeline).pipeline);
     }
     
@@ -2229,6 +2327,94 @@ namespace evk {
         }
     }
     
+    void RenderDepthBlit(CommandBufferData& cb, Internal_Image& src, Internal_Image& dst,
+                         const ImageRegion& from, const ImageRegion& to) {
+        auto& S = GetState();
+        EVK_ASSERT(!cb.insideRenderPass, "Depth blits must be outside a render pass");
+        EVK_ASSERT(src.desc.format == dst.desc.format && src.desc.format == Format::D32Sfloat,
+                   "Depth blits require matching D32 formats");
+        EVK_ASSERT(from.mip >= 0 && from.mip < src.desc.mipCount && from.layer >= 0 && from.layer < src.desc.layerCount
+                && to.mip >= 0 && to.mip < dst.desc.mipCount && to.layer >= 0 && to.layer < dst.desc.layerCount,
+                   "Depth blit subresource is out of range");
+        EVK_ASSERT(src.image != dst.image || from.mip != to.mip || from.layer != to.layer,
+                   "Depth blit source and destination subresources must differ");
+        EVK_ASSERT(!src.depthBlitViews.empty() && !dst.depthBlitViews.empty(), "Depth blits require single-sample persistent images");
+        EVK_ASSERT(from.z == 0 && to.z == 0 && from.depth == 1 && to.depth == 1, "Depth blits require 2D regions");
+        auto validRegion = [](const Internal_Image& image, const ImageRegion& region) {
+            int width = std::max(1u, image.desc.extent.width >> region.mip);
+            int height = std::max(1u, image.desc.extent.height >> region.mip);
+            return region.width != 0 && region.height != 0
+                && std::min(region.x, region.x + region.width) >= 0 && std::max(region.x, region.x + region.width) <= width
+                && std::min(region.y, region.y + region.height) >= 0 && std::max(region.y, region.y + region.height) <= height;
+        };
+        EVK_ASSERT(validRegion(src, from) && validRegion(dst, to), "Depth blit region is out of range");
+        VkImageMemoryBarrier2 barriers[2] = {};
+        for (auto& barrier : barriers) {
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        }
+        barriers[0].image = src.image;
+        barriers[0].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, uint32_t(from.mip), 1, uint32_t(from.layer), 1};
+        barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        barriers[0].srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        barriers[0].dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        barriers[1].image = dst.image;
+        barriers[1].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, uint32_t(to.mip), 1, uint32_t(to.layer), 1};
+        barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barriers[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        barriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        barriers[1].dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        VkDependencyInfo dependency = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dependency.imageMemoryBarrierCount = 2;
+        dependency.pImageMemoryBarriers = barriers;
+        vkCmdPipelineBarrier2(cb.cmd, &dependency);
+
+        uint32_t sourceIndex = from.layer * src.desc.mipCount + from.mip;
+        uint32_t targetIndex = to.layer * dst.desc.mipCount + to.mip;
+        VkRenderingAttachmentInfo attachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        attachment.imageView = dst.depthBlitViews[targetIndex];
+        attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRect2D region = {{std::min(to.x, to.x + to.width), std::min(to.y, to.y + to.height)},
+                           {uint32_t(std::abs(to.width)), uint32_t(std::abs(to.height))}};
+        VkRenderingInfo rendering = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+        rendering.renderArea = region;
+        rendering.layerCount = 1;
+        rendering.pDepthAttachment = &attachment;
+        vkCmdBeginRendering(cb.cmd, &rendering);
+        VkViewport viewport = {0, 0, float(std::max(1u, dst.desc.extent.width >> to.mip)),
+                              float(std::max(1u, dst.desc.extent.height >> to.mip)), 0, 1};
+        vkCmdSetViewport(cb.cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cb.cmd, 0, 1, &region);
+        vkCmdSetLineWidth(cb.cmd, 1);
+        vkCmdBindPipeline(cb.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.depthBlitPipeline);
+        vkCmdBindDescriptorSets(cb.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.depthBlitLayout,
+                                0, 1, &src.depthBlitSets[sourceIndex], 0, nullptr);
+        const float push[] = {float(from.x), float(from.y), float(from.width), float(from.height),
+                              float(to.x), float(to.y), float(to.width), float(to.height)};
+        vkCmdPushConstants(cb.cmd, S.depthBlitLayout, VK_SHADER_STAGE_ALL, 0, sizeof(push), push);
+        vkCmdDraw(cb.cmd, 3, 1, 0, 0);
+        vkCmdEndRendering(cb.cmd);
+
+        for (auto& barrier : barriers) {
+            std::swap(barrier.oldLayout, barrier.newLayout);
+            std::swap(barrier.srcStageMask, barrier.dstStageMask);
+            std::swap(barrier.srcAccessMask, barrier.dstAccessMask);
+        }
+        vkCmdPipelineBarrier2(cb.cmd, &dependency);
+        vkCmdBindDescriptorSets(cb.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, S.pipelineLayout,
+                                0, 1, &S.descriptorSet, 0, nullptr);
+        if (cb.graphicsPipeline) vkCmdBindPipeline(cb.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cb.graphicsPipeline);
+        if (cb.pushConstantBytes) vkCmdPushConstants(cb.cmd, S.pipelineLayout, VK_SHADER_STAGE_ALL,
+                                                    0, cb.pushConstantBytes, cb.pushConstants);
+    }
+
     void Cmd::blit(Image& src, Image& dst, ImageRegion srcRegion, ImageRegion dstRegion, Filter filter) {
         CommandBufferData* cb = (CommandBufferData*)_internal;
         if (srcRegion.width == 0) srcRegion.width = std::max(GetDesc(src).extent.width >> srcRegion.mip, 1u);
@@ -2237,6 +2423,12 @@ namespace evk {
         if (dstRegion.width == 0) dstRegion.width = std::max(GetDesc(dst).extent.width >> dstRegion.mip, 1u);
         if (dstRegion.height == 0) dstRegion.height = std::max(GetDesc(dst).extent.height >> dstRegion.mip, 1u);
         if (dstRegion.depth == 0) dstRegion.depth = std::max(GetDesc(dst).extent.depth >> dstRegion.mip, 1u);
+
+        if (GetState().renderDepthBlits && GetDesc(dst).format == Format::D32Sfloat) {
+            EVK_ASSERT(filter == Filter::Nearest, "Depth blits require nearest filtering");
+            RenderDepthBlit(*cb, ToInternal(src), ToInternal(dst), srcRegion, dstRegion);
+            return;
+        }
 
         VkImageBlit blitInfo = {};
         blitInfo.srcOffsets[0] = {srcRegion.x, srcRegion.y, srcRegion.z};

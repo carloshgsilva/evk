@@ -55,6 +55,9 @@ namespace evk {
         CmdState state = CmdState::Ready;
         bool insideRenderPass = false;
         bool doingPresent = false;
+        VkPipeline graphicsPipeline = VK_NULL_HANDLE;
+        uint8_t pushConstants[128] = {};
+        uint32_t pushConstantBytes = 0;
 
         // Swapchain image index acquired in beginPresent() (valid only when doingPresent is true)
         uint32_t swapchainIndex = 0;
@@ -142,6 +145,11 @@ namespace evk {
         VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
         VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
         VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+        bool renderDepthBlits = false;
+        VkDescriptorSetLayout depthBlitSetLayout = VK_NULL_HANDLE;
+        VkPipelineLayout depthBlitLayout = VK_NULL_HANDLE;
+        VkPipeline depthBlitPipeline = VK_NULL_HANDLE;
+        VkSampler depthBlitSampler = VK_NULL_HANDLE;
         SlotAllocator bufferSlots;
         SlotAllocator imageSlots;
         SlotAllocator tlasSlots;
@@ -222,9 +230,14 @@ namespace evk {
         VkImage image = {};
         VkImageView view = {};
         VkSampler sampler = {};
+        VkDescriptorPool depthBlitPool = VK_NULL_HANDLE;
+        std::vector<VkImageView> depthBlitViews;
+        std::vector<VkDescriptorSet> depthBlitSets;
 
         ~Internal_Image() {
             auto& S = GetState();
+            vkDestroyDescriptorPool(S.device, depthBlitPool, nullptr);
+            for (auto blitView : depthBlitViews) vkDestroyImageView(S.device, blitView, nullptr);
             vkDestroySampler(S.device, sampler, nullptr);
             vkDestroyImageView(S.device, view, nullptr);
             if (allocation != nullptr) {

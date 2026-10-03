@@ -53,6 +53,12 @@ endif()
 # evk::ai
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/evk_embed_shaders.cmake")
 
+if(EVK_BACKEND STREQUAL "Vulkan")
+  evk_embed_shaders(evk "evk::detail"
+      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/internal/depth_blit_vertex.vert"
+      "${CMAKE_CURRENT_SOURCE_DIR}/shaders/internal/depth_blit_fragment.frag")
+endif()
+
 file(GLOB EVK_AI_SHADERS CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ai/*.comp"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/oidn/*.comp")
