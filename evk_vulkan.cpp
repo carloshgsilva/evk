@@ -390,6 +390,8 @@ namespace evk {
     // Image //
     ///////////
     void InitializeImageView(Internal_Image* state) {
+        auto usage = state->desc.usage;
+        if (!HasFlag(usage, ImageUsage::Sampled) && !HasFlag(usage, ImageUsage::Storage) && !HasFlag(usage, ImageUsage::Attachment)) return;
         VkImageAspectFlags aspects = {};
         if (DoesFormatHaveDepth(state->desc.format)) {
             aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -1106,6 +1108,8 @@ namespace evk {
             features.shaderStorageImageWriteWithoutFormat = supportedBase.shaderStorageImageWriteWithoutFormat;
             features.independentBlend = supportedBase.independentBlend;
             features.wideLines = supportedBase.wideLines;
+            features.multiDrawIndirect = supportedBase.multiDrawIndirect;
+            features.drawIndirectFirstInstance = supportedBase.drawIndirectFirstInstance;
 
             std::vector<const char*> deviceExtensions = {};
 

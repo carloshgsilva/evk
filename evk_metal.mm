@@ -15,6 +15,7 @@
 
 #include "evk.h"
 #include "evk_metal_blit.h"
+#include "evk_metal_indirect.h"
 #include "evk_metal_ray.h"
 #include "evk_metal_shader.h"
 
@@ -150,6 +151,11 @@ struct Command {
     id<MTLBlitCommandEncoder> blit = nil;
     id<MTLAccelerationStructureCommandEncoder> acceleration = nil;
     MTLRenderPassDescriptor* renderPass = nil;
+    std::array<MTLStoreAction, MAX_ATTACHMENTS_COUNT> colorStores = {};
+    MTLStoreAction depthStore = MTLStoreActionDontCare;
+    MTLStoreAction stencilStore = MTLStoreActionDontCare;
+    MTLViewport viewport = {};
+    MTLScissorRect scissor = {};
     MTLComputePassDescriptor* computePass = nil;
     MTLBlitPassDescriptor* blitPass = nil;
     MTLAccelerationStructurePassDescriptor* accelerationPass = nil;
@@ -186,6 +192,7 @@ struct State {
     id<MTLDepthStencilState> blitDepth = nil;
     id<MTLDepthStencilState> blitColorDepth = nil;
     id<MTLComputePipelineState> triangleData = nil;
+    id<MTLComputePipelineState> indirectCount = nil;
     std::array<std::array<id<MTLRenderPipelineState>, 3>, uint32_t(Format::D32Sfloat) + 1> blitPipelines;
     CAMetalLayer* layer = nil;
     NSView* view = nil;
@@ -262,8 +269,20 @@ void Retire() {
         delete resource;
     }
 }
+void EndRenderEncoder(Command& cmd, bool preserve) {
+    for (uint32_t index = 0; index < MAX_ATTACHMENTS_COUNT; ++index) {
+        auto attachment = cmd.renderPass.colorAttachments[index];
+        if (!attachment.texture) continue;
+        auto store = attachment.resolveTexture ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore;
+        [cmd.render setColorStoreAction:preserve ? store : cmd.colorStores[index] atIndex:index];
+    }
+    if (cmd.renderPass.depthAttachment.texture) [cmd.render setDepthStoreAction:preserve ? MTLStoreActionStore : cmd.depthStore];
+    if (cmd.renderPass.stencilAttachment.texture) [cmd.render setStencilStoreAction:preserve ? MTLStoreActionStore : cmd.stencilStore];
+    [cmd.render endEncoding];
+    cmd.render = nil;
+}
 void EndEncoder(Command& cmd) {
-    if (cmd.render) [cmd.render endEncoding];
+    if (cmd.render) EndRenderEncoder(cmd, false);
     if (cmd.compute) [cmd.compute endEncoding];
     if (cmd.blit) [cmd.blit endEncoding];
     if (cmd.acceleration) [cmd.acceleration endEncoding];
@@ -692,6 +711,11 @@ bool InitializeEVK(const EvkDesc& desc) {
         state.device = MTLCreateSystemDefaultDevice();
         Require(state.device != nil && state.device.argumentBuffersSupport == MTLArgumentBuffersTier2, "A tier-2 Metal device is required");
         state.queue = [state.device newCommandQueueWithMaxCommandBufferCount:COMMAND_COUNT];
+        NSError* error = nil;
+        auto indirectLibrary = [state.device newLibraryWithSource:[[NSString alloc] initWithUTF8String:metal::INDIRECT_COUNT_SHADER] options:nil error:&error];
+        Require(indirectLibrary != nil, "Cannot compile indirect-count shader: %s", error.localizedDescription.UTF8String);
+        state.indirectCount = [state.device newComputePipelineStateWithFunction:[indirectLibrary newFunctionWithName:@"filter_draw_count"] error:&error];
+        Require(state.indirectCount != nil, "Cannot create indirect-count pipeline: %s", error.localizedDescription.UTF8String);
         state.features.raytracing = state.device.supportsRaytracing;
         state.features.coopmat = [state.device supportsFamily:MTLGPUFamilyApple7];
         state.features.maxFramebufferSampleCount = GetSupportedSampleCount(SampleCount::SixtyFour);
@@ -913,6 +937,26 @@ void Cmd::copy(Buffer& src, Image& dst, const std::vector<ImageRegion>& regions)
     }
 }
 namespace {
+void RenderEncoder(Command& cmd) {
+    auto pass = cmd.renderPass;
+    if (cmd.counters) {
+        uint32_t first = EncoderSamples(cmd);
+        auto sample = pass.sampleBufferAttachments[0];
+        sample.sampleBuffer = cmd.counters;
+        sample.startOfVertexSampleIndex = first;
+        sample.endOfVertexSampleIndex = first + 1;
+        sample.startOfFragmentSampleIndex = first + 2;
+        sample.endOfFragmentSampleIndex = first + 3;
+    }
+    cmd.render = [cmd.buffer renderCommandEncoderWithDescriptor:pass];
+    Require(cmd.render != nil, "Cannot create render encoder");
+    [cmd.render setViewport:cmd.viewport];
+    [cmd.render setScissorRect:cmd.scissor];
+    [cmd.render setVertexBuffer:S().argumentBuffer offset:0 atIndex:metal::ARGUMENT_BUFFER];
+    [cmd.render setFragmentBuffer:S().argumentBuffer offset:0 atIndex:metal::ARGUMENT_BUFFER];
+    Residency(cmd.render);
+}
+
 void BeginRender(Cmd& api, Image* attachments, ClearValue* clears, int count, Image* resolves, bool loadDepth, uint32_t mip, uint32_t layer, bool loadColor = false) {
     auto& cmd = C(api);
     Require(!cmd.render && count > 0 && count <= MAX_ATTACHMENTS_COUNT, "Invalid render pass");
@@ -932,50 +976,40 @@ void BeginRender(Cmd& api, Image* attachments, ClearValue* clears, int count, Im
                 attachment.texture = I(attachments[index]).texture;
                 attachment.level = mip; attachment.slice = layer; attachment.depthPlane = 0;
                 attachment.loadAction = loadDepth ? MTLLoadActionLoad : action;
-                attachment.storeAction = store;
+                cmd.depthStore = store;
+                attachment.storeAction = MTLStoreActionUnknown;
                 attachment.clearDepth = clears ? clears[index].depthStencil.depth : 1.0;
                 if (desc.format == Format::D24UnormS8Uint) {
                     pass.stencilAttachment.texture = attachment.texture;
                     pass.stencilAttachment.level = mip; pass.stencilAttachment.slice = layer; pass.stencilAttachment.depthPlane = 0;
                     pass.stencilAttachment.loadAction = attachment.loadAction;
-                    pass.stencilAttachment.storeAction = store;
+                    cmd.stencilStore = store;
+                    pass.stencilAttachment.storeAction = MTLStoreActionUnknown;
                     pass.stencilAttachment.clearStencil = clears ? clears[index].depthStencil.stencil : 0;
                 }
                 continue;
             }
+            cmd.colorStores[color] = store;
             auto attachment = pass.colorAttachments[color++];
             attachment.texture = I(attachments[index]).texture;
             attachment.level = mip;
             attachment.slice = desc.extent.depth > 1 ? 0 : layer;
             attachment.depthPlane = desc.extent.depth > 1 ? layer : 0;
-            attachment.loadAction = loadColor ? MTLLoadActionLoad : action; attachment.storeAction = store;
+            attachment.loadAction = loadColor ? MTLLoadActionLoad : action; attachment.storeAction = MTLStoreActionUnknown;
             if (clears) {
                 auto& value = clears[index].color;
                 attachment.clearColor = UInt(desc.format) ? MTLClearColorMake(value.uint32[0], value.uint32[1], value.uint32[2], value.uint32[3])
                     : desc.format == Format::RGBA32Sint ? MTLClearColorMake(value.int32[0], value.int32[1], value.int32[2], value.int32[3])
                     : MTLClearColorMake(value.float32[0], value.float32[1], value.float32[2], value.float32[3]);
             }
-            if (resolves && resolves[index]) { attachment.resolveTexture = I(resolves[index]).texture; attachment.storeAction = MTLStoreActionMultisampleResolve; }
+            if (resolves && resolves[index]) { attachment.resolveTexture = I(resolves[index]).texture; cmd.colorStores[color - 1] = MTLStoreActionMultisampleResolve; }
         }
-        if (cmd.counters) {
-            uint32_t first = EncoderSamples(cmd);
-            auto sample = pass.sampleBufferAttachments[0];
-            sample.sampleBuffer = cmd.counters;
-            sample.startOfVertexSampleIndex = first;
-            sample.endOfVertexSampleIndex = first + 1;
-            sample.startOfFragmentSampleIndex = first + 2;
-            sample.endOfFragmentSampleIndex = first + 3;
-        }
-        cmd.render = [cmd.buffer renderCommandEncoderWithDescriptor:pass];
-        Require(cmd.render != nil, "Cannot create render encoder");
         auto extent = GetDesc(attachments[0]).extent;
         extent.width = std::max(1u, extent.width >> mip);
         extent.height = std::max(1u, extent.height >> mip);
-        [cmd.render setViewport:MTLViewport{0, 0, double(extent.width), double(extent.height), 0, 1}];
-        [cmd.render setScissorRect:MTLScissorRect{0, 0, extent.width, extent.height}];
-        [cmd.render setVertexBuffer:S().argumentBuffer offset:0 atIndex:metal::ARGUMENT_BUFFER];
-        [cmd.render setFragmentBuffer:S().argumentBuffer offset:0 atIndex:metal::ARGUMENT_BUFFER];
-        Residency(cmd.render);
+        cmd.viewport = {0, 0, double(extent.width), double(extent.height), 0, 1};
+        cmd.scissor = {0, 0, extent.width, extent.height};
+        RenderEncoder(cmd);
     }
 }
 
@@ -1054,12 +1088,16 @@ void Cmd::clear(Image image, ClearValue value) {
 void Cmd::vertex(Buffer& buffer, uint64_t offset) { C(*this).vertices = buffer; C(*this).vertexOffset = offset; }
 void Cmd::index(Buffer& buffer, bool half, uint64_t offset) { C(*this).indices = buffer; C(*this).halfIndices = half; C(*this).indexOffset = offset; }
 void Cmd::viewport(float x, float y, float width, float height, float near, float far) {
-    Require(C(*this).render != nil, "Viewport requires render pass");
-    [C(*this).render setViewport:MTLViewport{double(x), double(y), double(width), double(height), double(near), double(far)}];
+    auto& cmd = C(*this);
+    Require(cmd.render != nil, "Viewport requires render pass");
+    cmd.viewport = {double(x), double(y + height), double(width), double(-height), double(near), double(far)};
+    [cmd.render setViewport:cmd.viewport];
 }
 void Cmd::scissor(int32_t x, int32_t y, uint32_t width, uint32_t height) {
     Require(C(*this).render != nil && x >= 0 && y >= 0, "Invalid scissor");
-    [C(*this).render setScissorRect:MTLScissorRect{NSUInteger(x), NSUInteger(y), width, height}];
+    auto& cmd = C(*this);
+    cmd.scissor = {NSUInteger(x), NSUInteger(y), width, height};
+    [cmd.render setScissorRect:cmd.scissor];
 }
 void Cmd::lineWidth(float) {}
 namespace {
@@ -1095,8 +1133,43 @@ void Cmd::drawIndexedIndirect(Buffer& buffer, uint64_t offset, uint32_t count, u
     for (uint32_t index = 0; index < count; ++index) [cmd.render drawIndexedPrimitives:PrimitiveType(cmd) indexType:cmd.halfIndices ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
         indexBuffer:B(cmd.indices).buffer indexBufferOffset:cmd.indexOffset indirectBuffer:B(buffer).buffer indirectBufferOffset:offset + index * stride];
 }
-void Cmd::drawIndirectCount(Buffer&, uint64_t, Buffer&, uint64_t, uint32_t, uint32_t) { Require(false, "GPU-counted indirect drawing is not implemented yet"); }
-void Cmd::drawIndexedIndirectCount(Buffer&, uint64_t, Buffer&, uint64_t, uint32_t, uint32_t) { Require(false, "GPU-counted indexed drawing is not implemented yet"); }
+namespace {
+uint64_t FilterDrawCount(Command& cmd, Buffer& source, uint64_t offset, Buffer& count, uint64_t countOffset, uint32_t maximum, uint32_t stride, uint32_t words) {
+    Require(cmd.render != nil, "Counted draw requires a render pass");
+    Require(offset % 4 == 0 && countOffset % 4 == 0 && stride % 4 == 0 && stride >= words * 4, "Invalid indirect arguments alignment/stride");
+    uint64_t size = maximum ? uint64_t(maximum - 1) * stride + words * 4 : 0;
+    Require(offset <= GetDesc(source).size && size <= GetDesc(source).size - offset, "Indirect arguments exceed buffer size");
+    Require(countOffset <= GetDesc(count).size && 4 <= GetDesc(count).size - countOffset, "Indirect count exceeds buffer size");
+    uint64_t filtered = Scratch(cmd, uint64_t(maximum) * words * 4);
+    EndRenderEncoder(cmd, true);
+    Compute(cmd);
+    struct { uint32_t stride, words, maximum; } params = {stride / 4, words, maximum};
+    [cmd.compute setComputePipelineState:S().indirectCount];
+    [cmd.compute setBuffer:B(source).buffer offset:offset atIndex:0];
+    [cmd.compute setBuffer:B(count).buffer offset:countOffset atIndex:1];
+    [cmd.compute setBuffer:B(cmd.staging).buffer offset:filtered atIndex:2];
+    [cmd.compute setBytes:&params length:sizeof(params) atIndex:3];
+    [cmd.compute dispatchThreads:MTLSizeMake(maximum, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min(NSUInteger(64), S().indirectCount.maxTotalThreadsPerThreadgroup), 1, 1)];
+    EndEncoder(cmd);
+    for (uint32_t index = 0; index < MAX_ATTACHMENTS_COUNT; ++index) cmd.renderPass.colorAttachments[index].loadAction = MTLLoadActionLoad;
+    cmd.renderPass.depthAttachment.loadAction = MTLLoadActionLoad;
+    cmd.renderPass.stencilAttachment.loadAction = MTLLoadActionLoad;
+    RenderEncoder(cmd);
+    return filtered;
+}
+}
+void Cmd::drawIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countOffset, uint32_t count, uint32_t stride) {
+    if (count == 0) return;
+    auto& cmd = C(*this);
+    uint64_t filtered = FilterDrawCount(cmd, buffer, offset, countBuffer, countOffset, count, stride, 4);
+    drawIndirect(cmd.staging, filtered, count, 16);
+}
+void Cmd::drawIndexedIndirectCount(Buffer& buffer, uint64_t offset, Buffer& countBuffer, uint64_t countOffset, uint32_t count, uint32_t stride) {
+    if (count == 0) return;
+    auto& cmd = C(*this);
+    uint64_t filtered = FilterDrawCount(cmd, buffer, offset, countBuffer, countOffset, count, stride, 5);
+    drawIndexedIndirect(cmd.staging, filtered, count, 20);
+}
 int Cmd::beginTimestamp(const char* name) {
     auto& cmd = C(*this);
     if (!cmd.counters) return -1;
