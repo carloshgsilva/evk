@@ -13,7 +13,25 @@
 namespace evk::ai {
     evk::Cmd& GetCmd();
     uint64_t SubmitCmd(bool wait = true);
-    void WithCmd(evk::Cmd& cmd, const std::function<void()>& record);
+
+    namespace detail {
+        class CommandScope {
+        public:
+            explicit CommandScope(evk::Cmd& cmd);
+            ~CommandScope();
+            CommandScope(const CommandScope&) = delete;
+            CommandScope& operator=(const CommandScope&) = delete;
+
+        private:
+            evk::Cmd* previous_;
+        };
+    }
+
+    template<typename Record>
+    void WithCmd(evk::Cmd& cmd, Record&& record) {
+        detail::CommandScope scope(cmd);
+        record();
+    }
 }
 
 struct float16_t {
