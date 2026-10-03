@@ -469,13 +469,40 @@ id<MTLFunction> Function(const std::vector<uint8_t>& bytes, const ConstantRaw& c
     std::string stem = std::string(directory ? directory : ".cache/metal/shaders") + "/" + hash;
     std::ifstream metadata(stem + ".info", std::ios::binary);
     Require(bool(metadata.read(reinterpret_cast<char*>(&info), sizeof(info))), "Missing shader metadata: %s.info", stem.c_str());
-    Require(info.magic == 0x4D534C31 && info.version == 2 && info.hash == metal::ShaderHash(bytes), "Invalid shader metadata: %s", stem.c_str());
+    Require(info.magic == 0x4D534C31 && info.version == 5 && info.hash == metal::ShaderHash(bytes), "Invalid shader metadata: %s", stem.c_str());
     NSError* error = nil;
     NSURL* url = [NSURL fileURLWithPath:[[NSString alloc] initWithUTF8String:(stem + ".metallib").c_str()]];
-    id<MTLLibrary> library = [S().device newLibraryWithURL:url error:&error];
+    id<MTLLibrary> library = nil;
+    if (info.staticConstants) {
+        MTLCompileOptions* options = [MTLCompileOptions new];
+        options.languageVersion = MTLLanguageVersion3_1;
+        options.fastMathEnabled = YES;
+        options.preserveInvariance = YES;
+        NSMutableDictionary* macros = [NSMutableDictionary new];
+        for (uint32_t index = 0; index < 32; ++index) {
+            if (!(info.staticConstants & (1u << index))) continue;
+            uint32_t bits = info.constantDefaults[index];
+            if (index < constants.count) std::memcpy(&bits, constants.data + index * 4, sizeof(bits));
+            NSNumber* value = info.constantTypes[index] == metal::ConstantType::Int ? @(int32_t(bits)) : @(bits);
+            if (info.constantTypes[index] == metal::ConstantType::Float) {
+                float number;
+                std::memcpy(&number, &bits, sizeof(number));
+                value = @(number);
+            }
+            macros[[NSString stringWithFormat:@"SPIRV_CROSS_CONSTANT_ID_%u", index]] = value;
+        }
+        options.preprocessorMacros = macros;
+        NSString* sourcePath = [[NSString alloc] initWithUTF8String:(stem + ".metal").c_str()];
+        NSString* source = [NSString stringWithContentsOfFile:sourcePath encoding:NSUTF8StringEncoding error:&error];
+        Require(source != nil, "Cannot read array-specialized shader %s: %s", stem.c_str(), error.localizedDescription.UTF8String);
+        library = [S().device newLibraryWithSource:source options:options error:&error];
+    } else {
+        library = [S().device newLibraryWithURL:url error:&error];
+    }
     Require(library != nil, "Cannot load shader %s: %s", stem.c_str(), error.localizedDescription.UTF8String);
     MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
-    for (uint32_t index = 0; index < constants.count; ++index) {
+    for (uint32_t index = 0; index < 32; ++index) {
+        if (info.staticConstants & (1u << index)) continue;
         MTLDataType type = MTLDataTypeNone;
         switch (info.constantTypes[index]) {
             case metal::ConstantType::Bool: type = MTLDataTypeBool; break;
@@ -484,8 +511,10 @@ id<MTLFunction> Function(const std::vector<uint8_t>& bytes, const ConstantRaw& c
             case metal::ConstantType::Float: type = MTLDataTypeFloat; break;
             default: continue;
         }
-        bool boolean = constants.data[index * 4] != 0;
-        const void* value = type == MTLDataTypeBool ? static_cast<const void*>(&boolean) : constants.data + index * 4;
+        uint32_t bits = info.constantDefaults[index];
+        if (index < constants.count) std::memcpy(&bits, constants.data + index * 4, sizeof(bits));
+        bool boolean = bits != 0;
+        const void* value = type == MTLDataTypeBool ? static_cast<const void*>(&boolean) : static_cast<const void*>(&bits);
         [values setConstantValue:value type:type atIndex:index];
     }
     id<MTLFunction> function = [library newFunctionWithName:@"main0" constantValues:values error:&error];
@@ -591,12 +620,23 @@ Pipeline CreatePipeline(const PipelineDesc& desc) {
         NSError* error = nil;
         if (!desc.CS.empty()) {
             id<MTLFunction> function = Function(desc.CS, desc.constants, info);
-            pipeline->group = MTLSizeMake(info.groupX, info.groupY, info.groupZ);
+            auto groupSize = [&](uint32_t size, uint32_t constant) {
+                if (constant < desc.constants.count) std::memcpy(&size, desc.constants.data + constant * 4, sizeof(size));
+                Require(size > 0, "Compute workgroup size must be positive");
+                return size;
+            };
+            pipeline->group = MTLSizeMake(groupSize(info.groupX, info.groupConstantX),
+                groupSize(info.groupY, info.groupConstantY), groupSize(info.groupZ, info.groupConstantZ));
+            auto limit = S().device.maxThreadsPerThreadgroup;
+            Require(pipeline->group.width <= limit.width && pipeline->group.height <= limit.height
+                && pipeline->group.depth <= limit.depth, "Compute workgroup dimensions exceed device limits");
             MTLComputePipelineDescriptor* compute = [MTLComputePipelineDescriptor new];
             compute.computeFunction = function;
-            compute.maxTotalThreadsPerThreadgroup = info.groupX * info.groupY * info.groupZ;
+            compute.maxTotalThreadsPerThreadgroup = pipeline->group.width * pipeline->group.height * pipeline->group.depth;
             pipeline->compute = [S().device newComputePipelineStateWithDescriptor:compute options:MTLPipelineOptionNone reflection:nil error:&error];
             Require(pipeline->compute != nil, "Cannot create compute pipeline %s: %s", desc.name.c_str(), error.localizedDescription.UTF8String);
+            Require(compute.maxTotalThreadsPerThreadgroup <= pipeline->compute.maxTotalThreadsPerThreadgroup,
+                "Compute workgroup size exceeds pipeline limits");
             return Pipeline(pipeline);
         }
         MTLRenderPipelineDescriptor* render = [MTLRenderPipelineDescriptor new];
@@ -653,6 +693,7 @@ bool InitializeEVK(const EvkDesc& desc) {
         Require(state.device != nil && state.device.argumentBuffersSupport == MTLArgumentBuffersTier2, "A tier-2 Metal device is required");
         state.queue = [state.device newCommandQueueWithMaxCommandBufferCount:COMMAND_COUNT];
         state.features.raytracing = state.device.supportsRaytracing;
+        state.features.coopmat = [state.device supportsFamily:MTLGPUFamilyApple7];
         state.features.maxFramebufferSampleCount = GetSupportedSampleCount(SampleCount::SixtyFour);
         state.buffers.Initialize(std::min(desc.bindless.storageBufferCount, metal::BUFFER_COUNT));
         state.images.Initialize(std::min(desc.bindless.imageCount, metal::IMAGE_COUNT));

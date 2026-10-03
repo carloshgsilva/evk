@@ -28,12 +28,17 @@ inline uint64_t ShaderHash(std::span<const uint8_t> bytes) {
 
 struct ShaderInfo {
     uint32_t magic = 0x4D534C31;
-    uint32_t version = 2;
+    uint32_t version = 5;
     ShaderStage stage = ShaderStage::Vertex;
     uint32_t groupX = 1;
     uint32_t groupY = 1;
     uint32_t groupZ = 1;
+    uint32_t groupConstantX = UINT32_MAX;
+    uint32_t groupConstantY = UINT32_MAX;
+    uint32_t groupConstantZ = UINT32_MAX;
     uint64_t hash = 0;
     ConstantType constantTypes[32] = {};
+    uint32_t constantDefaults[32] = {};
+    uint32_t staticConstants = 0;
 };
 }

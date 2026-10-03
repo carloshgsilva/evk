@@ -1,4 +1,5 @@
 #include "evk_metal_shader.h"
+#include "metal_cooperative.h"
 
 #include <spirv_msl.hpp>
 #include <algorithm>
@@ -17,8 +18,46 @@ class MetalCompiler : public spirv_cross::CompilerMSL {
 public:
     using CompilerMSL::CompilerMSL;
 
+    void PrepareCooperativeMatrices() {
+        std::vector<uint32_t> undefined;
+        ir.for_each_typed_id<spirv_cross::SPIRUndef>([&](uint32_t id, const auto& value) {
+            const auto& type = get<spirv_cross::SPIRType>(value.basetype);
+            if (type.op == spv::OpTypeCooperativeMatrixKHR) undefined.push_back(id);
+        });
+        for (auto id : undefined) {
+            auto type = get<spirv_cross::SPIRUndef>(id).basetype;
+            ir.ids[id].set_allow_type_rewrite();
+            set<spirv_cross::SPIRConstant>(id, type, uint32_t(0), false);
+        }
+    }
+
 protected:
     std::vector<uint32_t> samplerAliases;
+
+    const spirv_cross::SPIRType* CooperativeType(const spirv_cross::SPIRType& type) {
+        const auto* matrix = &type;
+        while (matrix && (is_pointer(*matrix) || is_array(*matrix))) matrix = maybe_get<spirv_cross::SPIRType>(matrix->parent_type);
+        return matrix && matrix->op == spv::OpTypeCooperativeMatrixKHR ? matrix : nullptr;
+    }
+
+    std::string type_to_glsl(const spirv_cross::SPIRType& type, uint32_t id = 0) override {
+        const auto* matrix = CooperativeType(type);
+        if (!matrix || is_pointer(type)) return CompilerMSL::type_to_glsl(type, id);
+        auto rows = get<spirv_cross::SPIRConstant>(matrix->ext.cooperative.rows_id).scalar();
+        auto columns = get<spirv_cross::SPIRConstant>(matrix->ext.cooperative.columns_id).scalar();
+        if ((rows != 8 && rows != 16) || (columns != 8 && columns != 16)
+            || get<spirv_cross::SPIRConstant>(matrix->ext.cooperative.scope_id).scalar() != spv::ScopeSubgroup) {
+            throw std::runtime_error("Native cooperative matrices require subgroup scope and 8/16 dimensions");
+        }
+        auto name = "evk_cooperative_matrix<" + CompilerMSL::type_to_glsl(get<spirv_cross::SPIRType>(matrix->parent_type))
+            + ", " + std::to_string(rows) + ", " + std::to_string(columns) + ">";
+        if (type.array.empty() || using_builtin_array()) return name;
+        add_spv_func_and_recompile(SPVFuncImplUnsafeArray);
+        for (uint32_t i = 0; i < type.array.size(); ++i) {
+            name = "spvUnsafeArray<" + name + ", " + to_array_size(type, i) + ">";
+        }
+        return name;
+    }
 
     void emit_entry_point_declarations() override {
         CompilerMSL::emit_entry_point_declarations();
@@ -42,11 +81,33 @@ protected:
     }
 
     void emit_instruction(const spirv_cross::Instruction& instruction) override {
+        const auto* operands = stream(instruction);
+        if (instruction.op == spv::OpFConvert && CooperativeType(get<spirv_cross::SPIRType>(operands[0]))) {
+            emit_op(operands[0], operands[1], type_to_glsl(get<spirv_cross::SPIRType>(operands[0]))
+                + "(" + to_expression(operands[2]) + ")", false);
+            inherit_expression_dependencies(operands[1], operands[2]);
+            return;
+        }
+        if (instruction.op == spv::OpFAdd && CooperativeType(get<spirv_cross::SPIRType>(operands[0]))) {
+            emit_op(operands[0], operands[1], to_expression(operands[2]) + " + " + to_expression(operands[3]), false);
+            inherit_expression_dependencies(operands[1], operands[2]);
+            inherit_expression_dependencies(operands[1], operands[3]);
+            return;
+        }
+        if (instruction.op == spv::OpLoad) {
+            auto* variable = maybe_get_backing_variable(operands[2]);
+            if (variable && CooperativeType(get_variable_data_type(*variable))
+                && !CooperativeType(get<spirv_cross::SPIRType>(operands[0]))) {
+                emit_op(operands[0], operands[1], type_to_glsl(get<spirv_cross::SPIRType>(operands[0]))
+                    + "(" + to_expression(operands[2]) + ")", false);
+                register_read(operands[1], operands[2], false);
+                return;
+            }
+        }
         if (instruction.op != spv::OpRayQueryGetIntersectionTriangleVertexPositionsKHR) {
             CompilerMSL::emit_instruction(instruction);
             return;
         }
-        const auto* operands = stream(instruction);
         flush_variable_declaration(operands[2]);
         auto query = to_expression(operands[2]);
         bool committed = get<spirv_cross::SPIRConstant>(operands[3]).scalar_i32() != 0;
@@ -101,7 +162,13 @@ void Translate(const std::filesystem::path& input, const std::filesystem::path& 
     MetalCompiler compiler(std::move(words));
     const auto stage = compiler.get_execution_model();
     auto options = compiler.get_msl_options();
-    options.msl_version = 30000;
+    const auto& capabilities = compiler.get_declared_capabilities();
+    bool cooperative = std::find(capabilities.begin(), capabilities.end(), spv::CapabilityCooperativeMatrixKHR) != capabilities.end();
+    options.msl_version = cooperative ? 30100 : 30000;
+    if (cooperative) {
+        compiler.PrepareCooperativeMatrices();
+        compiler.add_header_line(METAL_COOPERATIVE_MATRIX);
+    }
     options.argument_buffers = true;
     options.argument_buffers_tier = spirv_cross::CompilerMSL::Options::ArgumentBuffersTier::Tier2;
     options.pad_argument_buffer_resources = true;
@@ -142,17 +209,19 @@ void Translate(const std::filesystem::path& input, const std::filesystem::path& 
         default: throw std::runtime_error("Unsupported Metal shader stage");
     }
     info.hash = evk::metal::ShaderHash(bytes);
-    const auto& entry = compiler.get_entry_point(compiler.get_entry_points_and_stages()[0].name, stage);
     if (stage == spv::ExecutionModelGLCompute) {
-        if (entry.workgroup_size.id_x || entry.workgroup_size.id_y || entry.workgroup_size.id_z) {
-            throw std::runtime_error("Specialized workgroup sizes require explicit metadata support");
-        }
-        info.groupX = entry.workgroup_size.x;
-        info.groupY = entry.workgroup_size.y;
-        info.groupZ = entry.workgroup_size.z;
+        spirv_cross::SpecializationConstant x{}, y{}, z{};
+        compiler.get_work_group_size_specialization_constants(x, y, z);
+        info.groupX = compiler.get_execution_mode_argument(spv::ExecutionModeLocalSize, 0);
+        info.groupY = compiler.get_execution_mode_argument(spv::ExecutionModeLocalSize, 1);
+        info.groupZ = compiler.get_execution_mode_argument(spv::ExecutionModeLocalSize, 2);
+        if (x.id) info.groupConstantX = x.constant_id;
+        if (y.id) info.groupConstantY = y.constant_id;
+        if (z.id) info.groupConstantZ = z.constant_id;
     }
     for (const auto& constant : compiler.get_specialization_constants()) {
         if (constant.constant_id >= 32) throw std::runtime_error("Function constant ID exceeds EVK constant slots");
+        info.constantDefaults[constant.constant_id] = compiler.get_constant(constant.id).scalar();
         const auto& type = compiler.get_type(compiler.get_constant(constant.id).constant_type);
         if (type.vecsize != 1 || type.columns != 1 || (type.basetype != spirv_cross::SPIRType::Boolean && type.width != 32)) {
             throw std::runtime_error("Unsupported function constant type");
@@ -171,6 +240,9 @@ void Translate(const std::filesystem::path& input, const std::filesystem::path& 
     std::filesystem::create_directories(output);
     const auto stem = output / name.str();
     const std::string source = compiler.compile();
+    for (const auto& constant : compiler.get_specialization_constants()) {
+        if (compiler.get_constant(constant.id).is_used_as_array_length) info.staticConstants |= 1u << constant.constant_id;
+    }
     std::ofstream metal(stem.string() + ".metal");
     metal << source;
     if (!metal) throw std::runtime_error("Cannot write MSL source");
