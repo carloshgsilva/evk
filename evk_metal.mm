@@ -157,6 +157,7 @@ struct Command {
     MTLStoreAction stencilStore = MTLStoreActionDontCare;
     MTLViewport viewport = {};
     MTLScissorRect scissor = {};
+    Extent renderExtent = {};
     MTLComputePassDescriptor* computePass = nil;
     MTLBlitPassDescriptor* blitPass = nil;
     MTLAccelerationStructurePassDescriptor* accelerationPass = nil;
@@ -1016,6 +1017,7 @@ void BeginRender(Cmd& api, Image* attachments, ClearValue* clears, int count, Im
         auto extent = GetDesc(attachments[0]).extent;
         extent.width = std::max(1u, extent.width >> mip);
         extent.height = std::max(1u, extent.height >> mip);
+        cmd.renderExtent = extent;
         cmd.viewport = {0, 0, double(extent.width), double(extent.height), 0, 1};
         cmd.scissor = {0, 0, extent.width, extent.height};
         RenderEncoder(cmd);
@@ -1105,7 +1107,9 @@ void Cmd::viewport(float x, float y, float width, float height, float near, floa
 void Cmd::scissor(int32_t x, int32_t y, uint32_t width, uint32_t height) {
     Require(C(*this).render != nil && x >= 0 && y >= 0, "Invalid scissor");
     auto& cmd = C(*this);
-    cmd.scissor = {NSUInteger(x), NSUInteger(y), width, height};
+    uint32_t left = std::min(uint32_t(x), cmd.renderExtent.width);
+    uint32_t top = std::min(uint32_t(y), cmd.renderExtent.height);
+    cmd.scissor = {left, top, std::min(width, cmd.renderExtent.width - left), std::min(height, cmd.renderExtent.height - top)};
     [cmd.render setScissorRect:cmd.scissor];
 }
 void Cmd::lineWidth(float width) { Require(width == 1.0f, "Native line primitives support width one; use triangles for wider lines"); }
