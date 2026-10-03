@@ -950,6 +950,9 @@ namespace evk {
             if (extension == VK_EXT_DEBUG_UTILS_EXTENSION_NAME) debugUtilsEnabled = true;
         }
 
+        S.presentMode = desc.presentMode;
+        S.swapchainImageCount = desc.swapchainImageCount;
+
         S.storageCount = desc.bindless.storageBufferCount;
         S.imageCount = desc.bindless.imageCount;
         S.samplerCount = desc.bindless.imageCount;
@@ -1812,17 +1815,26 @@ namespace evk {
             std::vector<VkPresentModeKHR> presentModes(presentModeCount);
             CHECK_VK(vkGetPhysicalDeviceSurfacePresentModesKHR(S.physicalDevice, S.surface, &presentModeCount, presentModes.data()));
 
-            for (VkPresentModeKHR mode : presentModes) {
-                if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
-                    presentMode = mode;
-                    break;
+            if (S.presentMode == PresentMode::Automatic) {
+                for (VkPresentModeKHR mode : presentModes) {
+                    if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+                        presentMode = mode;
+                        break;
+                    }
+                    if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                        presentMode = mode;
+                    }
                 }
-                if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
-                    presentMode = mode;
+            } else {
+                presentMode = S.presentMode == PresentMode::Immediate ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+                if (std::find(presentModes.begin(), presentModes.end(), presentMode) == presentModes.end()) {
+                    printf("[evk] Requested presentation mode is unsupported\n");
+                    return false;
                 }
             }
         }
-        uint32_t imageCount = surfaceCaps.minImageCount < 2 ? 2 : surfaceCaps.minImageCount;
+        uint32_t requestedImages = S.swapchainImageCount == 0 ? 2 : S.swapchainImageCount;
+        uint32_t imageCount = std::max(requestedImages, surfaceCaps.minImageCount);
         if (surfaceCaps.maxImageCount > 0 && imageCount > surfaceCaps.maxImageCount) {
             imageCount = surfaceCaps.maxImageCount;
         }
@@ -1854,6 +1866,12 @@ namespace evk {
         CHECK_VK(S.vulkanGetSwapchainImagesKHR(S.device, S.swapchain, &swapchainImageCount, nullptr));
         images.resize(swapchainImageCount);
         CHECK_VK(S.vulkanGetSwapchainImagesKHR(S.device, S.swapchain, &swapchainImageCount, images.data()));
+
+        const char* modeName = presentMode == VK_PRESENT_MODE_FIFO_KHR ? "fifo" :
+            presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "mailbox";
+        printf("[evk] Swapchain Vulkan | present_mode=%s | requested_images=%u | images=%u | command_slots=%u | extent=%ux%u\n",
+            modeName, S.swapchainImageCount, swapchainImageCount, MAX_COMMAND_BUFFERS, extent.width, extent.height);
+        fflush(stdout);
         
         // Clean up old swapchain images
         for (auto& img : S.swapchainImages) {

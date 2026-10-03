@@ -198,6 +198,8 @@ struct State {
     std::array<std::array<id<MTLRenderPipelineState>, 3>, uint32_t(Format::D32Sfloat) + 1> blitPipelines;
     CAMetalLayer* layer = nil;
     NSView* view = nil;
+    PresentMode presentMode = PresentMode::Automatic;
+    uint32_t swapchainImageCount = 0;
     Features features;
     Slots buffers;
     Slots images;
@@ -717,6 +719,8 @@ bool InitializeEVK(const EvkDesc& desc) {
         Require(G == nullptr, "Backend already initialized");
         G = new State;
         auto& state = S();
+        state.presentMode = desc.presentMode;
+        state.swapchainImageCount = desc.swapchainImageCount;
         state.device = MTLCreateSystemDefaultDevice();
         Require(state.device != nil && state.device.argumentBuffersSupport == MTLArgumentBuffersTier2, "A tier-2 Metal device is required");
         state.queue = [state.device newCommandQueueWithMaxCommandBufferCount:COMMAND_COUNT];
@@ -791,10 +795,19 @@ bool InitializeSwapchain(void* nativeWindow) {
         S().layer.device = S().device;
         S().layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         S().layer.framebufferOnly = YES;
-        S().layer.maximumDrawableCount = 3;
+        const uint32_t imageCount = S().swapchainImageCount == 0 ? 3 : S().swapchainImageCount;
+        Require(imageCount == 2 || imageCount == 3, "Metal supports two or three drawables");
+        S().layer.maximumDrawableCount = imageCount;
+        if (S().presentMode != PresentMode::Automatic) {
+            S().layer.displaySyncEnabled = S().presentMode == PresentMode::Fifo;
+        }
         S().view.wantsLayer = YES;
         S().view.layer = S().layer;
         ResizeLayer();
+        std::printf("[evk] Swapchain Metal | display_sync=%d | requested_images=%u | maximum_drawables=%lu | command_slots=%u | extent=%ux%u\n",
+            S().layer.displaySyncEnabled, S().swapchainImageCount, (unsigned long)S().layer.maximumDrawableCount,
+            COMMAND_COUNT, uint32_t(S().layer.drawableSize.width), uint32_t(S().layer.drawableSize.height));
+        std::fflush(stdout);
         return true;
     }
 }

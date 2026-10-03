@@ -329,6 +329,8 @@ namespace evk {
         uint32_t tlasCount = 16384;
     };
 
+    enum class PresentMode { Automatic, Immediate, Fifo };
+
     struct EvkDesc {
         std::string applicationName = "";
         std::uint32_t applicationVersion = 0;
@@ -342,6 +344,8 @@ namespace evk {
         uint32_t extraGraphicsQueueCount = 0;
         uint32_t extraComputeQueueCount = 0;
         uint32_t frameBufferingCount = 3;
+        PresentMode presentMode = PresentMode::Automatic;
+        uint32_t swapchainImageCount = 0; // Backend default; Vulkan may return more images.
         bool enableSwapchain = false; // VK_KHR_swapchain
         bool enableValidation = false;
         bool enableTimestamps = false;

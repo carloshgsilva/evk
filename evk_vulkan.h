@@ -168,6 +168,8 @@ namespace evk {
         SubmissionTiming submissionTiming;
 
         // Swapchain
+        PresentMode presentMode = PresentMode::Automatic;
+        uint32_t swapchainImageCount = 0;
         VkSurfaceKHR surface;
         VkSwapchainKHR swapchain;
         uint32_t swapchainIndex = 0;
