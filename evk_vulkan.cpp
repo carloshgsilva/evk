@@ -1496,6 +1496,9 @@ namespace evk {
             allocatorInfo.instance = S.instance;
             allocatorInfo.physicalDevice = S.physicalDevice;
             allocatorInfo.device = S.device;
+            #if defined(__APPLE__)
+            allocatorInfo.preferredLargeHeapBlockSize = 64 * 1024 * 1024;
+            #endif
             vmaCreateAllocator(&allocatorInfo, &S.allocator);
         }
 
