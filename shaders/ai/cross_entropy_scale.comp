@@ -5,19 +5,28 @@
 #extension GL_EXT_buffer_reference : enable
 
 layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
-layout(buffer_reference) buffer BufferFp32 { float x[]; };
+#include "fp16_stats.glsl"
 
 PUSH(
     BufferFp16 resultBuffer; // scalar loss output
-    BufferFp32 accumBuffer;  // float[2] -> {totalLoss, validCount}
+    BufferFp16 accumBuffer;  // valid count followed by per-row loss terms
+    uint totalPositions;
 )
 
 // Write mean loss (grads are already scaled in cross_entropy.comp)
-COMPUTE(1, 1, 1)
+// FP32 is temporary reduction scratch inside this dispatch, never persisted.
+shared float partial[64];
+COMPUTE(256, 1, 1)
 void main() {
-    float totalLoss = accumBuffer.x[0];
-    float validCount = accumBuffer.x[1];
-    float loss = (validCount > 0.0) ? totalLoss : 0.0;
+    float local = 0.0;
+    for (uint row = gl_LocalInvocationID.x; row < totalPositions; row += 256u)
+        local += read_fp16_stat(accumBuffer, 3u * (row + 1u));
+    float sum = subgroupAdd(local);
+    if (gl_SubgroupInvocationID == 0u) partial[gl_SubgroupID] = sum;
+    barrier();
+    if (gl_LocalInvocationID.x != 0u) return;
+    float loss = 0.0;
+    for (uint i = 0u; i < gl_NumSubgroups; ++i) loss += partial[i];
     if (isnan(loss) || isinf(loss)) {
         loss = 0.0;
     }

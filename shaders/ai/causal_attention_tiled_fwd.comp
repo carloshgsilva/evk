@@ -1,0 +1,138 @@
+#include "../common/evk.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+CONSTANT(0) uint width = 256u;
+CONSTANT(2) uint wide_accumulation = 0u;
+#define Acc coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define HalfAcc coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MatA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MatB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+PUSH(BufferFp16 q; BufferFp16 k; BufferFp16 v; BufferFp16 outputBuffer;
+     BufferFp16 stats; BufferFp16 dy; BufferFp16 dq; BufferFp16 dk; BufferFp16 dv;
+     uint length; uint window; float scale;)
+#include "fp16_stats.glsl"
+const uint span = 128u, warps = 8u;
+shared float16_t tile[16u * span];
+shared float dot_accumulation[16u * span];
+shared float row_scale[256];
+// All eight warps form a16x128 QK tile. Output features are distributed over them.
+void scores(uint base, uint row, uint col) {
+    uint key_row = col + gl_SubgroupID * 16u;
+    HalfAcc score = HalfAcc(0.0);
+    Acc wide_score = Acc(0.0);
+    if (key_row < length)
+        for (uint f = 0u; f < width; f += 16u) {
+            MatA a; MatB b;
+            coopMatLoad(a, q.x, base + row * width + f, width, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b, k.x, base + key_row * width + f, width, gl_CooperativeMatrixLayoutColumnMajor);
+            if (wide_accumulation != 0u) wide_score = coopMatMulAdd(a, b, wide_score);
+            else score = coopMatMulAdd(a, b, score);
+        }
+    if (wide_accumulation == 0u) wide_score = Acc(score);
+    coopMatStore(wide_score, dot_accumulation, gl_SubgroupID * 16u, span, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+}
+bool visible(uint row, uint col, float raw) {
+    return col <= row && (window == 0u || col + window > row) && !(raw <= -65504.0);
+}
+COMPUTE(256, 1, 1)
+void main() {
+    uint row = gl_WorkGroupID.x * 16u, warp = gl_SubgroupID;
+    uint local_row = gl_LocalInvocationID.x / 16u, lane = gl_LocalInvocationID.x % 16u;
+    uint query_row = row + local_row, base = gl_WorkGroupID.y * length * width;
+    uint first = window > 0u && row + 1u > window ? ((row + 1u - window) / span) * span : 0u;
+    uint last = row + 16u;
+    float maximum = -3.402823466e+38, denominator = 0.0;
+    float probability_scale = wide_accumulation != 0u ? 16.0 : 1.0;
+    Acc online_result[(width + 127u) / 128u];
+    for (uint f = 0u; f < (width + 127u) / 128u; ++f) online_result[f] = Acc(0.0);
+    for (uint col = first; col < last; col += span) {
+        scores(base, row, col);
+        float m = -3.402823466e+38;
+        for (uint c = lane; c < span; c += 16u) {
+            float raw = dot_accumulation[local_row * span + c];
+            if (visible(query_row, col + c, raw)) m = max(m, raw * scale);
+        }
+        for (uint offset = 1u; offset < 16u; offset *= 2u) m = max(m, subgroupShuffleXor(m, offset));
+        m = max(maximum, m);
+        float sum = 0.0;
+        for (uint c = lane; c < span; c += 16u) {
+            float raw = dot_accumulation[local_row * span + c];
+            float weight = visible(query_row, col + c, raw) ? exp(raw * scale - m) : 0.0;
+            sum += weight;
+            if (wide_accumulation != 0u) tile[local_row * span + c] = float16_t(weight * probability_scale);
+        }
+        for (uint offset = 1u; offset < 16u; offset *= 2u) sum += subgroupShuffleXor(sum, offset);
+        float rescale = exp(maximum - m);
+        denominator = denominator * rescale + sum;
+        if (wide_accumulation != 0u) row_scale[gl_LocalInvocationID.x] = rescale;
+        maximum = m;
+        barrier();
+        if (wide_accumulation != 0u) {
+            Acc rescaling;
+            coopMatLoad(rescaling, row_scale, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint f = warp; f < width / 16u; f += warps) {
+                Acc partial = Acc(0.0);
+                for (uint t = 0u; t < min(span, length - col) / 16u; ++t) {
+                    MatA p; MatB values;
+                    coopMatLoad(p, tile, t * 16u, span, gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(values, v.x, base + (col + t * 16u) * width + f * 16u, width, gl_CooperativeMatrixLayoutRowMajor);
+                    partial = coopMatMulAdd(p, values, partial);
+                }
+                online_result[f / warps] = online_result[f / warps] * rescaling + partial;
+            }
+            barrier();
+        }
+    }
+    if (lane == 0u) {
+        uint index = (gl_WorkGroupID.y * length + query_row) * 9u;
+        write_fp16_stat(stats, index, denominator == 0.0 ? 0.0 : maximum);
+        write_fp16_stat(stats, index + 3u, denominator);
+    }
+    if (wide_accumulation != 0u) {
+        row_scale[gl_LocalInvocationID.x] = denominator == 0.0 ? 0.0 : 1.0 / (denominator * probability_scale);
+        barrier();
+        Acc normalization;
+        coopMatLoad(normalization, row_scale, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint f = warp; f < width / 16u; f += warps) {
+            HalfAcc rounded = HalfAcc(online_result[f / warps] * normalization);
+            coopMatStore(rounded, outputBuffer.x, base + row * width + f * 16u, width, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        return;
+    }
+    Acc result[(width + 127u) / 128u], total[(width + 127u) / 128u];
+    HalfAcc short_result[(width + 127u) / 128u];
+    for (uint f = 0u; f < (width + 127u) / 128u; ++f) {
+        result[f] = Acc(0.0); total[f] = Acc(0.0); short_result[f] = HalfAcc(0.0);
+    }
+    for (uint col = first; col < last; col += span) {
+        scores(base, row, col);
+        for (uint c = lane; c < span; c += 16u) {
+            float raw = dot_accumulation[local_row * span + c];
+            tile[local_row * span + c] = float16_t(visible(query_row, col + c, raw) ?
+                exp(raw * scale - maximum) * (probability_scale / denominator) : 0.0);
+        }
+        barrier();
+        for (uint t = 0u; t < min(span, length - col) / 16u; ++t) {
+            MatA p;
+            coopMatLoad(p, tile, t * 16u, span, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint f = warp; f < width / 16u; f += warps) {
+                MatB values;
+                coopMatLoad(values, v.x, base + (col + t * 16u) * width + f * 16u, width, gl_CooperativeMatrixLayoutRowMajor);
+                if (wide_accumulation != 0u) result[f / warps] = coopMatMulAdd(p, values, result[f / warps]);
+                else short_result[f / warps] = coopMatMulAdd(p, values, short_result[f / warps]);
+            }
+        }
+        barrier();
+    }
+    for (uint f = warp; f < width / 16u; f += warps) {
+        if (wide_accumulation == 0u) result[f / warps] = Acc(short_result[f / warps]);
+        HalfAcc rounded = HalfAcc((result[f / warps] + total[f / warps]) * (1.0 / probability_scale));
+        coopMatStore(rounded, outputBuffer.x, base + row * width + f * 16u, width, gl_CooperativeMatrixLayoutRowMajor);
+    }
+}

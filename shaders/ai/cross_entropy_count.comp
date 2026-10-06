@@ -3,16 +3,16 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_shader_16bit_storage : enable
 #extension GL_EXT_buffer_reference : enable
-#extension GL_EXT_shader_atomic_float : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 
 layout(buffer_reference) buffer BufferU16 { uint16_t x[]; };
-layout(buffer_reference) buffer BufferFp32 { float x[]; };
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+#include "fp16_stats.glsl"
 
 PUSH(
     BufferU16 targetBuffer;   // (totalPositions)
-    BufferFp32 accumBuffer;   // float[2] -> {totalLoss, validCount}
+    BufferFp16 accumBuffer;   // valid count in three numeric FP16 components
     uint totalPositions;      // B * N
     uint vocabSize;           // V
 )
@@ -20,7 +20,7 @@ PUSH(
 const uint MAX_SUBGROUPS = 64;
 shared uint sharedCounts[MAX_SUBGROUPS];
 
-// Counts valid targets (target != 0 && target < vocabSize) with reduced atomics
+// One workgroup counts valid targets without a persisted FP32 atomic buffer.
 COMPUTE(256, 1, 1)
 void main() {
     uint gid = gl_GlobalInvocationID.x;
@@ -29,9 +29,11 @@ void main() {
     uint subgroupLane = gl_SubgroupInvocationID;
     uint subgroupCount = gl_NumSubgroups;
 
-    bool inRange = gid < totalPositions;
-    uint t = inRange ? uint(targetBuffer.x[gid]) : 0u;
-    uint localCount = (inRange && t != 0u && t < vocabSize) ? 1u : 0u;
+    uint localCount = 0u;
+    for (uint i = gid; i < totalPositions; i += gl_WorkGroupSize.x) {
+        uint t = uint(targetBuffer.x[i]);
+        localCount += (t != 0u && t < vocabSize) ? 1u : 0u;
+    }
 
     uint subgroupTotal = subgroupAdd(localCount);
     if (subgroupLane == 0) {
@@ -45,9 +47,7 @@ void main() {
         for (uint s = 0u; s < limit; ++s) {
             total += sharedCounts[s];
         }
-        if (total > 0u) {
-            atomicAdd(accumBuffer.x[1], float(total));
-        }
+        write_fp16_stat(accumBuffer, 0u, float(total));
     }
 }
 

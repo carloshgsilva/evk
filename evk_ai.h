@@ -535,6 +535,19 @@ namespace evk::ai {
                                    Tensor& grad_output, Tensor& grad_q, Tensor& grad_k,
                                    Tensor& grad_v, Tensor& grad_scores, float scale, uint32_t window = 0);
 
+    // Measured short-sequence partitioning; shared by allocation and dispatch.
+    inline uint32_t tiled_attention_splits(uint32_t batch, uint32_t length, uint32_t width) {
+        return batch == 1u && width == 256u &&
+            (length == 512u || length == 1024u) ? 4u : 1u;
+    }
+    // Linear FP16 workspace: 9*B*N statistics, then 3*splits*B*N*D partials
+    // when split backward is enabled. Partials are scaled by256 before storage.
+    void causal_attention_tiled(Tensor& q, Tensor& k, Tensor& v, Tensor& stats,
+                                Tensor& output, float scale, uint32_t window = 0);
+    void causal_attention_tiled_backward(Tensor& q, Tensor& k, Tensor& v, Tensor& output, Tensor& stats,
+        Tensor& grad_output, Tensor& grad_q, Tensor& grad_k, Tensor& grad_v,
+        float scale, uint32_t window = 0);
+
     // Inference-only ring KV cache: rows (1,B,D), caches (B,capacity,D).
     // Keys receive RoPE when appended; queries must already have RoPE applied.
     void attention_cache_append(Tensor& k, Tensor& v, Tensor& key_cache, Tensor& value_cache,
@@ -545,6 +558,14 @@ namespace evk::ai {
     // Packed last dimension [gate,value], out = silu(gate) * value.
     void swiglu(Tensor& input, Tensor& output);
     void swiglu_backward(Tensor& input, Tensor& grad_output, Tensor& grad_input);
+
+    // Causal depthwise convolution: input/output (B,N,D), weights (K,D), lag zero first.
+    void causal_depthwise_conv(Tensor& input, Tensor& weight, Tensor& output);
+    void causal_depthwise_conv_backward(Tensor& input, Tensor& weight, Tensor& grad_output,
+                                        Tensor& grad_input, Tensor& grad_weight);
+    // Inference rows (1,B,D), ring state (B,K,D). Position zero starts a new sequence.
+    void causal_depthwise_conv_step(Tensor& input, Tensor& weight, Tensor& state,
+                                    Tensor& output, uint32_t position);
 
     // Fused Flash Attention forward (Multi-Query Attention)
     // New layout without head permutation:
@@ -612,7 +633,8 @@ namespace evk::ai {
     //         are excluded from loss computation and gradients are zeroed
     // grad: (B*N, V) gradient output (softmax - one_hot, or zero if ignored)
     // result: scalar loss value (mean over non-ignored positions only)
-    void cross_entropy_loss(Tensor& logits, Tensor& targets, Tensor& grad, Tensor& result);
+    void cross_entropy_loss(Tensor& logits, Tensor& targets, Tensor& grad, Tensor& result,
+                            Tensor* workspace = nullptr);
 
     // Embedding lookup: out[i] = embeddings[indices[i]]
     // embeddings: (vocab_size, embed_dim)
@@ -707,6 +729,8 @@ namespace evk::ai {
     // Accumulates gradient into grad_input
     void rms_norm_backward(Tensor& input, Tensor& grad_out, Tensor& grad_input, float eps = 1e-4f);
 }
+
+enum class AttentionKernel { Automatic, Materialized, Tiled };
 
 struct Graph {
     std::vector<std::unique_ptr<Tensor>> nodes;
@@ -994,6 +1018,17 @@ struct Graph {
             evk::ai::concat_channels(a, b, output);
         };
         return output;
+    }
+
+    Tensor& causal_depthwise_conv(Tensor& input, Tensor& weight) {
+        Tensor& out = tensor(input.shape);
+        out.forward_fn = [&input, &weight, &out]() {
+            evk::ai::causal_depthwise_conv(input, weight, out);
+        };
+        out.backward_fn = [&input, &weight, &out]() {
+            evk::ai::causal_depthwise_conv_backward(input, weight, out.grad(), input.grad(), weight.grad());
+        };
+        return out;
     }
 
     Tensor& swiglu(Tensor& input) {
@@ -1305,22 +1340,22 @@ struct Graph {
         
         nodes.push_back(std::make_unique<Tensor>(Shape({1})));
         Tensor& loss = *nodes.back();
-        
+        get_scratch({3u * (B * N + 1u)});
         // The kernel expects (B*N, V) logits and (B*N) targets
         // Since data is contiguous and layout matches, we can directly alias the buffers
-        loss.forward_fn = [&logits, &targets, &loss, &flat_grad, B, N, V]() {
+        loss.forward_fn = [this, &logits, &targets, &loss, &flat_grad, B, N, V]() {
             // Directly use logits buffer aliased as flat (B*N, V)
             // Directly use targets buffer aliased as flat (B*N)
             Tensor flat_logits = Tensor::alias(Shape({B * N, V}), logits.buffer);
             Tensor flat_targets = Tensor::alias(Shape({B * N}), targets.buffer);
             
             // Compute loss and gradient into flat_grad
-            evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, loss);
+            evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, loss, &get_scratch({3u * (B * N + 1u)}));
         };
-        loss.backward_fn = [&logits, &targets, &loss, &flat_grad, B, N, V]() {
+        loss.backward_fn = [this, &logits, &targets, &loss, &flat_grad, B, N, V]() {
             Tensor flat_logits = Tensor::alias(Shape({B * N, V}), logits.buffer);
             Tensor flat_targets = Tensor::alias(Shape({B * N}), targets.buffer);
-            evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, loss);
+            evk::ai::cross_entropy_loss(flat_logits, flat_targets, flat_grad, loss, &get_scratch({3u * (B * N + 1u)}));
             auto& cmd = evk::ai::GetCmd();
             cmd.copy(flat_grad.buffer, logits.grad().buffer, logits.shape.count() * sizeof(float16_t));
         };
@@ -1349,10 +1384,26 @@ struct Graph {
     // q: (B, N, D), k: (B, N, D), v: (B, N, D)
     // Returns: (B, N, D) attention output
     Tensor& causal_attention(Tensor& q, Tensor& k, Tensor& v, float scale = 0.0f,
-                            uint32_t window = 0) {
+                            uint32_t window = 0, AttentionKernel kernel = AttentionKernel::Automatic) {
         assert(q.shape.rank() == 3 && k.shape.rank() == 3 && v.shape.rank() == 3);
         uint32_t B = q.shape[0], N = q.shape[1], D = q.shape[2];
         float attn_scale = (scale > 0.0f) ? scale : (1.0f / std::sqrt(float(D)));
+        // Measured combined forward/backward crossovers on the target GPU.
+        // Explicit overrides allow comparisons; tiled workspace grows linearly.
+        bool tiled = kernel == AttentionKernel::Tiled || (kernel == AttentionKernel::Automatic &&
+            (N >= (D <= 64u ? 1024u : 2048u) || N % 16u != 0u || D % 16u != 0u));
+        if (tiled) {
+            uint32_t splits = evk::ai::tiled_attention_splits(B, N, D);
+            Tensor& stats = workspace({B, N, 9u + (splits > 1u ? 3u * splits * D : 0u)});
+            Tensor& out = tensor(q.shape);
+            out.forward_fn = [&q, &k, &v, &stats, &out, attn_scale, window]() {
+                evk::ai::causal_attention_tiled(q, k, v, stats, out, attn_scale, window);
+            };
+            out.backward_fn = [&q, &k, &v, &stats, &out, attn_scale, window]() {
+                evk::ai::causal_attention_tiled_backward(q, k, v, out, stats, out.grad(), q.grad(), k.grad(), v.grad(), attn_scale, window);
+            };
+            return out;
+        }
         if (evk::ai::supports_fused_causal_attention(N, D)) {
             Tensor& probs = workspace({B, N, N});
             Tensor& out = tensor(q.shape);

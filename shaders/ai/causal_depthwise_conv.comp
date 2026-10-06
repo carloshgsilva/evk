@@ -1,0 +1,40 @@
+#include "../common/evk.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+PUSH(BufferFp16 inputBuffer; BufferFp16 weight; BufferFp16 gradient;
+     BufferFp16 outputBuffer; BufferFp16 state;
+     uint batches; uint length; uint channels; uint kernel; uint mode; uint position;)
+// mode: forward, input gradient, weight gradient, recurrent forward.
+COMPUTE(256, 1, 1)
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint size = mode == 2u ? kernel * channels : batches * length * channels;
+    if (i >= size) return;
+    uint c = i % channels;
+    float sum = 0.0;
+    if (mode == 2u) {
+        uint lag = i / channels;
+        for (uint b = 0u; b < batches; ++b)
+            for (uint t = lag; t < length; ++t)
+                sum += float(inputBuffer.x[(b * length + t - lag) * channels + c]) *
+                       float(gradient.x[(b * length + t) * channels + c]);
+    } else if (mode == 3u) {
+        uint b = i / channels;
+        state.x[(b * kernel + position % kernel) * channels + c] = inputBuffer.x[i];
+        for (uint lag = 0u; lag < kernel && lag <= position; ++lag)
+            sum += float(state.x[(b * kernel + (position - lag) % kernel) * channels + c]) *
+                   float(weight.x[lag * channels + c]);
+    } else {
+        uint t = (i / channels) % length;
+        for (uint lag = 0u; lag < kernel; ++lag) {
+            if (mode == 0u && lag <= t)
+                sum += float(inputBuffer.x[i - lag * channels]) * float(weight.x[lag * channels + c]);
+            if (mode == 1u && t + lag < length)
+                sum += float(gradient.x[i + lag * channels]) * float(weight.x[lag * channels + c]);
+        }
+    }
+    if (mode == 1u || mode == 2u) sum += float(outputBuffer.x[i]);
+    outputBuffer.x[i] = float16_t(sum);
+}

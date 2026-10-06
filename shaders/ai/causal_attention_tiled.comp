@@ -1,0 +1,81 @@
+#include "../common/evk.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+CONSTANT(0) uint width = 256u;
+CONSTANT(1) uint stage = 0u;
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+PUSH(BufferFp16 q; BufferFp16 k; BufferFp16 v; BufferFp16 outputBuffer;
+     BufferFp16 stats; BufferFp16 dy; BufferFp16 dq; BufferFp16 dk; BufferFp16 dv;
+     uint length; uint window; float scale;)
+// Each subgroup owns one row. No atomics or context-sized score storage.
+// Scaled FP16 components retain small residuals without persisted FP32 storage.
+#include "fp16_stats.glsl"
+float dot_rows(BufferFp16 a, uint ai, BufferFp16 b, uint bi) {
+    float sum = 0.0;
+    for (uint f = gl_SubgroupInvocationID; f < width; f += 32u)
+        sum += float(a.x[ai * width + f]) * float(b.x[bi * width + f]);
+    return subgroupAdd(sum);
+}
+float probability(uint ai, uint bi, float lse) {
+    float raw = dot_rows(q, ai, k, bi);
+    return raw <= -65504.0 ? 0.0 : exp(raw * scale - lse);
+}
+COMPUTE(32, 1, 1)
+void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.z * 65535u, batch = gl_WorkGroupID.y;
+    if (row >= length) return;
+    uint lane = gl_SubgroupInvocationID, base = batch * length, index = base + row;
+    uint first = window > 0u && row + 1u > window ? row + 1u - window : 0u;
+    float acc[(width + 31u) / 32u], acc_v[(width + 31u) / 32u];
+    for (uint f = 0u; f < (width + 31u) / 32u; ++f) { acc[f] = 0.0; acc_v[f] = 0.0; }
+    if (stage == 0u) {
+        float maximum = -3.402823466e+38, sum = 0.0;
+        for (uint tile = first; tile <= row; tile += 32u)
+            for (uint j = tile; j < min(tile + 32u, row + 1u); ++j) {
+                float raw = dot_rows(q, index, k, base + j);
+                if (raw <= -65504.0) continue;
+                float score = raw * scale;
+                float next_maximum = max(maximum, score);
+                float alpha = exp(maximum - next_maximum), p = exp(score - next_maximum);
+                sum = sum * alpha + p;
+                for (uint f = lane; f < width; f += 32u)
+                    acc[f / 32u] = acc[f / 32u] * alpha + p * float(v.x[(base + j) * width + f]);
+                maximum = next_maximum;
+            }
+        for (uint f = lane; f < width; f += 32u) outputBuffer.x[index * width + f] = float16_t(sum == 0.0 ? 0.0 : acc[f / 32u] / sum);
+        if (lane == 0u) write_fp16_stat(stats, index * 9u, sum == 0.0 ? 0.0 : maximum + log(sum));
+    } else if (stage == 1u) {
+        float lse = read_fp16_stat(stats, index * 9u), delta = 0.0;
+        // Recompute delta rather than using rounded FP16 output in dot(dO,O).
+        for (uint j = first; j <= row; ++j) {
+            float p = probability(index, base + j, lse);
+            delta += p * dot_rows(dy, index, v, base + j);
+        }
+        if (lane == 0u) write_fp16_stat(stats, index * 9u + 3u, delta);
+        for (uint tile = first; tile <= row; tile += 32u)
+            for (uint j = tile; j < min(tile + 32u, row + 1u); ++j) {
+                float p = probability(index, base + j, lse);
+                float ds = p * (dot_rows(dy, index, v, base + j) - delta) * scale;
+                for (uint f = lane; f < width; f += 32u) acc[f / 32u] += ds * float(k.x[(base + j) * width + f]);
+            }
+        for (uint f = lane; f < width; f += 32u)
+            dq.x[index * width + f] = float16_t(float(dq.x[index * width + f]) + acc[f / 32u]);
+    } else {
+        uint end = window > 0u ? min(length, row + window) : length;
+        for (uint tile = row; tile < end; tile += 32u)
+            for (uint i = tile; i < min(tile + 32u, end); ++i) {
+                uint qi = base + i;
+                float p = probability(qi, index, read_fp16_stat(stats, qi * 9u));
+                float ds = p * (dot_rows(dy, qi, v, index) - read_fp16_stat(stats, qi * 9u + 3u)) * scale;
+                for (uint f = lane; f < width; f += 32u) {
+                    acc[f / 32u] += ds * float(q.x[qi * width + f]);
+                    acc_v[f / 32u] += p * float(dy.x[qi * width + f]);
+                }
+            }
+        for (uint f = lane; f < width; f += 32u) {
+            dk.x[index * width + f] = float16_t(float(dk.x[index * width + f]) + acc[f / 32u]);
+            dv.x[index * width + f] = float16_t(float(dv.x[index * width + f]) + acc_v[f / 32u]);
+        }
+    }
+}

@@ -5,18 +5,17 @@
 #extension GL_EXT_buffer_reference : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
-#extension GL_EXT_shader_atomic_float : enable
 #extension GL_EXT_control_flow_attributes : enable
 
 layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
 layout(buffer_reference) buffer BufferU16 { uint16_t x[]; };
-layout(buffer_reference) buffer BufferFp32 { float x[]; };
+#include "fp16_stats.glsl"
 
 PUSH(
     BufferFp16 logitsBuffer;   // (totalPositions, vocabSize)
     BufferU16 targetBuffer;    // (totalPositions)
     BufferFp16 gradBuffer;     // (totalPositions, vocabSize)
-    BufferFp32 accumBuffer;    // float[2] -> {totalLoss, validCount}
+    BufferFp16 accumBuffer;    // 3 components each: valid count, then per-row mean-loss terms
     uint vocabSize;            // V
     uint totalPositions;       // B * N
 )
@@ -34,10 +33,10 @@ const float LN2 = 0.6931471805599453;
 // Workgroup processes one row; tuned workgroup lowers per-thread loop trip count
 COMPUTE(768, 1, 1)
 void main() {
-    uint row = gl_WorkGroupID.x;
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.z * 65535u;
     if (row >= totalPositions) return;
 
-    uint lid = gl_LocalInvocationID.x; // 0..127
+    uint lid = gl_LocalInvocationID.x;
     uint subgroupId = gl_SubgroupID;
     uint subgroupCount = gl_NumSubgroups;
     uint subgroupLane = gl_SubgroupInvocationID;
@@ -54,11 +53,13 @@ void main() {
 
     // Nothing to do if this position is masked out
     if (!isValidTarget) {
+        if (lid == 0u) write_fp16_stat(accumBuffer, 3u * (row + 1u), 0.0);
         return;
     }
 
     // Load global scale (1 / validCount)
-    float invValid = (accumBuffer.x[1] > 0.0) ? (1.0 / accumBuffer.x[1]) : 0.0;
+    float validCount = read_fp16_stat(accumBuffer, 0u);
+    float invValid = (validCount > 0.0) ? (1.0 / validCount) : 0.0;
     if (invValid <= 0.0) {
         return;
     }
@@ -118,7 +119,7 @@ void main() {
         if (j == targetIdx) {
             grad -= invValid;
             float targetLoss = (rowMax + logDenom) - logit; // = -log softmax(target)
-            atomicAdd(accumBuffer.x[0], targetLoss * invValid);
+            write_fp16_stat(accumBuffer, 3u * (row + 1u), targetLoss * invValid);
         }
         gradBuffer.x[rowStart + j] = float16_t(grad);
     }
