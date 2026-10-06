@@ -892,6 +892,16 @@ void Cmd::dispatch(uint32_t x, uint32_t y, uint32_t z) {
     [cmd.compute setComputePipelineState:pipeline.compute]; Push(cmd);
     [cmd.compute dispatchThreadgroups:MTLSizeMake(x, y, z) threadsPerThreadgroup:pipeline.group];
 }
+void Cmd::dispatchIndirect(Buffer& buffer, uint64_t offset) {
+    const auto& desc = GetDesc(buffer);
+    Require(Has(desc.usage, BufferUsage::Indirect), "Indirect dispatch requires an indirect buffer");
+    Require(offset % 4 == 0 && offset <= desc.size && 12 <= desc.size - offset, "Indirect dispatch arguments are out of bounds or unaligned");
+    auto& cmd = C(*this); Compute(cmd);
+    auto& pipeline = P(cmd.pipeline);
+    Require(pipeline.compute != nil, "Dispatch requires a compute pipeline");
+    [cmd.compute setComputePipelineState:pipeline.compute]; Push(cmd);
+    [cmd.compute dispatchThreadgroupsWithIndirectBuffer:B(buffer).buffer indirectBufferOffset:offset threadsPerThreadgroup:pipeline.group];
+}
 void Cmd::restoreBindings() { if (C(*this).render) Residency(C(*this).render); if (C(*this).compute) Residency(C(*this).compute); }
 void Cmd::barrier(Image&, ImageLayout, ImageLayout, uint32_t, uint32_t, uint32_t, uint32_t) { Require(!C(*this).render, "Image transition inside a render pass"); EndEncoder(C(*this)); }
 void Cmd::barrier() { Require(!C(*this).render, "Global barrier inside a render pass"); EndEncoder(C(*this)); }

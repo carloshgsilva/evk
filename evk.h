@@ -408,6 +408,7 @@ namespace evk {
 
         // Dispatch a compute shader
         void dispatch(uint32_t countX, uint32_t countY = 1, uint32_t countZ = 1);
+        void dispatchIndirect(Buffer& buffer, uint64_t offset = 0);
 
         // Restore EVK bindings after an external API records into this command buffer.
         void restoreBindings();

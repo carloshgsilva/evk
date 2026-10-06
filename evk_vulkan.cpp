@@ -2137,6 +2137,13 @@ namespace evk {
         CommandBufferData* cb = (CommandBufferData*)_internal;
         vkCmdDispatch(cb->cmd, countX, countY, countZ);
     }
+    void Cmd::dispatchIndirect(Buffer& buffer, uint64_t offset) {
+        const auto& desc = GetDesc(buffer);
+        EVK_ASSERT(HasFlag(desc.usage, BufferUsage::Indirect), "Indirect dispatch requires an indirect buffer");
+        EVK_ASSERT(offset % 4 == 0 && offset <= desc.size && 12 <= desc.size - offset, "Indirect dispatch arguments are out of bounds or unaligned");
+        CommandBufferData* cb = (CommandBufferData*)_internal;
+        vkCmdDispatchIndirect(cb->cmd, ToInternal(buffer).buffer, offset);
+    }
 
     VkResult CreateVulkanWin32Surface(void* windowHandle, VkSurfaceKHR* surface) {
 #if defined(_WIN32)
