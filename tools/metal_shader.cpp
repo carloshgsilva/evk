@@ -88,8 +88,11 @@ protected:
             inherit_expression_dependencies(operands[1], operands[2]);
             return;
         }
-        if (instruction.op == spv::OpFAdd && CooperativeType(get<spirv_cross::SPIRType>(operands[0]))) {
-            emit_op(operands[0], operands[1], to_expression(operands[2]) + " + " + to_expression(operands[3]), false);
+        if ((instruction.op == spv::OpFAdd || instruction.op == spv::OpFMul || instruction.op == spv::OpMatrixTimesScalar)
+            && CooperativeType(get<spirv_cross::SPIRType>(operands[0]))) {
+            const char* operation = instruction.op == spv::OpFAdd ? " + " : " * ";
+            emit_op(operands[0], operands[1], "(" + to_expression(operands[2]) + ")" + operation
+                + "(" + to_expression(operands[3]) + ")", false);
             inherit_expression_dependencies(operands[1], operands[2]);
             inherit_expression_dependencies(operands[1], operands[3]);
             return;

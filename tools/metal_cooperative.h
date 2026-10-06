@@ -55,9 +55,9 @@ void simdgroup_store(evk_cooperative_matrix<T, Rows, Columns> matrix, Pointer da
                 origin + (columnMajor ? ulong2(row * 8, column * 8) : ulong2(column * 8, row * 8)), columnMajor);
 }
 
-template<typename T, uint Rows, uint Columns, uint Inner>
+template<typename T, typename U, typename V, uint Rows, uint Columns, uint Inner>
 void simdgroup_multiply_accumulate(thread evk_cooperative_matrix<T, Rows, Columns>& result,
-        evk_cooperative_matrix<T, Rows, Inner> left, evk_cooperative_matrix<T, Inner, Columns> right,
+        evk_cooperative_matrix<U, Rows, Inner> left, evk_cooperative_matrix<V, Inner, Columns> right,
         evk_cooperative_matrix<T, Rows, Columns> previous) {
     result = previous;
     for (uint row = 0; row < Rows / 8; ++row)
@@ -72,5 +72,18 @@ evk_cooperative_matrix<T, Rows, Columns> operator+(evk_cooperative_matrix<T, Row
         evk_cooperative_matrix<T, Rows, Columns> right) {
     for (uint index = 0; index < Rows * Columns / 32; ++index) left.set(index, left.get(index) + right.get(index));
     return left;
+}
+
+template<typename T, uint Rows, uint Columns>
+evk_cooperative_matrix<T, Rows, Columns> operator*(evk_cooperative_matrix<T, Rows, Columns> left,
+        evk_cooperative_matrix<T, Rows, Columns> right) {
+    for (uint index = 0; index < Rows * Columns / 32; ++index) left.set(index, left.get(index) * right.get(index));
+    return left;
+}
+
+template<typename T, uint Rows, uint Columns>
+evk_cooperative_matrix<T, Rows, Columns> operator*(evk_cooperative_matrix<T, Rows, Columns> matrix, T value) {
+    for (uint index = 0; index < Rows * Columns / 32; ++index) matrix.set(index, matrix.get(index) * value);
+    return matrix;
 }
 )msl";
