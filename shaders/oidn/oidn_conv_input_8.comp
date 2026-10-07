@@ -1,3 +1,5 @@
 #define OIDN_NARROW
+#ifndef EVK_VULKAN
 #define OIDN_INPUT_K8
+#endif
 #include "oidn_conv.comp"

@@ -1,5 +1,7 @@
 #define OIDN_NARROW
+#ifndef EVK_VULKAN
 #define OIDN_RGB_K8
+#endif
 #define OIDN_PREPACKED_WEIGHTS
 #define OIDN_ROWS_96
 #include "oidn_concat_phase.comp"

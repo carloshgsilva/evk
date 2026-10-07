@@ -274,7 +274,7 @@ struct Tensor {
         uint32_t s = shape.count() * sizeof(float16_t);
         buffer = evk::CreateBuffer({
             .size = s,
-            .usage = evk::BufferUsage::Storage,
+            .usage = evk::BufferUsage::Storage | evk::BufferUsage::TransferSrc | evk::BufferUsage::TransferDst,
         });
     }
 

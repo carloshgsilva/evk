@@ -52,8 +52,13 @@ std::unique_ptr<Tensor> pack_3x3_weight(const TensorData& source,
     uint32_t input_channels = source.desc.shape[1];
     constexpr uint32_t kernel_elements = 9u;
 
+#if EVK_VULKAN
+    constexpr bool compact_rgb_input = false;
+    constexpr bool compact_rgb_skip = false;
+#else
     bool compact_rgb_input = input_channels == 3u && skip_channels == 0u;
     bool compact_rgb_skip = skip_channels == 3u;
+#endif
 
     uint32_t low_channels = 0u;
     if (skip_channels != 0u) {

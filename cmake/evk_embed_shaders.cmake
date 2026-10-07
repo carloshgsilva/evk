@@ -12,6 +12,10 @@ function(evk_embed_shaders target shader_namespace)
       "#include <cstddef>\n#include <cstdint>\n#include <stdexcept>\n#include <string>\n#include <string_view>\n#include <vector>\n\nnamespace ${shader_namespace} {\nnamespace {\n\ntemplate <std::size_t N>\nstd::vector<uint8_t> shader_bytes(const uint32_t (&words)[N]) {\n    const auto* first = reinterpret_cast<const uint8_t*>(words);\n    return {first, first + sizeof(words)};\n}\n\n")
   set(shader_outputs)
   set(shader_lookup)
+  set(shader_definitions)
+  if(EVK_BACKEND STREQUAL "Vulkan")
+    list(APPEND shader_definitions -DEVK_VULKAN=1)
+  endif()
 
   foreach(shader IN LISTS ARGN)
     get_filename_component(shader_name "${shader}" NAME_WE)
@@ -25,6 +29,7 @@ function(evk_embed_shaders target shader_namespace)
           "${shader}"
           -std=460
           --target-env=vulkan1.3
+          ${shader_definitions}
           -O
           -mfmt=c
           -MD
