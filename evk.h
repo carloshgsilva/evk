@@ -234,6 +234,7 @@ namespace evk {
         Op depthOp = Op::Less;
         bool depthTest = false;
         bool depthWrite = false;
+        float depthBiasSlope = 0.0f;
         SampleCount sampleCount = SampleCount::One;
     };
     struct Pipeline : ResourceRef {

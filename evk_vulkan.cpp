@@ -672,7 +672,8 @@ namespace evk {
         rasterizationInfo.frontFace = desc.frontClockwise ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
         rasterizationInfo.lineWidth = 1.0f;
         rasterizationInfo.depthClampEnable = false;
-        rasterizationInfo.depthBiasEnable = false;
+        rasterizationInfo.depthBiasEnable = desc.depthBiasSlope != 0.0f;
+        rasterizationInfo.depthBiasSlopeFactor = desc.depthBiasSlope;
         rasterizationInfo.rasterizerDiscardEnable = false;
 
         VkPipelineMultisampleStateCreateInfo multisampleInfo{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};

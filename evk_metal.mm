@@ -1143,6 +1143,7 @@ void DrawState(Command& cmd) {
     Require(pipeline.render != nil, "Draw requires graphics pipeline");
     [cmd.render setRenderPipelineState:pipeline.render];
     [cmd.render setDepthStencilState:pipeline.depth];
+    [cmd.render setDepthBias:0.0f slopeScale:pipeline.desc.depthBiasSlope clamp:0.0f];
     [cmd.render setCullMode:pipeline.desc.cull == Cull::None ? MTLCullModeNone : pipeline.desc.cull == Cull::Front ? MTLCullModeFront : MTLCullModeBack];
     [cmd.render setFrontFacingWinding:pipeline.desc.frontClockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
     [cmd.render setTriangleFillMode:pipeline.desc.wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
