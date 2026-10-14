@@ -841,24 +841,66 @@ namespace evk {
             CHECK_VK(vkEnumeratePhysicalDevices(S.instance, &physicalDeviceCount, physicalDevices.data()));
             EVK_ASSERT(physicalDeviceCount > 0, "could not find physical device!");
 
-            // Select the best physical device
+            std::vector<const char*> deviceExtensions = {
+                VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+                VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
+                VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
+
+                VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+                VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+                VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
+                VK_KHR_RAY_QUERY_EXTENSION_NAME,
+            };
+            auto supportedExtensions = [](VkPhysicalDevice device) {
+                uint32_t count = 0;
+                vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr);
+                std::vector<VkExtensionProperties> extensions(count);
+                vkEnumerateDeviceExtensionProperties(device, nullptr, &count, extensions.data());
+                return extensions;
+            };
+            auto hasExtension = [](const std::vector<VkExtensionProperties>& extensions, const char* name) {
+                for (const VkExtensionProperties& extension : extensions) {
+                    if (strcmp(extension.extensionName, name) == 0) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
             S.physicalDevice = VK_NULL_HANDLE;
-            for (auto& device : physicalDevices) {
+            int bestScore = -1;
+            for (VkPhysicalDevice device : physicalDevices) {
                 VkPhysicalDeviceProperties deviceProperties;
                 vkGetPhysicalDeviceProperties(device, &deviceProperties);
-
-                // Prioritize discrete GPUs
-                if (deviceProperties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
-                    S.physicalDevice = device;
-                    break;
+                if (deviceProperties.apiVersion < VK_API_VERSION_1_3) {
+                    continue;
                 }
-
-                // If no discrete GPU is found, use the first device
-                if (S.physicalDevice == VK_NULL_HANDLE) {
+                std::vector<VkExtensionProperties> extensions = supportedExtensions(device);
+                bool supported = true;
+                for (const char* name : deviceExtensions) {
+                    supported = supported && hasExtension(extensions, name);
+                }
+                if (!supported) {
+                    continue;
+                }
+                S.deviceNames.push_back(deviceProperties.deviceName);
+                int score = (desc.deviceName == deviceProperties.deviceName ? 2 : 0) + (deviceProperties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 1 : 0);
+                if (score > bestScore) {
+                    bestScore = score;
                     S.physicalDevice = device;
+                    S.deviceName = deviceProperties.deviceName;
                 }
             }
             EVK_ASSERT(S.physicalDevice != VK_NULL_HANDLE, "No suitable physical device found!");
+
+#if defined(NETRUNNER_ENABLE_STREAMLINE)
+            std::vector<VkExtensionProperties> selectedExtensions = supportedExtensions(S.physicalDevice);
+            for (const char* name : {VK_NVX_BINARY_IMPORT_EXTENSION_NAME, VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME}) {
+                if (hasExtension(selectedExtensions, name)) {
+                    deviceExtensions.push_back(name);
+                }
+            }
+#endif
 
             // PhysicalDevice properties
             VkPhysicalDeviceProperties props = {};
@@ -968,34 +1010,10 @@ namespace evk {
                 .accelerationStructureCaptureReplay = VK_TRUE,
                 .descriptorBindingAccelerationStructureUpdateAfterBind = VK_TRUE,
             };
-            VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR feature_rtPositionFetch = {
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR,
-                .pNext = &feature_accelerationStructure,
-                .rayTracingPositionFetch = true,
-            };
             VkPhysicalDeviceRayQueryFeaturesKHR feature_rayQuery = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
-                .pNext = &feature_rtPositionFetch,
+                .pNext = &feature_accelerationStructure,
                 .rayQuery = VK_TRUE,
-            };
-
-
-            // Create device and get queue
-            std::vector<const char*> deviceExtensions = {
-                VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-                VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
-                VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
-
-                VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
-                VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
-                VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
-                VK_KHR_RAY_QUERY_EXTENSION_NAME,
-                VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME,
-#if defined(NETRUNNER_ENABLE_STREAMLINE)
-                VK_NVX_BINARY_IMPORT_EXTENSION_NAME,
-                VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME,
-                VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-#endif
             };
 
             VkDeviceCreateInfo deviceci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -1350,6 +1368,12 @@ namespace evk {
         _ReleaseResources();
         _BeginFrame();
     }
+    const std::string& GetDeviceName() {
+        return GetState().deviceName;
+    }
+    const std::vector<std::string>& GetDeviceNames() {
+        return GetState().deviceNames;
+    }
     uint32_t GetFrameBufferingCount() {
         return (uint32_t)GetState().frames.size();
     }
@@ -1482,8 +1506,8 @@ namespace evk {
             */
             srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
             dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-            barrier.srcAccessMask = VK_ACCESS_NONE_KHR;
-            barrier.dstAccessMask = VK_ACCESS_NONE_KHR;
+            barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         }
         vkCmdPipelineBarrier(GetFrame().cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     }
@@ -1922,7 +1946,7 @@ namespace evk {
             res->primCounts.push_back(desc.aabbsCount);
         }
 
-        VkBuildAccelerationStructureFlagsKHR flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR;
+        VkBuildAccelerationStructureFlagsKHR flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
         if (desc.allowUpdate) {
             flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
         }

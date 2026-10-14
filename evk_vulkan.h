@@ -94,6 +94,8 @@ namespace evk {
     struct State {
         VkInstance instance;
         VkPhysicalDevice physicalDevice;
+        std::string deviceName;
+        std::vector<std::string> deviceNames;
         VkDevice device;
         VkQueue queue;
         uint32_t queueFamily;

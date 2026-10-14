@@ -329,10 +329,13 @@ namespace evk {
         std::vector<std::string> instanceExtensions = {};
         uint32_t frameBufferingCount = 3;
         bool enableSwapchain = false;
+        std::string deviceName = "";
     };
 
     bool InitializeEVK(const EvkDesc& info);
     void Shutdown();
+    const std::string& GetDeviceName();
+    const std::vector<std::string>& GetDeviceNames();
     bool InitializeSwapchain(void* vulkanSurfaceKHR, uint32_t width = 0, uint32_t height = 0);
     void SetSwapchainExtent(uint32_t width, uint32_t height);
 
