@@ -2378,8 +2378,8 @@ namespace evk {
         EVK_ASSERT(!cb.insideRenderPass, "Depth blits must be outside a render pass");
         EVK_ASSERT(src.desc.format == dst.desc.format && src.desc.format == Format::D32Sfloat,
                    "Depth blits require matching D32 formats");
-        EVK_ASSERT(from.mip >= 0 && from.mip < src.desc.mipCount && from.layer >= 0 && from.layer < src.desc.layerCount
-                && to.mip >= 0 && to.mip < dst.desc.mipCount && to.layer >= 0 && to.layer < dst.desc.layerCount,
+        EVK_ASSERT(from.mip >= 0 && uint32_t(from.mip) < src.desc.mipCount && from.layer >= 0 && uint32_t(from.layer) < src.desc.layerCount
+                && to.mip >= 0 && uint32_t(to.mip) < dst.desc.mipCount && to.layer >= 0 && uint32_t(to.layer) < dst.desc.layerCount,
                    "Depth blit subresource is out of range");
         EVK_ASSERT(src.image != dst.image || from.mip != to.mip || from.layer != to.layer,
                    "Depth blit source and destination subresources must differ");
