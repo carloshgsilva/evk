@@ -1786,6 +1786,12 @@ namespace evk {
         EVK_ASSERT(!F.doingPresent, "CmdBeginPresent have already been called this frame.");
         F.doingPresent = true;
 
+        const Extent& requested = S.requestedSwapchainExtent;
+        const Extent& current = GetDesc(S.swapchainImages[0]).extent;
+        if (requested.width > 0 && requested.height > 0 && (requested.width != current.width || requested.height != current.height)) {
+            RecreateSwapchain();
+        }
+
         VkResult r = vkAcquireNextImageKHR(S.device, S.swapchain, std::numeric_limits<uint64_t>().max(), F.imageReadySemaphore, 0, &F.swapchainIndex);
         if (r == VK_ERROR_OUT_OF_DATE_KHR) {
             F.doingPresent = false;
