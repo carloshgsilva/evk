@@ -1333,7 +1333,7 @@ namespace evk {
                 supportedRTPosFetch.rayTracingPositionFetch &&
                 supported12.bufferDeviceAddress;
 
-            S.features.raytracing = canRayTracing;
+            S.features.raytracing = desc.enableRaytracing && canRayTracing;
 
             {
                 VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};

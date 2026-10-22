@@ -350,6 +350,8 @@ namespace evk {
         bool enableSwapchain = false; // VK_KHR_swapchain
         bool enableValidation = false;
         bool enableTimestamps = false;
+        // Ray tracing where the device supports it; leaving it off spares its cost in device creation (~65 ms on NVIDIA).
+        bool enableRaytracing = true;
         EvkBindlessDesc bindless = {};
     };
 

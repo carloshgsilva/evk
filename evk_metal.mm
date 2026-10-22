@@ -729,7 +729,7 @@ bool InitializeEVK(const EvkDesc& desc) {
         Require(indirectLibrary != nil, "Cannot compile indirect-count shader: %s", error.localizedDescription.UTF8String);
         state.indirectCount = [state.device newComputePipelineStateWithFunction:[indirectLibrary newFunctionWithName:@"filter_draw_count"] error:&error];
         Require(state.indirectCount != nil, "Cannot create indirect-count pipeline: %s", error.localizedDescription.UTF8String);
-        state.features.raytracing = state.device.supportsRaytracing;
+        state.features.raytracing = desc.enableRaytracing && state.device.supportsRaytracing;
         state.features.coopmat = [state.device supportsFamily:MTLGPUFamilyApple7];
         state.features.maxFramebufferSampleCount = GetSupportedSampleCount(SampleCount::SixtyFour);
         state.buffers.Initialize(std::min(desc.bindless.storageBufferCount, metal::BUFFER_COUNT));
