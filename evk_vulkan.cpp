@@ -1384,7 +1384,8 @@ namespace evk {
 
                 // Init slot allocators to the final clamped counts.
                 S.bufferSlots = SlotAllocator((int)S.storageCount);
-                S.imageSlots = SlotAllocator((int)S.imageCount);
+                // Image slot 0 is never handed out, so an image id of 0 always means no image.
+                S.imageSlots = SlotAllocator((int)S.imageCount, 1);
                 S.tlasSlots = SlotAllocator((int)S.tlasCount);
             }
             if (S.features.raytracing) {

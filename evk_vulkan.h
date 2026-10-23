@@ -92,7 +92,7 @@ namespace evk {
         int currentSlot = 0;
         std::vector<int> freeSlots;
         SlotAllocator() = default;
-        SlotAllocator(int maxSlot) : maxSlot(maxSlot) {
+        SlotAllocator(int maxSlot, int firstSlot = 0) : maxSlot(maxSlot), currentSlot(firstSlot) {
         }
 
         int alloc() {

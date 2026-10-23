@@ -93,7 +93,7 @@ struct Slots {
     uint32_t limit = 0;
     uint32_t next = 0;
     std::vector<int> free;
-    void Initialize(uint32_t count) { limit = count; free.reserve(count); }
+    void Initialize(uint32_t count, uint32_t first = 0) { limit = count; next = first; free.reserve(count); }
     int Allocate() {
         if (!free.empty()) { int value = free.back(); free.pop_back(); return value; }
         Require(next < limit, "Bindless resource limit exceeded (%u)", limit);
@@ -733,7 +733,8 @@ bool InitializeEVK(const EvkDesc& desc) {
         state.features.coopmat = [state.device supportsFamily:MTLGPUFamilyApple7];
         state.features.maxFramebufferSampleCount = GetSupportedSampleCount(SampleCount::SixtyFour);
         state.buffers.Initialize(std::min(desc.bindless.storageBufferCount, metal::BUFFER_COUNT));
-        state.images.Initialize(std::min(desc.bindless.imageCount, metal::IMAGE_COUNT));
+        // Image slot 0 is never handed out, so an image id of 0 always means no image.
+        state.images.Initialize(std::min(desc.bindless.imageCount, metal::IMAGE_COUNT), 1);
         state.tlas.Initialize(std::min(desc.bindless.tlasCount, metal::TLAS_COUNT));
         state.reads.reserve(metal::BUFFER_COUNT + metal::IMAGE_COUNT + metal::TLAS_COUNT + 4096);
         state.writes.reserve(metal::BUFFER_COUNT + metal::IMAGE_COUNT + metal::TLAS_COUNT + 4096);

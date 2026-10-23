@@ -69,17 +69,23 @@ IMGUI_IMPL_API bool ImGui_ImplEvk_Init(Cmd& cmd) {
         cmd.barrier(g_fontImage, ImageLayout::Undefined, ImageLayout::TransferDst);
         cmd.copy(font_staging, g_fontImage);
         cmd.barrier(g_fontImage, ImageLayout::TransferDst, ImageLayout::ShaderRead);
+        io.Fonts->SetTexID(ImGui_ImplEvk_Texture(g_fontImage));
     }
 
     return true;
 }
 IMGUI_IMPL_API void ImGui_ImplEvk_Shutdown() {
+    ImGui::GetIO().Fonts->SetTexID(0);
     g_fontImage.release();
     g_vertexBuffer.release();
     g_indexBuffer.release();
     g_pipeline.release();
 }
 
+
+IMGUI_IMPL_API ImTextureID ImGui_ImplEvk_Texture(const Image& image) {
+    return image ? ImTextureID(uint64_t(image.GetRID())) : ImTextureID(0);
+}
 
 IMGUI_IMPL_API void ImGui_ImplEvk_PrepareRender(ImDrawData* draw_data, Cmd& cmd) {
     CreateOrResizeBuffer(g_vertexBuffer, draw_data->TotalVtxCount * sizeof(ImDrawVert), BufferUsage::Vertex);
@@ -131,6 +137,7 @@ IMGUI_IMPL_API void ImGui_ImplEvk_RenderDrawData(ImDrawData* draw_data, Cmd& cmd
                 if (pcmd->UserCallback == ImDrawCallback_ResetRenderState){ }
                 else { pcmd->UserCallback(cmd_list, pcmd); }
             } else {
+                IM_ASSERT(pcmd->GetTexID() != 0 && "Draw with no texture: pass ImGui_ImplEvk_Texture(image) of a live image");
                 ImVec4 clip_rect;
                 clip_rect.x = (pcmd->ClipRect.x - clip_off.x) * clip_scale.x;
                 clip_rect.y = (pcmd->ClipRect.y - clip_off.y) * clip_scale.y;
@@ -148,8 +155,7 @@ IMGUI_IMPL_API void ImGui_ImplEvk_RenderDrawData(ImDrawData* draw_data, Cmd& cmd
                     translate[0] = -1.0f - draw_data->DisplayPos.x * scale[0];
                     translate[1] = -1.0f - draw_data->DisplayPos.y * scale[1];
 
-                    int rid = (int)(uint64_t)pcmd->TextureId;
-                    if(rid == 0) rid = g_fontImage.GetRID();
+                    int rid = (int)(uint64_t)pcmd->GetTexID();
                     cmd.push(&rid, sizeof(int), sizeof(float)*4);
                     cmd.scissor((int32_t)clip_rect.x, (int32_t)clip_rect.y, (uint32_t)(clip_rect.z - clip_rect.x), (uint32_t)(clip_rect.w - clip_rect.y));
                     cmd.drawIndexed(pcmd->ElemCount, 1, pcmd->IdxOffset + global_idx_offset, pcmd->VtxOffset + global_vtx_offset, 0);
