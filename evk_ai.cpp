@@ -1204,6 +1204,9 @@ namespace evk::ai {
         cmd.computeBarrier();
     }
 
+    static float g_cross_entropy_grad_scale = 1.0f;
+    void set_cross_entropy_grad_scale(float scale) { g_cross_entropy_grad_scale = scale; }
+
     void cross_entropy_loss(Tensor& logits, Tensor& targets, Tensor& grad, Tensor& result, Tensor* workspace) {
         assert(logits.shape.rank() == 2);
         assert(targets.shape.rank() == 1);
@@ -1248,6 +1251,7 @@ namespace evk::ai {
             accum,
             vocabSize,
             totalPositions,
+            g_cross_entropy_grad_scale,
         });
         cmd.dispatch((std::min)(totalPositions, 65535u), 1u, (totalPositions + 65534u) / 65535u);
         cmd.computeBarrier();

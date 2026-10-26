@@ -583,12 +583,13 @@ namespace evk::ai {
     void sgd(Tensor& param, Tensor& gradient, float learning_rate);
 
     // Adam: Adaptive Moment Estimation optimizer
-    // Uses fp16-appropriate epsilon (default 1e-4) to avoid underflow
+    // The update runs in FP32 with log-RMS state, so epsilon can stay small. Gradients
+    // are FP16 and often far below 1e-4; a larger epsilon swamps the RMS normalization.
     void adam(Tensor& param, Tensor& gradient, AdamState& state,
               float learning_rate = 0.001f,
               float beta1 = 0.9f,
               float beta2 = 0.999f,
-              float epsilon = 1e-4f);
+              float epsilon = 1e-6f);
 
     // Elementwise add: C = A + B
     void add(Tensor& a, Tensor& b, Tensor& c);
@@ -635,6 +636,9 @@ namespace evk::ai {
     // result: scalar loss value (mean over non-ignored positions only)
     void cross_entropy_loss(Tensor& logits, Tensor& targets, Tensor& grad, Tensor& result,
                             Tensor* workspace = nullptr);
+    // Loss scaling: multiplies cross-entropy gradients (not the reported loss) so small
+    // FP16 gradients stay out of the subnormal range. Scale Adam epsilon by the same factor.
+    void set_cross_entropy_grad_scale(float scale);
 
     // Embedding lookup: out[i] = embeddings[indices[i]]
     // embeddings: (vocab_size, embed_dim)
@@ -1546,8 +1550,8 @@ struct Graph {
     }
 
     // apply the gradient update using Adam optimizer
-    // Uses fp16-appropriate epsilon (default 1e-4)
-    void step_adam(float lr = 0.001f, float beta1 = 0.9f, float beta2 = 0.999f, float epsilon = 1e-4f) {
+    // Epsilon defaults to 1e-6; see evk::ai::adam
+    void step_adam(float lr = 0.001f, float beta1 = 0.9f, float beta2 = 0.999f, float epsilon = 1e-6f) {
         for(auto& param : params) {
             evk::ai::adam(*param, param->grad(), adam_states[param], lr, beta1, beta2, epsilon);
         }

@@ -447,6 +447,7 @@ struct AttentionStepModel;
 
 struct SequenceBlock {
     Tensor* w_conv = nullptr;
+    Tensor* w_short_conv = nullptr; // optional causal depthwise conv before self-mixer projections
     Tensor* w_projection = nullptr;
     Tensor* w_q = nullptr;
     Tensor* w_k = nullptr;
@@ -464,12 +465,15 @@ struct SequenceBlock {
               uint32_t hidden_dim,
               float rope_base_,
               AttentionMode attention_mode_,
-              uint32_t head_count_, bool cross_attention = false, uint32_t conv_kernel = 0) {
+              uint32_t head_count_, bool cross_attention = false, uint32_t conv_kernel = 0,
+              uint32_t short_conv_kernel = 0) {
         model_dim = model_dim_;
         rope_base = rope_base_;
         attention_mode = attention_mode_;
         head_count = head_count_;
 
+        if (short_conv_kernel && !conv_kernel && !cross_attention)
+            w_short_conv = &graph.tensor({short_conv_kernel, model_dim}, true);
         if (conv_kernel) {
             w_conv = &graph.tensor({conv_kernel, model_dim}, true);
         } else if (attention_mode == AttentionMode::GatedDelta) {
@@ -488,6 +492,7 @@ struct SequenceBlock {
     }
 
     void init_weights(float weight_stddev, float residual_proj_stddev) {
+        if (w_short_conv) w_short_conv->random_init(1.0f / std::sqrt(float(w_short_conv->shape[0])));
         if (w_conv) {
             w_conv->random_init(1.0f / std::sqrt(float(w_conv->shape[0])));
         } else if (w_projection) {
@@ -534,7 +539,9 @@ struct SequenceBlock {
         if (w_conv) {
             attn = &graph.causal_depthwise_conv(graph.rms_norm(input), *w_conv);
         } else if (attention_mode == AttentionMode::GatedDelta) {
-            Tensor& projection = graph.matmul(graph.rms_norm(input), *w_projection);
+            Tensor* mixer_in = &graph.rms_norm(input);
+            if (w_short_conv) mixer_in = &graph.causal_depthwise_conv(*mixer_in, *w_short_conv);
+            Tensor& projection = graph.matmul(*mixer_in, *w_projection);
             Tensor& delta = graph.gated_delta_projected(
                 projection, model_dim, head_count, rope_base, -4.0f, 16u);
             attn = &graph.rms_norm(delta);
@@ -542,7 +549,9 @@ struct SequenceBlock {
             Tensor& q = graph.matmul_rope(input, *w_q, rope_base, 1e-4f, tile_n);
             attn = &graph.causal_attention(q, *shared_key, *shared_value, 0.0f, window, kernel);
         } else {
-            Tensor& norm_in = graph.rms_norm(input);
+            Tensor* mixer_in = &graph.rms_norm(input);
+            if (w_short_conv) mixer_in = &graph.causal_depthwise_conv(*mixer_in, *w_short_conv);
+            Tensor& norm_in = *mixer_in;
             Tensor& q_rope = graph.matmul_rope(norm_in, *w_q, rope_base, 0.0f, tile_n);
             Tensor& k = w_k ? graph.matmul_rope(norm_in, *w_k, rope_base, 0.0f, tile_n) : *shared_key;
             Tensor& v = w_v ? graph.matmul(norm_in, *w_v, 16, tile_n) : *shared_value;
@@ -578,6 +587,7 @@ struct TokenModel {
     Tensor* shared_w_k = nullptr;
     Tensor* shared_w_v = nullptr;
     uint32_t window; // Local attention window or causal convolution kernel size.
+    uint32_t short_conv; // Short causal conv before self-mixers; full-sequence training/eval only.
 
     std::vector<SequenceBlock> blocks;
     std::unique_ptr<GatedDeltaStepModel> gated_delta_decoder;
@@ -591,7 +601,8 @@ struct TokenModel {
                    uint32_t num_layers_,
                    float rope_base_,
                    AttentionMode attention_mode_,
-                   uint32_t head_count_, uint32_t window_ = 32u, AttentionKernel kernel = AttentionKernel::Automatic)
+                   uint32_t head_count_, uint32_t window_ = 32u, AttentionKernel kernel = AttentionKernel::Automatic,
+                   uint32_t short_conv_ = 0u)
         : batch_size(batch_size_),
           seq_len(seq_len_),
           vocab_size(vocab_size_),
@@ -600,7 +611,7 @@ struct TokenModel {
           num_layers(num_layers_),
           head_count(head_count_),
           rope_base(rope_base_),
-          attention_mode(attention_mode_), window(window_) {
+          attention_mode(attention_mode_), window(window_), short_conv(short_conv_) {
         build_graph(kernel);
     }
 
@@ -631,7 +642,8 @@ struct TokenModel {
                            rope_base,
                            attention_mode,
                            head_count, cross,
-                           attention_mode == AttentionMode::YocoConv && !cross ? window : 0u);
+                           attention_mode == AttentionMode::YocoConv && !cross ? window : 0u,
+                           short_conv);
             x = &blocks[i].forward(graph, *x, shared_key, shared_value,
                 is_yoco(attention_mode) && !cross ? window : 0u, kernel);
         }
@@ -672,6 +684,7 @@ struct GatedDeltaStepModel {
     explicit GatedDeltaStepModel(TokenModel& source) {
         assert(source.attention_mode == AttentionMode::GatedDelta);
         assert(source.batch_size <= kTileRows);
+        if (source.short_conv) throw std::runtime_error("Step decoders do not support short convolutions");
         input_tokens = &graph.tensor({1u, kTileRows});
         input_positions = &graph.tensor({1u, kTileRows});
         Tensor* x = &graph.embed(*source.token_emb, *input_tokens);
@@ -728,6 +741,7 @@ struct AttentionStepModel {
 
     explicit AttentionStepModel(TokenModel& source) {
         assert(source.batch_size == 16u && source.attention_mode != AttentionMode::GatedDelta);
+        if (source.short_conv) throw std::runtime_error("Step decoders do not support short convolutions");
         input_tokens = &graph.tensor({1u, source.batch_size});
         Tensor* x = &graph.embed(*source.token_emb, *input_tokens);
         Tensor* shared_key = nullptr;
@@ -1177,6 +1191,7 @@ ExperimentResult train_experiment(
     uint32_t train_steps,
     uint32_t log_interval,
     float learning_rate,
+    float adam_epsilon,
     const std::vector<Mesh>& base_shapes,
     const std::vector<ValSeed>& val,
     const std::vector<float>& sample_condition_meshes,
@@ -1230,7 +1245,7 @@ ExperimentResult train_experiment(
         upload_token_tensor(*model.input_tokens, train_input_tokens, false);
         upload_token_tensor(*model.target_tokens, train_target_tokens, false);
         model.graph.eval(true, false, false);
-        model.graph.step_adam(learning_rate, 0.9f, 0.98f, 1e-4f);
+        model.graph.step_adam(learning_rate, 0.9f, 0.98f, adam_epsilon);
         if (should_log) {
             queue_tensor_download(*model.loss);
         }
@@ -1375,6 +1390,191 @@ ExperimentResult train_experiment(
     return result;
 }
 
+// Multi-query associative recall (MQAR, Arora et al. 2023, "Zoology").
+// Sequence: BOS, P key/value pairs, filler tokens, then every key queried once in
+// random order with its value as the next token. Only answer positions carry a
+// target, so CE and accuracy measure in-context recall alone.
+constexpr uint16_t kMqarKeyBase = 3;
+constexpr uint16_t kMqarKeyCount = 64;
+constexpr uint16_t kMqarValueBase = kMqarKeyBase + kMqarKeyCount;     // 67
+constexpr uint16_t kMqarValueCount = 64;
+constexpr uint16_t kMqarFillerBase = kMqarValueBase + kMqarValueCount; // 131
+constexpr uint16_t kMqarFillerCount = 13;                              // ids [131..143]
+constexpr uint32_t kMqarMaxPairs = (kSeqLen - 1u) / 4u;                // 27
+constexpr uint32_t kMqarValExamples = 4096;
+constexpr uint32_t kMqarProbeExamples = 1024; // periodic probe uses the first quarter
+static_assert(kMqarFillerBase + kMqarFillerCount <= kVocabSize);
+
+void build_mqar_batch(uint32_t batch_size, uint32_t pairs, std::mt19937& rng,
+                      std::vector<uint16_t>& input_tokens,
+                      std::vector<uint16_t>& target_tokens) {
+    assert(pairs >= 1u && pairs <= kMqarMaxPairs);
+    input_tokens.assign(batch_size * kSeqLen, kPadToken);
+    target_tokens.assign(batch_size * kSeqLen, kPadToken);
+    std::array<uint16_t, kMqarKeyCount> keys;
+    std::array<uint16_t, kMqarKeyCount> values;
+    std::array<uint32_t, kMqarMaxPairs> order;
+    std::uniform_int_distribution<uint32_t> value_dist(0u, kMqarValueCount - 1u);
+    std::uniform_int_distribution<uint32_t> filler_dist(0u, kMqarFillerCount - 1u);
+    uint32_t query_start = kSeqLen - 2u * pairs;
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        uint16_t* in = input_tokens.data() + b * kSeqLen;
+        uint16_t* tgt = target_tokens.data() + b * kSeqLen;
+        for (uint16_t k = 0; k < kMqarKeyCount; ++k) keys[k] = uint16_t(kMqarKeyBase + k);
+        std::shuffle(keys.begin(), keys.end(), rng);
+        in[0] = kBosToken;
+        for (uint32_t i = 0; i < pairs; ++i) {
+            values[i] = uint16_t(kMqarValueBase + value_dist(rng));
+            in[1u + 2u * i] = keys[i];
+            in[2u + 2u * i] = values[i];
+            order[i] = i;
+        }
+        for (uint32_t p = 1u + 2u * pairs; p < query_start; ++p)
+            in[p] = uint16_t(kMqarFillerBase + filler_dist(rng));
+        std::shuffle(order.begin(), order.begin() + pairs, rng);
+        for (uint32_t i = 0; i < pairs; ++i) {
+            uint32_t p = query_start + 2u * i;
+            in[p] = keys[order[i]];
+            tgt[p] = values[order[i]];
+            if (p + 1u < kSeqLen) in[p + 1u] = values[order[i]];
+        }
+    }
+}
+
+struct MqarValSet {
+    std::vector<std::vector<uint16_t>> inputs;
+    std::vector<std::vector<uint16_t>> targets;
+};
+
+MqarValSet make_mqar_val_set(uint32_t batch_size, uint32_t pairs) {
+    MqarValSet val;
+    std::mt19937 rng(9001u + pairs);
+    uint32_t batches = kMqarValExamples / batch_size;
+    val.inputs.resize(batches);
+    val.targets.resize(batches);
+    for (uint32_t i = 0; i < batches; ++i)
+        build_mqar_batch(batch_size, pairs, rng, val.inputs[i], val.targets[i]);
+    return val;
+}
+
+struct MqarMetrics {
+    double accuracy = 0.0;
+    double ce = 0.0;
+};
+
+// Teacher forcing is exact here: each key is queried once, so earlier answers
+// in the context never reveal a later one.
+MqarMetrics evaluate_mqar(TokenModel& model, const MqarValSet& val, uint32_t examples,
+                          Tensor& predictions) {
+    MqarMetrics metrics;
+    uint32_t batches = (std::min)(uint32_t(val.inputs.size()), examples / model.batch_size);
+    uint64_t correct = 0, answers = 0;
+    for (uint32_t i = 0; i < batches; ++i) {
+        upload_token_tensor(*model.input_tokens, val.inputs[i], false);
+        upload_token_tensor(*model.target_tokens, val.targets[i], false);
+        model.graph.eval(false, false, false);
+        evk::ai::greedy_sample_rows(*model.logits, predictions, kMqarValueBase, kMqarValueCount);
+        queue_tensor_download(*model.loss);
+        queue_tensor_download(predictions);
+        evk::ai::SubmitCmd(true);
+        metrics.ce += float(model.loss->cpu()[0]);
+        const float16_t* predicted = predictions.cpu();
+        for (size_t p = 0; p < val.targets[i].size(); ++p) {
+            if (val.targets[i][p] == kPadToken) continue;
+            correct += predicted[p].value == val.targets[i][p] ? 1u : 0u;
+            ++answers;
+        }
+    }
+    metrics.accuracy = answers ? double(correct) / double(answers) : 0.0;
+    metrics.ce /= double((std::max)(1u, batches));
+    return metrics;
+}
+
+struct MqarResult {
+    std::string name;
+    uint32_t pairs = 0;
+    uint32_t seed = 0;
+    uint64_t parameters = 0;
+    uint32_t steps = 0;
+    double train_seconds = 0.0;
+    MqarMetrics final_metrics;
+    double seconds_to_90 = -1.0; // first probe at or above the threshold, -1 if never
+    double seconds_to_99 = -1.0;
+};
+
+MqarResult train_mqar(TokenModel& model, const char* name, uint32_t pairs, uint32_t seed, double budget_seconds,
+                      double probe_seconds, float learning_rate, float adam_epsilon, const MqarValSet& val,
+                      const std::filesystem::path& output_dir) {
+    MqarResult result;
+    result.name = name;
+    result.pairs = pairs;
+    result.seed = seed;
+    result.parameters = parameter_count(model.graph);
+
+    std::ofstream curve_csv(output_dir / ("mqar_" + std::string(name) + "_p" +
+                                          std::to_string(pairs) + "_s" + std::to_string(seed) + "_curve.csv"));
+    curve_csv.precision(9);
+    curve_csv << "step,train_seconds,train_ce,probe_accuracy,probe_ce\n";
+    Tensor predictions({model.batch_size * kSeqLen});
+    std::mt19937 train_rng(1337u + pairs + 7919u * seed);
+    std::vector<uint16_t> inputs, targets;
+    double next_probe = probe_seconds;
+    // Probes are excluded from the budget; the update clock includes batch generation and upload.
+    while (result.train_seconds < budget_seconds) {
+        auto start = std::chrono::high_resolution_clock::now();
+        build_mqar_batch(model.batch_size, pairs, train_rng, inputs, targets);
+        upload_token_tensor(*model.input_tokens, inputs, false);
+        upload_token_tensor(*model.target_tokens, targets, false);
+        model.graph.eval(true, false, false);
+        model.graph.step_adam(learning_rate, 0.9f, 0.98f, adam_epsilon);
+        ++result.steps;
+        bool probe = result.train_seconds >= next_probe;
+        if (probe) queue_tensor_download(*model.loss);
+        uint64_t submitted = evk::ai::SubmitCmd(probe);
+        // Queued steps finish before the budget is checked again at the end.
+        if (result.train_seconds + std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - start).count() >= budget_seconds)
+            evk::CmdWait(submitted);
+        result.train_seconds += std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - start).count();
+        if (!probe) continue;
+        next_probe += probe_seconds;
+
+        float train_ce = float(model.loss->cpu()[0]);
+        if (!std::isfinite(train_ce))
+            throw std::runtime_error(std::string(name) + " produced non-finite MQAR loss");
+        MqarMetrics metrics = evaluate_mqar(model, val, kMqarProbeExamples, predictions);
+        if (result.seconds_to_90 < 0.0 && metrics.accuracy >= 0.90) result.seconds_to_90 = result.train_seconds;
+        if (result.seconds_to_99 < 0.0 && metrics.accuracy >= 0.99) result.seconds_to_99 = result.train_seconds;
+        curve_csv << result.steps << "," << result.train_seconds << "," << train_ce << ","
+                  << metrics.accuracy << "," << metrics.ce << "\n";
+        curve_csv.flush();
+        printf("[mqar %s p%u s%u] %5.1fs | step %6u | train_ce %.4f | probe_acc %.4f | probe_ce %.4f\n",
+               name, pairs, seed, result.train_seconds, result.steps, train_ce, metrics.accuracy, metrics.ce);
+        fflush(stdout);
+    }
+    result.final_metrics = evaluate_mqar(model, val, kMqarValExamples, predictions);
+    if (result.seconds_to_90 < 0.0 && result.final_metrics.accuracy >= 0.90) result.seconds_to_90 = result.train_seconds;
+    if (result.seconds_to_99 < 0.0 && result.final_metrics.accuracy >= 0.99) result.seconds_to_99 = result.train_seconds;
+    printf("[mqar %s p%u s%u] final | steps %u | %.1fs | val_acc %.4f | val_ce %.4f | t90 %.1fs | t99 %.1fs\n",
+           name, pairs, seed, result.steps, result.train_seconds, result.final_metrics.accuracy,
+           result.final_metrics.ce, result.seconds_to_90, result.seconds_to_99);
+    fflush(stdout);
+    return result;
+}
+
+std::vector<uint32_t> parse_uint_list(const std::string& text) {
+    std::vector<uint32_t> values;
+    size_t begin = 0;
+    while (begin < text.size()) {
+        size_t end = text.find(',', begin);
+        if (end == std::string::npos) end = text.size();
+        values.push_back(uint32_t(std::stoul(text.substr(begin, end - begin))));
+        begin = end + 1u;
+    }
+    return values;
+}
+
 uint32_t parse_uint_arg(int argc, char** argv, const char* flag, uint32_t fallback) {
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::string(argv[i]) == flag) {
@@ -1402,12 +1602,32 @@ std::string parse_string_arg(int argc, char** argv, const char* flag,
 
 void main_llm(int argc, char** argv) {
     constexpr uint32_t kBatchSize = 16;
-    constexpr uint32_t kModelDim = 256;
-    constexpr uint32_t kLayerCount = 8;
-    constexpr uint32_t kAttentionHiddenDim = 512;
-    constexpr uint32_t kYocoHiddenDim = 400;
-    uint32_t gated_delta_heads = parse_uint_arg(argc, argv, "--llm-gdn-heads", 16);
-    uint32_t gated_delta_hidden = parse_uint_arg(argc, argv, "--llm-gdn-hidden", 496);
+    std::string task = parse_string_arg(argc, argv, "--llm-task", "mesh");
+    bool mqar_task = task == "mqar";
+    // Epsilon 1e-4 dominates Adam's RMS for these small FP16 gradients: MQAR attention
+    // stays near the 37% plateau for minutes and mesh training starts far slower.
+    float adam_epsilon = std::stof(parse_string_arg(argc, argv, "--llm-adam-eps", "1e-6"));
+    // CE gradients are divided by the answer count and stored in FP16. On MQAR the
+    // attention query/key gradients (~1e-6) then sit in the subnormal range and YOCO-Conv
+    // can stall at uniform guessing; scaling the loss gradient lifts them out. Adam is
+    // scale invariant apart from epsilon, which is scaled to keep the update unchanged.
+    float loss_scale = std::stof(parse_string_arg(argc, argv, "--llm-loss-scale", mqar_task ? "256" : "1"));
+    if (!(loss_scale > 0.0f)) throw std::invalid_argument("--llm-loss-scale must be positive");
+    evk::ai::set_cross_entropy_grad_scale(loss_scale);
+    adam_epsilon *= loss_scale;
+    // MQAR defaults to a 2-layer, 128-wide preset so one run fits a one-minute budget.
+    const uint32_t kModelDim = parse_uint_arg(argc, argv, "--llm-dim", mqar_task ? 128 : 256);
+    const uint32_t kLayerCount = parse_uint_arg(argc, argv, "--llm-layers", mqar_task ? 2 : 8);
+    if (kModelDim == 0u || kModelDim % 16u != 0u || kLayerCount < 2u || kLayerCount % 2u != 0u)
+        throw std::invalid_argument("--llm-dim must be a positive multiple of 16 and --llm-layers an even count >= 2");
+    // FFN widths keep the width-256 parameter ratios between architectures.
+    auto scaled_hidden = [&](uint32_t width) {
+        return (std::max)(16u, (width * kModelDim / 256u + 8u) / 16u * 16u);
+    };
+    const uint32_t kAttentionHiddenDim = scaled_hidden(512);
+    const uint32_t kYocoHiddenDim = scaled_hidden(400);
+    uint32_t gated_delta_heads = parse_uint_arg(argc, argv, "--llm-gdn-heads", (std::max)(8u, kModelDim / 16u));
+    uint32_t gated_delta_hidden = parse_uint_arg(argc, argv, "--llm-gdn-hidden", scaled_hidden(496));
     uint32_t parameter_seed = parse_uint_arg(argc, argv, "--llm-seed", 42);
     uint32_t attention_override = parse_uint_arg(argc, argv, "--llm-attention-tiled", 2);
     if (attention_override > 2u) throw std::invalid_argument("--llm-attention-tiled must be 0 (materialized), 1 (tiled), or 2 (automatic)");
@@ -1448,13 +1668,109 @@ void main_llm(int argc, char** argv) {
         return;
     }
 
+    if (task != "mesh" && task != "mqar") {
+        printf("[llm] unknown --llm-task '%s'; expected mesh or mqar\n", task.c_str());
+        return;
+    }
+    if (!mqar_task && parse_uint_arg(argc, argv, "--llm-short-conv", 0) != 0u)
+        throw std::invalid_argument("--llm-short-conv is MQAR-only; the step decoders do not implement it");
+    if (mqar_task) {
+        double budget_seconds = double(parse_uint_arg(argc, argv, "--llm-seconds", 60));
+        double probe_seconds = double((std::max)(1u, parse_uint_arg(argc, argv, "--llm-probe-seconds", 2)));
+        std::string pair_text = parse_string_arg(argc, argv, "--llm-mqar-pairs", "8,16,24");
+        std::vector<uint32_t> pair_sweep = parse_uint_list(pair_text);
+        uint32_t mqar_batch = parse_uint_arg(argc, argv, "--llm-batch", 16);
+        uint32_t short_conv = parse_uint_arg(argc, argv, "--llm-short-conv", 0);
+        if (short_conv > 32u) throw std::invalid_argument("--llm-short-conv must be between 0 and 32");
+        // Recall emerges in a sudden phase change whose timing varies by seed, so
+        // comparisons should use the solve rate over several seeds.
+        uint32_t seed_count = (std::max)(1u, parse_uint_arg(argc, argv, "--llm-seeds", 1));
+        float mqar_learning_rate = std::stof(parse_string_arg(argc, argv, "--llm-lr", "3e-4"));
+        if (mqar_batch == 0u || mqar_batch % 16u != 0u || kMqarValExamples % mqar_batch != 0u)
+            throw std::invalid_argument("--llm-batch must be a multiple of 16 dividing 4096");
+        for (uint32_t pairs : pair_sweep)
+            if (pairs < 1u || pairs > kMqarMaxPairs)
+                throw std::invalid_argument("--llm-mqar-pairs entries must be between 1 and 27");
+        printf("=== main_llm: MQAR | model %s | budget %.0fs per run | pairs %s | seed %u | "
+               "dim %u | layers %u | batch %u | lr %g | adam_eps %g | loss_scale %g | short_conv %u ===\n",
+               selected_model.c_str(), budget_seconds, pair_text.c_str(), parameter_seed,
+               kModelDim, kLayerCount, mqar_batch, mqar_learning_rate, adam_epsilon / loss_scale,
+               loss_scale, short_conv);
+        std::filesystem::create_directories(output_dir);
+        std::vector<MqarResult> mqar_results;
+        MqarValSet val;
+        for (uint32_t pairs : pair_sweep) for (uint32_t seed = 0; seed < seed_count; ++seed) {
+            if (seed == 0u) val = make_mqar_val_set(mqar_batch, pairs);
+            auto run_mqar = [&](const char* name, AttentionMode mode, uint32_t hidden_dim,
+                                uint32_t heads, float learning_rate, uint32_t window = 32u) {
+                TokenModel model(mqar_batch, kSeqLen, kVocabSize, kModelDim, hidden_dim,
+                                 kLayerCount, kRopeBase, mode, heads, window, attention_kernel, short_conv);
+                initialize_model(model, parameter_seed + seed, checkpoint);
+                mqar_results.push_back(train_mqar(model, name, pairs, seed, budget_seconds, probe_seconds,
+                                                  learning_rate, adam_epsilon, val, output_dir));
+            };
+            if (run_attention)
+                run_mqar("attention", AttentionMode::Softmax, kAttentionHiddenDim, 1u, mqar_learning_rate);
+            if (run_gated_delta)
+                run_mqar("gated_delta", AttentionMode::GatedDelta, gated_delta_hidden,
+                         gated_delta_heads, mqar_learning_rate);
+            if (run_yoco)
+                run_mqar("yoco", AttentionMode::Yoco, kYocoHiddenDim, 1u, mqar_learning_rate);
+            if (run_yoco_conv)
+                run_mqar("yoco_conv", AttentionMode::YocoConv, kYocoHiddenDim, 1u,
+                         mqar_learning_rate, conv_kernel);
+        }
+        std::ofstream mqar_csv(output_dir / "mqar_results.csv");
+        mqar_csv << "model,pairs,seed,parameters,steps,train_seconds,update_ms,val_accuracy,val_ce,"
+                    "seconds_to_90,seconds_to_99\n";
+        for (const MqarResult& r : mqar_results) {
+            double update_ms = r.train_seconds * 1000.0 / double((std::max)(1u, r.steps));
+            mqar_csv << r.name << "," << r.pairs << "," << r.seed << "," << r.parameters << ","
+                     << r.steps << "," << r.train_seconds << "," << update_ms << ","
+                     << r.final_metrics.accuracy << "," << r.final_metrics.ce << ","
+                     << r.seconds_to_90 << "," << r.seconds_to_99 << "\n";
+        }
+        // Solved = final accuracy >= 99%; t99 is the median over solved seeds.
+        printf("\n=== MQAR comparison (%u seeds, val accuracy over %u examples, higher is better) ===\n",
+               seed_count, kMqarValExamples);
+        for (size_t first = 0; first < mqar_results.size(); ++first) {
+            const MqarResult& r = mqar_results[first];
+            if (r.seed != 0u) continue;
+            uint32_t runs = 0, solved = 0, steps = 0;
+            double accuracy = 0.0, seconds = 0.0;
+            std::vector<double> solve_times;
+            for (const MqarResult& o : mqar_results) {
+                if (o.name != r.name || o.pairs != r.pairs) continue;
+                ++runs;
+                accuracy += o.final_metrics.accuracy;
+                steps += o.steps;
+                seconds += o.train_seconds;
+                if (o.final_metrics.accuracy >= 0.99) {
+                    ++solved;
+                    solve_times.push_back(o.seconds_to_99);
+                }
+            }
+            std::sort(solve_times.begin(), solve_times.end());
+            double median_t99 = solve_times.empty() ? -1.0 : solve_times[solve_times.size() / 2];
+            printf("%-12s | pairs %2u | params %llu | update_ms %.3f | solved %u/%u | mean_acc %.4f | "
+                   "median_t99 %6.1fs\n",
+                   r.name.c_str(), r.pairs, static_cast<unsigned long long>(r.parameters),
+                   seconds * 1000.0 / double((std::max)(1u, steps)), solved, runs,
+                   accuracy / double(runs), median_t99);
+        }
+        fflush(stdout);
+        return;
+    }
+
     printf("=== main_llm: softmax attention, Gated DeltaNet, and YOCO (default: Conv3) ===\n");
-    printf("config | model %s | steps %u | batch %u | dim %u | sequence %u\n",
+    printf("config | model %s | steps %u | batch %u | dim %u | sequence %u | adam_eps %g | loss_scale %g\n",
            selected_model.c_str(),
            train_steps,
            kBatchSize,
            kModelDim,
-           kSeqActiveLen);
+           kSeqActiveLen,
+           adam_epsilon / loss_scale,
+           loss_scale);
 
     const std::vector<Mesh> base_shapes{
         make_cube_triangles(),
@@ -1493,7 +1809,7 @@ void main_llm(int argc, char** argv) {
                          kLayerCount, kRopeBase, mode, heads, window, attention_kernel);
         initialize_model(model, parameter_seed, checkpoint);
         results.push_back(train_experiment(model, name, train_steps, log_interval,
-            learning_rate, base_shapes, val, sample_condition_meshes, output_dir));
+            learning_rate, adam_epsilon, base_shapes, val, sample_condition_meshes, output_dir));
     };
     if (run_attention) {
         run_model("attention", AttentionMode::Softmax, kAttentionHiddenDim,

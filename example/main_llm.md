@@ -65,6 +65,10 @@ updates.
 (head dimensions 32, 16, 8, or 4). `--llm-gdn-hidden` sets the FFN width,
 a positive multiple of 16. Defaults are 16 heads and FFN width 496.
 `--llm-seed` sets parameter initialization (default 42), not the data stream.
+`--llm-adam-eps` sets Adam epsilon for both tasks (default 1e-6). The former
+1e-4 swamps the RMS normalization of these small FP16 gradients: mesh attention
+and YOCO train far slower early on, and MQAR attention stays at the 37%
+guess-an-unused-value plateau for minutes.
 `--llm-output` selects a separate output directory; files there are overwritten.
 For example, this tests dimension 16 at the baseline parameter count:
 
@@ -79,3 +83,54 @@ Outputs are written under `output/` by default:
 - `gated_delta_training_curve.csv`
 - `gated_delta_mesh_val_evolution.obj`
 - `llm_comparison.csv`
+
+## MQAR recall benchmark
+
+`--llm-task mqar` replaces the mesh task with multi-query associative recall
+(Arora et al., "Zoology", 2023), a fast check of in-context recall. Each
+112-token sequence is BOS, P key/value pairs, filler tokens, then all P keys
+queried once in random order. Keys, values and filler use disjoint token ranges
+(64 keys, 64 values, 13 filler ids), and only answer positions carry a target.
+
+Each model trains for a fixed wall-clock budget (`--llm-seconds`, default 60),
+so slower updates cost quality. Probe accuracy on the first 1,024 validation
+examples is logged every `--llm-probe-seconds` (default 2) of training time;
+probes are excluded from the budget. Final accuracy uses a fixed 4,096-example
+validation set per pair count. Teacher forcing is exact because no key repeats.
+
+```bat
+.\run.bat --llm --llm-task mqar
+.\run.bat --llm --llm-task mqar --llm-mqar-pairs 24 --llm-model gated-delta
+```
+
+MQAR defaults: width 128, 2 layers (`--llm-dim`, `--llm-layers`; FFN widths
+scale with width), batch 16 (`--llm-batch`), learning rate 3e-4 (`--llm-lr`)
+for every model, and pair sweep `8,16,24` (`--llm-mqar-pairs`, at most 27).
+
+`--llm-short-conv K` (MQAR only, default 0) inserts a causal depthwise
+convolution of K tokens before every attention and Gated DeltaNet mixer's
+projections, as in reference Gated DeltaNet. Without it, binding a key to the
+value in the next token must be learned through the mixer itself: attention
+solves 16+ pairs only slowly and Gated DeltaNet stays at the guessing plateau.
+YOCO-Conv already has this through its local convolution layers. Gated
+DeltaNet capacity is also bounded by head dimension: 16-dimensional heads fail
+24 pairs while 32-dimensional heads (`--llm-dim 256 --llm-gdn-heads 8`) solve it.
+The step decoders do not implement the short convolution, so the mesh task
+rejects it.
+
+`--llm-loss-scale S` (default 256 for MQAR, 1 for mesh) multiplies the
+cross-entropy gradient by S and Adam epsilon by S, so the update is unchanged
+in exact arithmetic. Gradients are divided by the answer count and stored in
+FP16; without scaling, YOCO-Conv's cross-attention query/key gradients sit near
+1e-6, in the subnormal range, and half of its MQAR runs stalled at uniform
+guessing over the 64 values (CE ln 64). With S = 256 every run trained.
+
+Recall appears as a sudden phase change, and whether it happens within the
+budget varies by seed. Compare architectures with `--llm-seeds N` (seed i uses
+parameter seed `--llm-seed + i` and its own training stream); the summary
+reports solved runs (final accuracy >= 99%), mean accuracy and the median
+seconds to 99% over solved runs.
+
+Outputs: `mqar_results.csv` (one row per model, pair count and seed: accuracy,
+CE, steps, update time and seconds to 90%/99% probe accuracy, -1 if never
+reached) and `mqar_<model>_p<pairs>_s<seed>_curve.csv`.

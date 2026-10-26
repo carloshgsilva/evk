@@ -18,6 +18,7 @@ PUSH(
     BufferFp16 accumBuffer;    // 3 components each: valid count, then per-row mean-loss terms
     uint vocabSize;            // V
     uint totalPositions;       // B * N
+    float gradScale;           // loss scale applied to gradients only (not the reported loss)
 )
 
 // Shared reduction buffers sized for typical subgroup counts (covers up to 64 subgroups)
@@ -121,6 +122,6 @@ void main() {
             float targetLoss = (rowMax + logDenom) - logit; // = -log softmax(target)
             write_fp16_stat(accumBuffer, 3u * (row + 1u), targetLoss * invValid);
         }
-        gradBuffer.x[rowStart + j] = float16_t(grad);
+        gradBuffer.x[rowStart + j] = float16_t(grad * gradScale);
     }
 }
