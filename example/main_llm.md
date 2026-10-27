@@ -18,6 +18,15 @@ model autoregressively completes the remaining ten triangles. Training uses
 next-token cross entropy. Validation reports cross entropy and completion MSE
 over generated, non-conditioning coordinates.
 
+Validation uses 256 fixed meshes (16 batches). Teacher-forced CE and token
+accuracy cover all of them; greedy completion of the first 64 distinct meshes
+reports completion MSE, the fraction of completion coordinates within one
+quantization bin of the source, and mesh success (every completion coordinate
+within two bins). The conditioning triangles are quantized, so a correct
+completion is often one bin off and exact-token matches stay near zero. The
+restored "best" checkpoint is the one with the lowest validation CE, which is
+far less noisy than completion MSE.
+
 Only `*_mesh_val_evolution.obj` is produced for mesh visualization. Each
 validation checkpoint appends five generated meshes to the file.
 

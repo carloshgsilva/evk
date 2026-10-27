@@ -298,13 +298,27 @@ using ParamSnapshot = std::vector<std::vector<float16_t>>;
 struct ValSeed {
     std::vector<uint16_t> input_tokens;
     std::vector<uint16_t> target_tokens;
-    std::vector<float> first_target_mesh;
+    std::vector<float> meshes; // (batch, triangles, coords) source meshes for this batch
 };
 
 struct EvalMetrics {
     float val_ce = 0.0f;
     float val_completion_mse = 0.0f;
+    float val_token_accuracy = 0.0f;        // teacher-forced argmax over every validation target
+    // The conditioning triangles are quantized, so completions are often one bin off
+    // without being wrong; exact-token metrics stay near zero for every model.
+    float completion_within_bin = 0.0f;     // completion coordinates within one bin of the source
+    float completion_mesh_success = 0.0f;   // meshes with every completion coordinate within two bins
 };
+
+// Greedy completions decode the first batches of distinct validation meshes.
+constexpr uint32_t kGenerationBatches = 4;
+constexpr uint32_t kEvolutionRows = 5;
+
+std::vector<float> mesh_at(const std::vector<float>& meshes, uint32_t index) {
+    auto begin = meshes.begin() + size_t(index) * kTrianglesPerMesh * kMeshFeatureDim;
+    return std::vector<float>(begin, begin + kTrianglesPerMesh * kMeshFeatureDim);
+}
 
 ParamSnapshot capture_params(Graph& graph) {
     ParamSnapshot snapshot(graph.params.size());
@@ -988,32 +1002,57 @@ void sample_attention_reference(TokenModel& model,
     }
 }
 
+// Teacher-forced CE and token accuracy over every validation batch, then greedy
+// completion of the first kGenerationBatches batches. Batches decode last to
+// first so sampled_tokens ends with batch 0 for the evolution snapshots.
 EvalMetrics evaluate_model(TokenModel& model,
                            const std::vector<ValSeed>& val,
-                           const std::vector<float>& sample_condition_meshes,
                            std::vector<uint16_t>& sampled_tokens) {
     EvalMetrics metrics;
-
+    Tensor predictions({model.batch_size * kSeqLen});
+    uint64_t correct = 0, targets = 0;
     for (const auto& seed : val) {
         upload_token_tensor(*model.input_tokens, seed.input_tokens, false);
         upload_token_tensor(*model.target_tokens, seed.target_tokens, false);
         model.graph.eval(false, false, false);
+        evk::ai::greedy_sample_rows(*model.logits, predictions, 0u, uint16_t(model.vocab_size));
         queue_tensor_download(*model.loss);
+        queue_tensor_download(predictions);
         evk::ai::SubmitCmd(true);
         metrics.val_ce += float(model.loss->cpu()[0]);
+        for (size_t p = 0; p < seed.target_tokens.size(); ++p) {
+            if (seed.target_tokens[p] == kPadToken) continue;
+            correct += predictions.cpu()[p].value == seed.target_tokens[p] ? 1u : 0u;
+            ++targets;
+        }
     }
     metrics.val_ce /= float(val.size());
+    metrics.val_token_accuracy = float(double(correct) / double((std::max)(uint64_t(1), targets)));
 
-    sample_autoregressive(model, sample_condition_meshes, sampled_tokens);
-
+    uint32_t batches = (std::min)(kGenerationBatches, uint32_t(val.size()));
+    uint64_t successes = 0, within_bin = 0, generated = 0;
+    double mse = 0.0;
     std::vector<float> pred_mesh;
-    metrics.val_completion_mse = 0.0f;
-    for (size_t s = 0; s < val.size(); ++s) {
-        decode_generated_mesh(sampled_tokens, uint32_t(s), pred_mesh);
-        metrics.val_completion_mse += completion_mse(pred_mesh, val[s].first_target_mesh);
+    for (uint32_t g = batches; g-- > 0;) {
+        sample_autoregressive(model, val[g].meshes, sampled_tokens);
+        for (uint32_t b = 0; b < model.batch_size; ++b) {
+            decode_generated_mesh(sampled_tokens, b, pred_mesh);
+            mse += completion_mse(pred_mesh, mesh_at(val[g].meshes, b));
+            bool success = true;
+            for (uint32_t i = kConditionCoordTokens; i < kCoordTokenCount; ++i) {
+                uint32_t p = b * kSeqLen + 1u + i;
+                int bins = std::abs(int(sampled_tokens[p]) - int(val[g].input_tokens[p]));
+                within_bin += bins <= 1 ? 1u : 0u;
+                success = success && bins <= 2;
+                ++generated;
+            }
+            successes += success ? 1u : 0u;
+        }
     }
-    metrics.val_completion_mse /= float(val.size());
-
+    double meshes = double(batches) * double(model.batch_size);
+    metrics.val_completion_mse = float(mse / meshes);
+    metrics.completion_mesh_success = float(double(successes) / meshes);
+    metrics.completion_within_bin = float(double(within_bin) / double(generated));
     return metrics;
 }
 
@@ -1194,7 +1233,6 @@ ExperimentResult train_experiment(
     float adam_epsilon,
     const std::vector<Mesh>& base_shapes,
     const std::vector<ValSeed>& val,
-    const std::vector<float>& sample_condition_meshes,
     const std::filesystem::path& output_dir) {
     ExperimentResult result;
     result.name = name;
@@ -1211,17 +1249,18 @@ ExperimentResult train_experiment(
     std::ofstream curve_csv(curve_path);
     curve_csv.precision(9);
     curve_csv << "step,train_ce,val_ce,completion_mse,"
-                 "cumulative_update_ms,cumulative_validation_ms\n";
+                 "cumulative_update_ms,cumulative_validation_ms,"
+                 "val_token_accuracy,completion_within_bin,completion_mesh_success\n";
     uint32_t evolution_vertex_index = 1;
     uint32_t evolution_snapshot_count = 0;
     constexpr float mesh_spacing = 2.0f;
     constexpr float row_spacing = mesh_spacing * 2.0f;
-    for (uint32_t seed = 0; seed < val.size(); ++seed) {
+    for (uint32_t row = 0; row < kEvolutionRows; ++row) {
         append_obj(evolution_obj,
-                   val[seed].first_target_mesh,
+                   mesh_at(val.front().meshes, row),
                    evolution_vertex_index,
                    0.0f,
-                   -float(seed) * row_spacing);
+                   -float(row) * row_spacing);
     }
     evolution_obj.flush();
 
@@ -1259,10 +1298,7 @@ ExperimentResult train_experiment(
 
         float train_ce = float(model.loss->cpu()[0]);
         auto validation_start = std::chrono::high_resolution_clock::now();
-        EvalMetrics metrics = evaluate_model(model,
-                                             val,
-                                             sample_condition_meshes,
-                                             sampled_tokens);
+        EvalMetrics metrics = evaluate_model(model, val, sampled_tokens);
         if (!std::isfinite(train_ce) || !std::isfinite(metrics.val_ce) ||
             !std::isfinite(metrics.val_completion_mse))
             throw std::runtime_error(std::string(name) + " produced non-finite training/validation metrics");
@@ -1275,34 +1311,41 @@ ExperimentResult train_experiment(
                   << metrics.val_ce << ","
                   << metrics.val_completion_mse << ","
                   << result.train_update_seconds * 1000.0 << ","
-                  << result.validation_seconds * 1000.0 << "\n";
+                  << result.validation_seconds * 1000.0 << ","
+                  << metrics.val_token_accuracy << ","
+                  << metrics.completion_within_bin << ","
+                  << metrics.completion_mesh_success << "\n";
         curve_csv.flush();
-        if (best_params.empty() ||
-            metrics.val_completion_mse < result.best.val_completion_mse) {
+        // Teacher-forced CE over 256 meshes is far less noisy than greedy completion MSE.
+        if (best_params.empty() || metrics.val_ce < result.best.val_ce) {
             best_params = capture_params(model.graph);
             result.best_step = step;
             result.best = metrics;
         }
 
         std::vector<float> predicted_mesh;
-        for (uint32_t seed = 0; seed < val.size(); ++seed) {
-            decode_generated_mesh(sampled_tokens, seed, predicted_mesh);
-            copy_condition_prefix(val[seed].first_target_mesh, predicted_mesh);
+        for (uint32_t row = 0; row < kEvolutionRows; ++row) {
+            decode_generated_mesh(sampled_tokens, row, predicted_mesh);
+            copy_condition_prefix(mesh_at(val.front().meshes, row), predicted_mesh);
             append_obj(evolution_obj,
                        predicted_mesh,
                        evolution_vertex_index,
                        mesh_spacing * float(evolution_snapshot_count + 1),
-                       -float(seed) * row_spacing);
+                       -float(row) * row_spacing);
         }
         evolution_obj.flush();
         ++evolution_snapshot_count;
 
-        printf("[%s] step %5u | train_ce %.6f | val_ce %.6f | val_completion_mse %.6f\n",
+        printf("[%s] step %5u | train_ce %.6f | val_ce %.6f | val_token_acc %.4f | "
+               "completion_mse %.6f | within_bin %.4f | mesh_success %.3f\n",
                name,
                step,
                train_ce,
                metrics.val_ce,
-               metrics.val_completion_mse);
+               metrics.val_token_accuracy,
+               metrics.val_completion_mse,
+               metrics.completion_within_bin,
+               metrics.completion_mesh_success);
         fflush(stdout);
     }
 
@@ -1310,7 +1353,7 @@ ExperimentResult train_experiment(
     result.train_seconds = std::chrono::duration<double>(train_end - train_start).count();
     if (best_params.empty()) {
         auto start = std::chrono::high_resolution_clock::now();
-        result.best = evaluate_model(model, val, sample_condition_meshes, sampled_tokens);
+        result.best = evaluate_model(model, val, sampled_tokens);
         result.validation_seconds = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - start).count();
         result.validation_runs = 1u;
@@ -1323,13 +1366,14 @@ ExperimentResult train_experiment(
     if (model.attention_mode != AttentionMode::GatedDelta) {
         result.reference_completion_mse = 0.0;
         auto start = std::chrono::high_resolution_clock::now();
-        sample_attention_reference(model, sample_condition_meshes, sampled_tokens, scratch_targets);
+        sample_attention_reference(model, val.front().meshes, sampled_tokens, scratch_targets);
         result.reference_decode_ms = std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - start).count();
         std::vector<float> mesh;
-        for (uint32_t b = 0; b < val.size(); ++b) {
+        for (uint32_t b = 0; b < model.batch_size; ++b) {
             decode_generated_mesh(sampled_tokens, b, mesh);
-            result.reference_completion_mse += completion_mse(mesh, val[b].first_target_mesh) / val.size();
+            result.reference_completion_mse +=
+                completion_mse(mesh, mesh_at(val.front().meshes, b)) / model.batch_size;
         }
         printf("[%s] full-recompute decode_ms: %.3f ms | mesh_mse %.6f\n",
             name, result.reference_decode_ms, result.reference_completion_mse);
@@ -1350,7 +1394,7 @@ ExperimentResult train_experiment(
     std::array<double, 5> decode_times;
     for (double& time : decode_times) {
         auto start = std::chrono::high_resolution_clock::now();
-        sample_autoregressive(model, sample_condition_meshes, sampled_tokens);
+        sample_autoregressive(model, val.front().meshes, sampled_tokens);
         time = std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - start).count();
     }
@@ -1359,7 +1403,7 @@ ExperimentResult train_experiment(
     if (model.attention_mode != AttentionMode::GatedDelta) {
         std::array<double, 5> prefill_times;
         for (double& time : prefill_times)
-            sample_attention_autoregressive(model, sample_condition_meshes, sampled_tokens, &time);
+            sample_attention_autoregressive(model, val.front().meshes, sampled_tokens, &time);
         std::sort(prefill_times.begin(), prefill_times.end());
         result.prefill_gpu_ms = prefill_times[prefill_times.size() / 2u];
         printf("[%s] prefill_gpu_ms: %.3f ms | prefix_tokens %u | includes first-token sampling\n",
@@ -1380,11 +1424,15 @@ ExperimentResult train_experiment(
            result.validation_runs);
     printf("[%s] decode_ms: %.3f ms\n", name, result.decode_ms);
 
-    printf("[%s] restored_best | step %5u | val_ce %.6f | val_completion_mse %.6f | decode_ms %.3f\n",
+    printf("[%s] restored_best | step %5u | val_ce %.6f | val_token_acc %.4f | completion_mse %.6f | "
+           "within_bin %.4f | mesh_success %.3f | decode_ms %.3f\n",
            name,
            result.best_step,
            result.best.val_ce,
+           result.best.val_token_accuracy,
            result.best.val_completion_mse,
+           result.best.completion_within_bin,
+           result.best.completion_mesh_success,
            result.decode_ms);
     fflush(stdout);
     return result;
@@ -1642,7 +1690,7 @@ void main_llm(int argc, char** argv) {
     constexpr float kGatedDeltaLearningRate = 2.0e-4f;
     constexpr float kAttentionLearningRate = 1.0e-4f;
     constexpr float kRopeBase = 10000.0f;
-    constexpr uint32_t kValSeeds = 5;
+    constexpr uint32_t kValSeeds = 16; // 256 validation meshes
     uint32_t head_dim = kModelDim / gated_delta_heads;
     uint64_t gated_delta_state_bytes = uint64_t(kLayerCount) *
         gated_delta_heads * head_dim * head_dim * sizeof(float16_t);
@@ -1786,19 +1834,7 @@ void main_llm(int argc, char** argv) {
                           kBatchSize,
                           val[seed].input_tokens,
                           val[seed].target_tokens);
-        val[seed].first_target_mesh.assign(
-            mesh_target.begin(),
-            mesh_target.begin() + kTrianglesPerMesh * kMeshFeatureDim);
-    }
-
-    std::vector<float> sample_condition_meshes(
-        kBatchSize * kTrianglesPerMesh * kMeshFeatureDim,
-        0.0f);
-    for (uint32_t batch = 0; batch < kBatchSize; ++batch) {
-        const auto& source = val[batch % kValSeeds].first_target_mesh;
-        float* destination =
-            sample_condition_meshes.data() + batch * kTrianglesPerMesh * kMeshFeatureDim;
-        std::copy(source.begin(), source.end(), destination);
+        val[seed].meshes = std::move(mesh_target);
     }
 
     std::filesystem::create_directories(output_dir);
@@ -1809,7 +1845,7 @@ void main_llm(int argc, char** argv) {
                          kLayerCount, kRopeBase, mode, heads, window, attention_kernel);
         initialize_model(model, parameter_seed, checkpoint);
         results.push_back(train_experiment(model, name, train_steps, log_interval,
-            learning_rate, adam_epsilon, base_shapes, val, sample_condition_meshes, output_dir));
+            learning_rate, adam_epsilon, base_shapes, val, output_dir));
     };
     if (run_attention) {
         run_model("attention", AttentionMode::Softmax, kAttentionHiddenDim,
@@ -1832,6 +1868,7 @@ void main_llm(int argc, char** argv) {
     printf("\n=== comparison (lower is better) ===\n");
     std::ofstream comparison_csv(output_dir / "llm_comparison.csv");
     comparison_csv << "model,parameters,best_step,val_ce,completion_mse,"
+                      "val_token_accuracy,completion_within_bin,completion_mesh_success,"
                       "train_update_ms,validation_ms,validation_runs,validation_mean_ms,"
                       "decode_ms,total_train_seconds,"
                       "inference_state_bytes,state_growth,parameter_bytes,training_tensor_bytes,"
@@ -1841,12 +1878,17 @@ void main_llm(int argc, char** argv) {
             result.train_update_seconds * 1000.0 / double((std::max)(1u, train_steps));
         double validation_mean_ms =
             result.validation_seconds * 1000.0 / double((std::max)(1u, result.validation_runs));
-        printf("%-16s | params %llu | best_step %u | val_ce %.6f | completion_mse %.6f | update_ms %.3f | validation_mean_ms %.3f | decode_ms %.3f | state_bytes %llu (%s)\n",
+        printf("%-16s | params %llu | best_step %u | val_ce %.6f | val_token_acc %.4f | completion_mse %.6f | "
+               "within_bin %.4f | mesh_success %.3f | update_ms %.3f | validation_mean_ms %.3f | "
+               "decode_ms %.3f | state_bytes %llu (%s)\n",
                result.name.c_str(),
                static_cast<unsigned long long>(result.parameters),
                result.best_step,
                result.best.val_ce,
+               result.best.val_token_accuracy,
                result.best.val_completion_mse,
+               result.best.completion_within_bin,
+               result.best.completion_mesh_success,
                update_ms,
                validation_mean_ms,
                result.decode_ms,
@@ -1857,6 +1899,9 @@ void main_llm(int argc, char** argv) {
                        << result.best_step << ","
                        << result.best.val_ce << ","
                        << result.best.val_completion_mse << ","
+                       << result.best.val_token_accuracy << ","
+                       << result.best.completion_within_bin << ","
+                       << result.best.completion_mesh_success << ","
                        << update_ms << ","
                        << result.validation_seconds * 1000.0 << ","
                        << result.validation_runs << ","
