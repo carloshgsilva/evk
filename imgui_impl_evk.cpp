@@ -30,7 +30,11 @@ const std::vector<uint32_t> FRAGMENT = {
 
 IMGUI_IMPL_API bool ImGui_ImplEvk_Init(Cmd& cmd) {
     ImGuiIO& io = ImGui::GetIO();
-    
+    io.BackendRendererName = "imgui_impl_evk";
+    // Draws start at each command's VtxOffset, so a window past the 65536 vertices that 16-bit indices reach is split
+    // into commands of its own instead of wrapping its indices round onto the wrong vertices.
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
+
     std::vector<uint8_t> VS(VERTEX.size()*4);
     std::memcpy(VS.data(), VERTEX.data(), VS.size());
     std::vector<uint8_t> FS(FRAGMENT.size()*4);
@@ -75,7 +79,10 @@ IMGUI_IMPL_API bool ImGui_ImplEvk_Init(Cmd& cmd) {
     return true;
 }
 IMGUI_IMPL_API void ImGui_ImplEvk_Shutdown() {
-    ImGui::GetIO().Fonts->SetTexID(0);
+    ImGuiIO& io = ImGui::GetIO();
+    io.BackendRendererName = nullptr;
+    io.BackendFlags &= ~ImGuiBackendFlags_RendererHasVtxOffset;
+    io.Fonts->SetTexID(0);
     g_fontImage.release();
     g_vertexBuffer.release();
     g_indexBuffer.release();
