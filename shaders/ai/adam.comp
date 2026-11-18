@@ -32,7 +32,25 @@ PUSH(
     float beta2CorrectionInv;  // 1 / (1 - β2^t)
     float epsilon;
     uint totalElements;
+    uint roundingSeed;  // 0 = round to nearest, otherwise seeds stochastic rounding of parameter and state
 )
+
+// Uniform value in [0, 1) from an element index and a seed.
+float hashUniform(uint a, uint b) {
+    uint h = a * 0x9E3779B1u + b * 0x85EBCA77u;
+    h ^= h >> 16; h *= 0x7FEB352Du;
+    h ^= h >> 15; h *= 0x846CA68Bu;
+    h ^= h >> 16;
+    return float(h >> 8) * (1.0 / 16777216.0);
+}
+
+// Rounds x to one of its two fp16 neighbours, up with probability equal to its
+// fractional position between them, so the stored value is unbiased.
+float stochasticRound(float x, float u) {
+    float step = exp2(floor(log2(max(abs(x), 6.1035156e-5))) - 10.0);
+    float low = floor(x / step) * step;
+    return low + (u < (x - low) / step ? step : 0.0);
+}
 
 COMPUTE(256, 1, 1)
 void main() {
@@ -62,11 +80,15 @@ void main() {
         float denom = max(rms, 1.0e-8);
         m_norm = m / denom;
         if (!isnan(m_norm) && !isinf(m_norm)) {
+            if (roundingSeed != 0u) m_norm = stochasticRound(m_norm, hashUniform(gid, roundingSeed + 0x51ED270Bu));
             mBuffer.x[gid] = float16_t(m_norm);
         }
         float rms_clamped = max(rms, MIN_RMS);
         float logRms = log2(rms_clamped) + LOG_RMS_OFFSET;
         if (!isnan(logRms) && !isinf(logRms)) {
+            // With beta2 near 1 the log RMS moves by far less than an fp16 step per update;
+            // rounded to nearest it would stop tracking the gradient scale.
+            if (roundingSeed != 0u) logRms = stochasticRound(logRms, hashUniform(gid, roundingSeed + 0xA24BAED5u));
             vBuffer.x[gid] = float16_t(logRms);
         }
 
@@ -80,6 +102,8 @@ void main() {
             param = param - update;
             // Clamp parameter to fp16 range
             param = clamp(param, -65504.0, 65504.0);
+            // Updates below half an fp16 step are kept on average instead of being dropped.
+            if (roundingSeed != 0u) param = stochasticRound(param, hashUniform(gid, roundingSeed));
             paramBuffer.x[gid] = float16_t(param);
         }
     }

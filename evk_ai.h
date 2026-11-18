@@ -502,6 +502,7 @@ namespace evk::ai {
         evk::Buffer m_buffer;  // FP16 normalized first moment estimate
         evk::Buffer v_buffer;  // FP16 biased log2 RMS(second moment) estimate
         uint32_t t = 0;        // Timestep counter
+        uint32_t id = 0;       // Creation index, part of the stochastic rounding seed
 
         void init(uint32_t num_elements);
         void reset();
@@ -579,17 +580,33 @@ namespace evk::ai {
     // Returns a scalar tensor containing the mean squared error
     void mse_loss(Tensor& predicted, Tensor& target, Tensor& predGrad, Tensor& result);
 
+    // PPO loss gradient for a discrete policy head (clipped surrogate, entropy bonus, value loss).
+    // head: (..., width) rows of `actions` logits followed by the state value.
+    // samples: (rows, 4) of (action, old log-probability, advantage, return); the head's rows
+    // read samples starting at row sample_offset.
+    // Writes grad_scale * d(loss)/d(head) into head_grad, per row (no mean over rows); the
+    // columns after the value get zero. evk_ai_ppo.h builds a full PPO trainer on it.
+    void ppo_loss(Tensor& head, Tensor& samples, uint32_t sample_offset, Tensor& head_grad,
+                  uint32_t actions, float clip, float entropy_coef, float value_coef, float grad_scale = 1.0f);
+
     // SGD: param = param - learning_rate * gradient
     void sgd(Tensor& param, Tensor& gradient, float learning_rate);
 
     // Adam: Adaptive Moment Estimation optimizer
     // The update runs in FP32 with log-RMS state, so epsilon can stay small. Gradients
     // are FP16 and often far below 1e-4; a larger epsilon swamps the RMS normalization.
+    // Parameters and state are stored in FP16. With round-to-nearest an update below half
+    // an FP16 step of the weight (2^-11 of its magnitude) is lost, and with beta2 near 1
+    // the stored log RMS stops tracking the gradient scale (it moves by less than an FP16
+    // step per update). stochastic_rounding rounds parameter and state up or down at
+    // random instead, which keeps both correct on average; use it when learning_rate is
+    // small relative to the weights or beta2 is above about 0.98.
     void adam(Tensor& param, Tensor& gradient, AdamState& state,
               float learning_rate = 0.001f,
               float beta1 = 0.9f,
               float beta2 = 0.999f,
-              float epsilon = 1e-6f);
+              float epsilon = 1e-6f,
+              bool stochastic_rounding = false);
 
     // Elementwise add: C = A + B
     void add(Tensor& a, Tensor& b, Tensor& c);
@@ -607,7 +624,10 @@ namespace evk::ai {
     void relu(Tensor& in, Tensor& out);
 
     // ReLU backward: grad_in = grad_out * (in > 0 ? 1 : 0)
-    void relu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in);
+    // With accumulate false it writes grad_in = grad_out * (in > 0) instead of adding; grad_in
+    // may then be the grad_out tensor, which masks a gradient in place. `in` may be the ReLU's
+    // output as well as its input: both are positive in the same places.
+    void relu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in, bool accumulate = true);
 
     // Inference-oriented 2D image operations. Images use NCHW layout and
     // convolution weights use OIHW layout.
@@ -721,8 +741,10 @@ namespace evk::ai {
     // Zero out a tensor on GPU
     void zero(Tensor& tensor, bool barrier = true);
 
-    // Sum across batch dimension: out[i] += sum_b(input[b, i])
-    void sum_batch(Tensor& input, Tensor& output, uint32_t batch_count, uint32_t size_per_batch);
+    // Sum across batch dimension: out[i] += sum_b(input[b, i]), or out[i] = sum_b(...)
+    // when accumulate is false (no need to zero the output first).
+    void sum_batch(Tensor& input, Tensor& output, uint32_t batch_count, uint32_t size_per_batch,
+                   bool accumulate = true);
 
     // RMS Normalization forward: out = input / sqrt(mean(input^2) + eps)
     // Normalizes over the last dimension
@@ -1551,9 +1573,11 @@ struct Graph {
 
     // apply the gradient update using Adam optimizer
     // Epsilon defaults to 1e-6; see evk::ai::adam
-    void step_adam(float lr = 0.001f, float beta1 = 0.9f, float beta2 = 0.999f, float epsilon = 1e-6f) {
+    void step_adam(float lr = 0.001f, float beta1 = 0.9f, float beta2 = 0.999f, float epsilon = 1e-6f,
+                   bool stochastic_rounding = false) {
         for(auto& param : params) {
-            evk::ai::adam(*param, param->grad(), adam_states[param], lr, beta1, beta2, epsilon);
+            evk::ai::adam(*param, param->grad(), adam_states[param], lr, beta1, beta2, epsilon,
+                          stochastic_rounding);
         }
     }
 

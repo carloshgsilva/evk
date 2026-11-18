@@ -5,6 +5,7 @@ To build, test or run the project call `.\run.bat` from a Windows terminal (cmd 
 The runner forwards any command-line arguments to the built executable and supports the following flags:
 
 - `--test`  : run the test suite
+- `--test-ppo` : run only the `evk::ai::ppo` learning test (about 1 s)
 - `--bench` : run the benchmarks
 - `--llm`   : run the LLM demo (`main_llm.cpp`)
 

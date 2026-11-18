@@ -14,6 +14,7 @@ void evk_tests();
 int main(int argc, char** argv) {
     // Parse command-line flags: --test, --bench, --llm
     bool do_test = false;
+    bool only_ppo = false; // --test-ppo: just the evk::ai::ppo learning test
     bool do_bench = false;
     bool attention_bench = false;
     uint32_t attention_context = 16384u;
@@ -22,6 +23,7 @@ int main(int argc, char** argv) {
     const char* oidn_weights = "oidn-weights/rt_ldr_small.tza";
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--test") == 0) do_test = true;
+        else if (strcmp(argv[i], "--test-ppo") == 0) { do_test = true; only_ppo = true; }
         else if (strcmp(argv[i], "--bench") == 0) do_bench = true;
         else if (strcmp(argv[i], "--bench-attention") == 0) { do_bench = true; attention_bench = true; }
         else if (strcmp(argv[i], "--bench-attention-long") == 0) {
@@ -92,7 +94,9 @@ int main(int argc, char** argv) {
     }
 
     // Run the suite of tests when requested
-    if (do_test) {
+    if (only_ppo) {
+        test_ppo_agent();
+    } else if (do_test) {
         evk_tests();
         run_ai_kernel_tests();
     }

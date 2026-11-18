@@ -1,0 +1,81 @@
+#include "../common/evk.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_buffer_reference : enable
+
+// PPO loss gradient for a discrete policy head.
+// Each head row holds `actions` logits followed by the state value. Each sample row holds
+// (action, old log-probability, advantage, return). Writes d(loss)/d(head):
+//   loss = -min(ratio * A, clamp(ratio, 1 - clip, 1 + clip) * A)
+//          - entropyCoef * H(pi) + valueCoef * 0.5 * (value - return)^2
+
+layout(buffer_reference) buffer BufferFp16 { float16_t x[]; };
+
+PUSH(
+    BufferFp16 headBuffer;
+    BufferFp16 sampleBuffer;
+    BufferFp16 gradBuffer;
+    uint rows;
+    uint width;
+    uint actions;
+    uint sampleOffset;
+    float clip;
+    float entropyCoef;
+    float valueCoef;
+    float gradScale;
+)
+
+const uint kMaxActions = 16u;
+
+COMPUTE(64, 1, 1)
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= rows) return;
+    uint head = row * width;
+    uint sampleBase = (sampleOffset + row) * 4u;
+
+    float logits[kMaxActions];
+    float top = -1.0e30;
+    bool finite = true;
+    for (uint a = 0u; a < actions; ++a) {
+        logits[a] = float(headBuffer.x[head + a]);
+        finite = finite && !isnan(logits[a]) && !isinf(logits[a]);
+        top = max(top, logits[a]);
+    }
+    float value = float(headBuffer.x[head + actions]);
+    finite = finite && !isnan(value) && !isinf(value);
+
+    for (uint c = 0u; c < width; ++c) gradBuffer.x[head + c] = float16_t(0.0);
+    if (!finite) return;
+
+    float sum = 0.0;
+    for (uint a = 0u; a < actions; ++a) {
+        logits[a] = exp(logits[a] - top);
+        sum += logits[a];
+    }
+    float entropy = 0.0;
+    for (uint a = 0u; a < actions; ++a) {
+        logits[a] /= sum; // now the probability
+        entropy -= logits[a] * log(max(logits[a], 1.0e-8));
+    }
+
+    uint action = min(uint(float(sampleBuffer.x[sampleBase]) + 0.5), actions - 1u);
+    float oldLogProb = float(sampleBuffer.x[sampleBase + 1u]);
+    float advantage = float(sampleBuffer.x[sampleBase + 2u]);
+    float target = float(sampleBuffer.x[sampleBase + 3u]);
+
+    float ratio = exp(log(max(logits[action], 1.0e-8)) - oldLogProb);
+    // The clipped surrogate has no gradient once the ratio leaves the clip range in the
+    // direction the advantage pushes it.
+    bool clipped = advantage >= 0.0 ? ratio > 1.0 + clip : ratio < 1.0 - clip;
+    float policyWeight = clipped ? 0.0 : -advantage * ratio;
+
+    for (uint a = 0u; a < actions; ++a) {
+        float p = logits[a];
+        float g = policyWeight * ((a == action ? 1.0 : 0.0) - p);
+        g += entropyCoef * p * (log(max(p, 1.0e-8)) + entropy);
+        gradBuffer.x[head + a] = float16_t(g * gradScale);
+    }
+    gradBuffer.x[head + actions] = float16_t(valueCoef * (value - target) * gradScale);
+}

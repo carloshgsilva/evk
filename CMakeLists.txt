@@ -66,6 +66,7 @@ file(GLOB EVK_AI_SHADERS CONFIGURE_DEPENDS
 add_library(evk_ai EXCLUDE_FROM_ALL
     "${CMAKE_CURRENT_SOURCE_DIR}/evk_ai.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/evk_ai_ir.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/evk_ai_ppo.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/evk_ai_image_compiler.cpp")
 target_include_directories(evk_ai PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(evk_ai PUBLIC cxx_std_20)

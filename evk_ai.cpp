@@ -52,6 +52,7 @@ namespace evk::ai {
         evk::Pipeline flash_attn;
         evk::Pipeline flash_attn_bwd;
         evk::Pipeline mse_loss;
+        evk::Pipeline ppo_loss;
         evk::Pipeline cross_entropy;
         evk::Pipeline cross_entropy_count;
         evk::Pipeline cross_entropy_scale;
@@ -265,6 +266,9 @@ namespace evk::ai {
         cmd.copy(zero_buf, v_buffer, size);
         evk::ai::SubmitCmd(true);
         t = 0;
+        // Seeds stochastic rounding. Creation order is deterministic; buffer addresses are not.
+        static uint32_t next_id = 0;
+        id = ++next_id;
     }
 
     void AdamState::reset() {
@@ -280,6 +284,7 @@ namespace evk::ai {
             pipelines->flash_attn_bwd = create_named_compute_pipeline("flash_attention_bwd");
         }
         pipelines->mse_loss = create_named_compute_pipeline("mse_loss");
+        pipelines->ppo_loss = create_named_compute_pipeline("ppo_loss");
         pipelines->sgd = create_named_compute_pipeline("sgd");
         pipelines->adam = create_named_compute_pipeline("adam");
         pipelines->add = create_named_compute_pipeline("add");
@@ -801,6 +806,35 @@ namespace evk::ai {
         cmd.barrier();
     }
 
+    void ppo_loss(Tensor& head, Tensor& samples, uint32_t sample_offset, Tensor& head_grad,
+                  uint32_t actions, float clip, float entropy_coef, float value_coef, float grad_scale) {
+        assert(head.shape.count() == head_grad.shape.count());
+        uint32_t width = head.shape[-1];
+        uint32_t rows = uint32_t(head.shape.count() / width);
+        assert(actions >= 1 && actions <= 16 && actions < width);
+        assert(samples.shape[-1] == 4);
+        assert((uint64_t(sample_offset) + rows) * 4u <= samples.shape.count());
+
+        auto& cmd = evk::ai::GetCmd();
+        cmd.bind(pipelines->ppo_loss);
+        // One plain struct: an initializer list this long nests too deeply for MSVC.
+        using Reference = decltype(head.buffer.GetReference());
+        struct Push {
+            Reference head, samples, grad;
+            uint32_t rows, width, actions, sample_offset;
+            float clip, entropy_coef, value_coef, grad_scale;
+        };
+        cmd.push(evk::Constant{Push{
+            head.buffer.GetReference(), samples.buffer.GetReference(), head_grad.buffer.GetReference(),
+            rows, width, actions, sample_offset,
+            clip, entropy_coef, value_coef, grad_scale,
+        }});
+
+        const uint32_t WORKGROUP_SIZE = 64u;
+        cmd.dispatch((rows + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE, 1, 1);
+        cmd.barrier();
+    }
+
     void sgd(Tensor& param, Tensor& gradient, float learning_rate) {
         assert(param.shape.rank() == gradient.shape.rank());
         for (uint32_t i = 0; i < param.shape.rank(); ++i) {
@@ -827,7 +861,8 @@ namespace evk::ai {
               float learning_rate,
               float beta1,
               float beta2,
-              float epsilon) {
+              float epsilon,
+              bool stochastic_rounding) {
         assert(param.shape.rank() == gradient.shape.rank());
         for (uint32_t i = 0; i < param.shape.rank(); ++i) {
             assert(param.shape[i] == gradient.shape[i]);
@@ -862,7 +897,9 @@ namespace evk::ai {
             beta1CorrectionInv,
             beta2CorrectionInv,
             epsilon,
-            totalElements
+            totalElements,
+            // Distinct per optimizer state and step; never 0 when enabled.
+            stochastic_rounding ? (uint32_t(state.t) * 2654435761u + state.id * 0x9E3779B9u) | 1u : 0u,
         });
 
         const uint32_t WORKGROUP_SIZE = 256u;
@@ -960,7 +997,7 @@ namespace evk::ai {
         cmd.barrier();
     }
 
-    void relu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in) {
+    void relu_backward(Tensor& grad_out, Tensor& in, Tensor& grad_in, bool accumulate) {
         assert(grad_out.shape.rank() == in.shape.rank());
         assert(grad_in.shape.rank() == in.shape.rank());
 
@@ -973,6 +1010,7 @@ namespace evk::ai {
             in.buffer.GetReference(),
             grad_in.buffer.GetReference(),
             totalElements,
+            accumulate ? 1u : 0u,
         });
 
         const uint32_t WORKGROUP_SIZE = 256u;
@@ -1687,7 +1725,8 @@ namespace evk::ai {
     }
 
     // Sum across batch dimension: out[i] += sum_b(input[b, i])
-    void sum_batch(Tensor& input, Tensor& output, uint32_t batch_count, uint32_t size_per_batch) {
+    void sum_batch(Tensor& input, Tensor& output, uint32_t batch_count, uint32_t size_per_batch,
+                   bool accumulate) {
         auto& cmd = evk::ai::GetCmd();
         cmd.bind(pipelines->sum_batch);
         cmd.push(evk::Constant{
@@ -1695,6 +1734,7 @@ namespace evk::ai {
             output.buffer.GetReference(),
             batch_count,
             size_per_batch,
+            accumulate ? 1u : 0u,
         });
 
         const uint32_t WORKGROUP_SIZE = 256u;

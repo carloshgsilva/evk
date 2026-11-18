@@ -11,6 +11,7 @@ PUSH(
     BufferFp16 outputBuffer;  // (size) - sum over batch dimension
     uint batchCount;
     uint sizePerBatch;
+    uint accumulate;  // 0 overwrites the output instead of adding to it
 )
 
 // Sum across batch dimension: out[i] += sum_b(input[b, i])
@@ -19,7 +20,7 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= sizePerBatch) return;
     
-    float sum = float(outputBuffer.x[gid]);
+    float sum = accumulate != 0u ? float(outputBuffer.x[gid]) : 0.0;
     for (uint b = 0; b < batchCount; ++b) {
         sum += float(inputBuffer.x[b * sizePerBatch + gid]);
     }

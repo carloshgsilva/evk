@@ -1,6 +1,8 @@
 
 #include <evk_ai.h>
 #include <evk_ai_ir.h>
+#include <evk_ai_ppo.h>
+#include <filesystem>
 
 #define TEST(expr) if((expr)) { printf(" TEST(" #expr ") [PASS]\n"); } else { printf(" TEST(" #expr ") [FAIL] [%s:%d]\n", __FILE__, __LINE__); exit(1); }
 
@@ -316,6 +318,168 @@ void test_mse_loss() {
     TEST(std::abs(float(grad_cpu[1]) - 0.0f) < 5e-4f);
     float expected_g2 = 2.0f * (3.0f - 4.0f) / 3.0f; // -2/3
     TEST(std::abs(float(grad_cpu[2]) - expected_g2) < 5e-3f);
+}
+
+void test_ppo_loss() {
+    printf("test_ppo_loss()\n");
+    const uint32_t rows = 4, width = 8, actions = 3;
+    const float clip = 0.2f, entropy_coef = 0.01f, value_coef = 0.5f, grad_scale = 0.5f;
+    // Rows: unclipped, clipped (ratio far above 1 with a positive advantage), negative
+    // advantage, and a row read past the sample offset.
+    std::vector<float> head_values = {
+        0.5f, -0.25f, 1.0f, 0.75f, 9.0f, 9.0f, 9.0f, 9.0f,
+        2.0f, 0.0f, -1.0f, -0.5f, 9.0f, 9.0f, 9.0f, 9.0f,
+        0.0f, 0.0f, 0.0f, 0.25f, 9.0f, 9.0f, 9.0f, 9.0f,
+        -1.0f, 1.5f, 0.5f, 1.0f, 9.0f, 9.0f, 9.0f, 9.0f,
+    };
+    // (action, old log-probability, advantage, return), preceded by one unused row.
+    std::vector<float> sample_values = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        2.0f, -0.75f, 1.0f, 0.5f,
+        0.0f, -2.0f, 1.5f, -1.0f,
+        1.0f, -1.0f, -0.5f, 1.0f,
+        1.0f, -0.5f, 0.25f, 2.0f,
+    };
+    Tensor head({rows, width});
+    Tensor samples({rows + 1, 4});
+    Tensor grad({rows, width});
+    upload_tensor_from_f32(head, head_values);
+    upload_tensor_from_f32(samples, sample_values);
+    evk::ai::ppo_loss(head, samples, 1, grad, actions, clip, entropy_coef, value_coef, grad_scale);
+    std::vector<float> actual;
+    download_tensor_to_f32(grad, actual);
+
+    bool saw_clipped = false;
+    for (uint32_t r = 0; r < rows; ++r) {
+        const float* h = &head_values[r * width];
+        const float* s = &sample_values[(r + 1) * 4];
+        float p[actions], sum = 0.0f, entropy = 0.0f;
+        for (uint32_t a = 0; a < actions; ++a) { p[a] = std::exp(h[a]); sum += p[a]; }
+        for (uint32_t a = 0; a < actions; ++a) { p[a] /= sum; entropy -= p[a] * std::log(p[a]); }
+        uint32_t action = uint32_t(s[0]);
+        float ratio = std::exp(std::log(p[action]) - s[1]);
+        bool clipped = s[2] >= 0.0f ? ratio > 1.0f + clip : ratio < 1.0f - clip;
+        saw_clipped = saw_clipped || clipped;
+        float weight = clipped ? 0.0f : -s[2] * ratio;
+        for (uint32_t a = 0; a < actions; ++a) {
+            float expected = weight * ((a == action ? 1.0f : 0.0f) - p[a]) +
+                             entropy_coef * p[a] * (std::log(p[a]) + entropy);
+            TEST(std::abs(actual[r * width + a] - expected * grad_scale) < 2e-3f);
+        }
+        TEST(std::abs(actual[r * width + actions] - value_coef * (h[actions] - s[3]) * grad_scale) < 2e-3f);
+        for (uint32_t c = actions + 1; c < width; ++c) TEST(actual[r * width + c] == 0.0f);
+    }
+    TEST(saw_clipped);
+}
+
+// evk::ai::ppo learns two toy problems: a contextual bandit (one step, the right action is
+// the observed state) and a corridor (walk right 6 cells for the reward, which needs credit
+// over several steps). Also checks that save/load restores the same policy.
+void test_ppo_agent() {
+    printf("test_ppo_agent()\n");
+    {
+        evk::ai::ppo::Config config;
+        config.obs_size = 4;
+        config.actions = 4;
+        config.envs = 256;
+        config.horizon = 8;
+        config.hidden = 64;
+        config.lr = 3e-3f;
+        evk::ai::ppo::Agent agent(config);
+        std::vector<float> obs(config.envs * 4);
+        std::vector<uint32_t> state(config.envs), actions(config.envs);
+        std::vector<float> rewards(config.envs);
+        std::vector<uint8_t> dones(config.envs, 1);
+        uint64_t rng = 1;
+        auto next_state = [&] { rng = rng * 6364136223846793005ull + 1442695040888963407ull; return uint32_t(rng >> 62); };
+        auto observe = [&] {
+            for (uint32_t e = 0; e < config.envs; ++e)
+                for (uint32_t i = 0; i < 4; ++i) obs[e * 4 + i] = state[e] == i ? 1.0f : 0.0f;
+        };
+        for (auto& s : state) s = next_state();
+        float first = 0.0f, last = 0.0f;
+        for (uint32_t iteration = 0; iteration < 40; ++iteration) {
+            for (uint32_t t = 0; t < config.horizon; ++t) {
+                observe();
+                agent.act(obs.data(), actions.data());
+                for (uint32_t e = 0; e < config.envs; ++e) {
+                    rewards[e] = actions[e] == state[e] ? 1.0f : 0.0f;
+                    state[e] = next_state();
+                }
+                agent.reward(rewards.data(), dones.data());
+            }
+            observe();
+            auto stats = agent.update(obs.data());
+            if (iteration == 0) first = stats.episode_return;
+            last = stats.episode_return;
+        }
+        printf("  bandit: mean reward %.3f -> %.3f\n", first, last);
+        TEST(first < 0.4f);
+        TEST(last > 0.9f);
+
+        // save/load: a fresh agent with other weights plays the same policy after load().
+        std::vector<float> p0(config.envs * 4), p1(config.envs * 4), v0(config.envs), v1(config.envs);
+        observe();
+        agent.evaluate(obs.data(), p0.data(), v0.data());
+        std::string path = (std::filesystem::temp_directory_path() / "evk_ppo_test.bin").string();
+        agent.save(path);
+        evk::ai::ppo::Config other = config;
+        other.seed = 7;
+        evk::ai::ppo::Agent copy(other);
+        copy.load(path);
+        copy.evaluate(obs.data(), p1.data(), v1.data());
+        std::filesystem::remove(path);
+        TEST(p0 == p1 && v0 == v1);
+    }
+    {
+        // Corridor of 7 cells, start in cell 0, actions left/right, reward 1 for reaching cell 6.
+        // Episodes end there or after 20 steps; a random walk rarely makes it.
+        evk::ai::ppo::Config config;
+        config.obs_size = 7;
+        config.actions = 2;
+        config.envs = 256;
+        config.horizon = 16;
+        config.hidden = 64;
+        config.lr = 3e-3f;
+        config.gamma = 0.95f;
+        evk::ai::ppo::Agent agent(config);
+        std::vector<float> obs(config.envs * 7);
+        std::vector<uint32_t> cell(config.envs, 0), age(config.envs, 0), actions(config.envs);
+        std::vector<float> rewards(config.envs);
+        std::vector<uint8_t> dones(config.envs);
+        auto observe = [&] {
+            for (uint32_t e = 0; e < config.envs; ++e)
+                for (uint32_t i = 0; i < 7; ++i) obs[e * 7 + i] = cell[e] == i ? 1.0f : 0.0f;
+        };
+        float first = 0.0f, last = 0.0f;
+        uint32_t first_episodes = 0, last_episodes = 0;
+        for (uint32_t iteration = 0; iteration < 60; ++iteration) {
+            uint32_t wins = 0;
+            for (uint32_t t = 0; t < config.horizon; ++t) {
+                observe();
+                agent.act(obs.data(), actions.data());
+                for (uint32_t e = 0; e < config.envs; ++e) {
+                    cell[e] = actions[e] == 1 ? cell[e] + 1 : (cell[e] > 0 ? cell[e] - 1 : 0);
+                    ++age[e];
+                    bool won = cell[e] == 6;
+                    wins += won;
+                    rewards[e] = won ? 1.0f : 0.0f;
+                    dones[e] = won || age[e] >= 20;
+                    if (dones[e]) { cell[e] = 0; age[e] = 0; }
+                }
+                agent.reward(rewards.data(), dones.data());
+            }
+            observe();
+            auto stats = agent.update(obs.data());
+            if (iteration == 0) { first = stats.episode_return; first_episodes = stats.episodes; }
+            last = stats.episode_return;
+            last_episodes = stats.episodes;
+            (void)wins;
+        }
+        printf("  corridor: win rate %.3f (%u episodes) -> %.3f (%u episodes)\n", first, first_episodes, last, last_episodes);
+        TEST(last > 0.95f);
+        TEST(last_episodes > 2 * first_episodes); // the walk gets shorter
+    }
 }
 
 void test_cross_entropy_loss() {
@@ -839,6 +1003,37 @@ void test_adam() {
 
     // Check that timestep was incremented
     TEST(state.t == 10);
+}
+
+void test_adam_stochastic_rounding() {
+    printf("test_adam_stochastic_rounding()\n");
+    // 0.3 has an fp16 step of 2^-12 (2.4e-4). A constant gradient makes every Adam update
+    // equal to the learning rate, 2e-5: round-to-nearest drops all of them, stochastic
+    // rounding moves the mean by steps * learning_rate.
+    const uint32_t count = 4096, steps = 200;
+    const float lr = 2e-5f;
+    for (int stochastic = 0; stochastic < 2; ++stochastic) {
+        Tensor param({count});
+        Tensor grad({count});
+        param.fill(0.3f);
+        grad.fill(1.0f);
+        evk::ai::AdamState state;
+        for (uint32_t i = 0; i < steps; ++i) {
+            evk::ai::adam(param, grad, state, lr, 0.9f, 0.999f, 1e-6f, stochastic != 0);
+            evk::ai::GetCmd().barrier(); // adam leaves the barrier to the next operation
+        }
+        std::vector<float> values;
+        download_tensor_to_f32(param, values);
+        double mean = 0.0;
+        for (float v : values) mean += v;
+        mean /= double(count);
+        float start = quantize_fp16_cpu(0.3f);
+        if (stochastic) {
+            TEST(std::abs(float(start - mean) - float(steps) * lr) < 4e-4f);
+        } else {
+            TEST(std::abs(float(mean) - start) < 1e-6f);
+        }
+    }
 }
 
 void test_adam_fp16_matmul_convergence_vs_cpu_fp32() {
@@ -3010,9 +3205,12 @@ void run_ai_kernel_tests() {
     test_matmul_weight_backward_cpu_reference();
     test_matmul_weight_backward_cpu_reference(1e-5f);
     test_mse_loss();
+    test_ppo_loss();
+    test_ppo_agent();
     test_cross_entropy_loss();
     test_sgd();
     test_adam();
+    test_adam_stochastic_rounding();
     test_adam_fp16_matmul_convergence_vs_cpu_fp32();
     test_softmax();
     test_relu();
